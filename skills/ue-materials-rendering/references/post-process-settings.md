@@ -1,383 +1,304 @@
 # Post-Process Settings Reference
 
-`FPostProcessSettings` fields accessible from C++, grouped by category. Every field requires its paired `bOverride_*` bool to be `true` to take effect when set on a `APostProcessVolume` or `UPostProcessComponent`.
+`FPostProcessSettings` fields as declared in `Engine/Source/Runtime/Engine/Classes/Engine/Scene.h`. Every value field has a paired `bOverride_<Field>` bit; the value is ignored unless that bit is `true`.
 
-Source: `Engine/Source/Runtime/Engine/Classes/Engine/Scene.h`
+Carriers of the struct: `APostProcessVolume::Settings`, `UPostProcessComponent::Settings`, `UCameraComponent::PostProcessSettings`, `USceneCaptureComponent2D::PostProcessSettings`.
 
 ---
 
 ## Usage Pattern
 
 ```cpp
-// Always set the override bool alongside the value:
-PPV->Settings.bOverride_BloomIntensity = true;
-PPV->Settings.BloomIntensity = 1.5f;
+FPostProcessSettings& S = Volume->Settings;
 
-// Setting the value without the override has no effect.
-PPV->Settings.BloomIntensity = 1.5f; // silent no-op if bOverride_BloomIntensity is false
+S.bOverride_BloomIntensity = true;
+S.BloomIntensity = 1.5f;
+
+// Without the override bit this assignment does nothing:
+S.BloomIntensity = 1.5f;
 ```
 
 ---
 
 ## Bloom
 
-Controls the glow around bright light sources.
+| Field | Type | Meaning |
+|-------|------|---------|
+| `BloomMethod` | `TEnumAsByte<EBloomMethod>` | `BM_SOG` (sum of Gaussians) or `BM_FFT` (convolution) |
+| `BloomIntensity` | float | Overall bloom brightness multiplier; 0 disables |
+| `BloomThreshold` | float | Luminance threshold; -1 lets every pixel contribute |
+| `BloomSizeScale` | float | Scales all Gaussian bloom kernel sizes |
+| `BloomDirtMask` | `TObjectPtr<UTexture>` | Lens dirt texture applied over bloom |
+| `BloomDirtMaskIntensity` | float | Strength of the dirt mask |
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_BloomMethod` | bool | false | Enable method override |
-| `BloomMethod` | EBloomMethod | `BM_SOG` | `BM_SOG` (Gaussian Sum) or `BM_FFT` (Convolution) |
-| `bOverride_BloomIntensity` | bool | false | |
-| `BloomIntensity` | float | 0.675 | Overall bloom brightness multiplier. 0 = off |
-| `bOverride_BloomThreshold` | bool | false | |
-| `BloomThreshold` | float | -1.0 | Luminance threshold for bloom. -1 = all pixels |
-| `bOverride_BloomSizeScale` | bool | false | |
-| `BloomSizeScale` | float | 4.0 | Scale for all Gaussian bloom kernel sizes |
-
-**Visual effect:** Increasing `BloomIntensity` above 1.0 creates a dreamy glow around bright elements (windows, neon signs, fire). Setting `BloomThreshold` to 1.0 restricts bloom to pixels brighter than 1.0 linear, which is more physically accurate.
+Raising `BloomThreshold` toward 1.0 keeps bloom on genuinely bright pixels and is closer to physical behaviour than the default catch-all.
 
 ---
 
-## Exposure (Auto Exposure / Eye Adaptation)
+## Exposure (Eye Adaptation)
 
-Controls how the camera adapts to scene brightness.
+| Field | Type | Meaning |
+|-------|------|---------|
+| `AutoExposureMethod` | `TEnumAsByte<EAutoExposureMethod>` | `AEM_Histogram`, `AEM_Basic`, `AEM_Manual` |
+| `AutoExposureMinBrightness` | float | Lower clamp on the adapted luminance |
+| `AutoExposureMaxBrightness` | float | Upper clamp on the adapted luminance |
+| `AutoExposureBias` | float | Exposure compensation in EV; +1 doubles perceived brightness |
+| `AutoExposureSpeedUp` | float | Adaptation rate when the scene gets brighter |
+| `AutoExposureSpeedDown` | float | Adaptation rate when the scene gets darker |
+| `AutoExposureLowPercent` | float | Histogram low percentile used for metering |
+| `AutoExposureHighPercent` | float | Histogram high percentile used for metering |
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_AutoExposureMethod` | bool | false | |
-| `AutoExposureMethod` | EAutoExposureMethod | `AEM_Histogram` | `AEM_Histogram` (high quality) or `AEM_Basic` (faster) |
-| `bOverride_AutoExposureMinBrightness` | bool | false | |
-| `AutoExposureMinBrightness` | float | 0.03 | Minimum scene luminance exposure adapts to (EV100 units) |
-| `bOverride_AutoExposureMaxBrightness` | bool | false | |
-| `AutoExposureMaxBrightness` | float | 8.0 | Maximum scene luminance exposure adapts to (EV100 units) |
-| `bOverride_AutoExposureBias` | bool | false | |
-| `AutoExposureBias` | float | 0.0 | Manual exposure offset in EV (exposure value). Positive = brighter |
-| `bOverride_AutoExposureSpeedUp` | bool | false | |
-| `AutoExposureSpeedUp` | float | 3.0 | Adaptation speed when moving to brighter scene (EV/sec) |
-| `bOverride_AutoExposureSpeedDown` | bool | false | |
-| `AutoExposureSpeedDown` | float | 1.0 | Adaptation speed when moving to darker scene (EV/sec) |
-| `bOverride_AutoExposureLowPercent` | bool | false | |
-| `AutoExposureLowPercent` | float | 80.0 | Histogram low percentile for metering (0–100) |
-| `bOverride_AutoExposureHighPercent` | bool | false | |
-| `AutoExposureHighPercent` | float | 98.3 | Histogram high percentile for metering (0–100) |
+Locking exposure:
 
-**Fixed exposure (override eye adaptation):**
 ```cpp
-// Lock exposure to a fixed EV100 value — disables adaptation
-PPV->Settings.bOverride_AutoExposureMethod = true;
-PPV->Settings.AutoExposureMethod = AEM_Manual;
-PPV->Settings.bOverride_AutoExposureBias = true;
-PPV->Settings.AutoExposureBias = 0.0f; // EV100 = 0 is "neutral" daylight
+S.bOverride_AutoExposureMethod = true;
+S.AutoExposureMethod = AEM_Manual;
+S.bOverride_AutoExposureBias = true;
+S.AutoExposureBias = 0.0f;
 ```
 
-**Visual effect:** `AutoExposureBias` of +1 doubles perceived brightness; -1 halves it. Narrowing the Min/Max range prevents wild brightness swings in high-contrast scenes.
+Setting `AutoExposureMinBrightness` equal to `AutoExposureMaxBrightness` also pins adaptation while keeping the histogram path.
 
 ---
 
-## Depth of Field (Cinematic DOF)
+## Depth of Field
 
-Blurs out-of-focus objects to simulate camera aperture. Requires Cinematic DOF method.
+| Field | Type | Meaning |
+|-------|------|---------|
+| `DepthOfFieldFstop` | float | Aperture in f-stops; lower means shallower focus |
+| `DepthOfFieldMinFstop` | float | Minimum aperture clamp |
+| `DepthOfFieldBladeCount` | int32 | Aperture blade count, shapes the bokeh |
+| `DepthOfFieldFocalDistance` | float | Distance from camera to the focal plane, in cm |
+| `DepthOfFieldSensorWidth` | float | Sensor width in mm |
+| `DepthOfFieldDepthBlurRadius` | float | Depth blur radius at 1 m |
+| `DepthOfFieldDepthBlurAmount` | float | Multiplier for the depth blur radius |
+| `DepthOfFieldNearTransitionRegion` | float | Blur transition distance in front of the focal plane, cm |
+| `DepthOfFieldFarTransitionRegion` | float | Blur transition distance behind the focal plane, cm |
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_DepthOfFieldFstop` | bool | false | |
-| `DepthOfFieldFstop` | float | 4.0 | Aperture in f-stops. Lower = more blur (f/1.4 = very shallow DOF) |
-| `bOverride_DepthOfFieldMinFstop` | bool | false | |
-| `DepthOfFieldMinFstop` | float | 1.2 | Minimum aperture clamp |
-| `bOverride_DepthOfFieldBladeCount` | bool | false | |
-| `DepthOfFieldBladeCount` | int32 | 5 | Aperture blade count (affects bokeh shape) |
-| `bOverride_DepthOfFieldFocalDistance` | bool | false | |
-| `DepthOfFieldFocalDistance` | float | 1000.0 | In-focus distance from camera (cm) |
-| `bOverride_DepthOfFieldSensorWidth` | bool | false | |
-| `DepthOfFieldSensorWidth` | float | 24.576 | Sensor width in mm (affects DOF calculation) |
-| `bOverride_DepthOfFieldDepthBlurRadius` | bool | false | |
-| `DepthOfFieldDepthBlurRadius` | float | 0.0 | Gaussian blur radius at 1m distance (0 = off) |
-| `bOverride_DepthOfFieldDepthBlurAmount` | bool | false | |
-| `DepthOfFieldDepthBlurAmount` | float | 1.0 | Blur amount multiplier for DepthBlurRadius |
-| `bOverride_DepthOfFieldNearTransitionRegion` | bool | false | |
-| `DepthOfFieldNearTransitionRegion` | float | 300.0 | Distance in front of focal plane for blur transition (cm) |
-| `bOverride_DepthOfFieldFarTransitionRegion` | bool | false | |
-| `DepthOfFieldFarTransitionRegion` | float | 500.0 | Distance behind focal plane for blur transition (cm) |
-
-**Visual effect:** `DepthOfFieldFstop = 1.4` with `DepthOfFieldFocalDistance = 200` (2m) creates a very cinematic portrait-style shallow depth of field. `Fstop = 22` produces near-infinite focus.
+`DepthOfFieldFstop = 1.4` with `DepthOfFieldFocalDistance = 200` gives a portrait-style shallow focus; `Fstop = 22` is near-infinite focus.
 
 ---
 
 ## Color Grading
 
-Adjusts the final image colors. Applied in linear light before tonemapping.
+All grading fields are `FVector4` — RGB plus a master component in W.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `bOverride_ColorSaturation` | bool | |
-| `ColorSaturation` | FVector4 | Per-channel saturation (RGBA). Default = (1,1,1,1) |
-| `bOverride_ColorContrast` | bool | |
-| `ColorContrast` | FVector4 | Per-channel contrast. Default = (1,1,1,1) |
-| `bOverride_ColorGamma` | bool | |
-| `ColorGamma` | FVector4 | Gamma correction per channel. Default = (1,1,1,1) |
-| `bOverride_ColorGain` | bool | |
-| `ColorGain` | FVector4 | Multiplier per channel. Default = (1,1,1,1) |
-| `bOverride_ColorOffset` | bool | |
-| `ColorOffset` | FVector4 | Additive offset per channel. Default = (0,0,0,0) |
-| `bOverride_ColorSaturationShadows` | bool | Shadow-region saturation |
-| `ColorSaturationShadows` | FVector4 | Affects only shadow tones |
-| `bOverride_ColorSaturationMidtones` | bool | Midtone-region saturation |
-| `ColorSaturationMidtones` | FVector4 | Affects only midtones |
-| `bOverride_ColorSaturationHighlights` | bool | Highlight-region saturation |
-| `ColorSaturationHighlights` | FVector4 | Affects only highlights |
+| Field | Scope |
+|-------|-------|
+| `ColorSaturation`, `ColorContrast`, `ColorGamma`, `ColorGain`, `ColorOffset` | Whole image |
+| `ColorSaturationShadows`, `ColorContrastShadows`, `ColorGammaShadows`, `ColorGainShadows`, `ColorOffsetShadows` | Shadow range |
+| `ColorSaturationMidtones`, `ColorContrastMidtones`, `ColorGammaMidtones`, `ColorGainMidtones`, `ColorOffsetMidtones` | Midtone range |
+| `ColorSaturationHighlights`, `ColorContrastHighlights`, `ColorGammaHighlights`, `ColorGainHighlights`, `ColorOffsetHighlights` | Highlight range |
 
 ```cpp
-// Desaturate shadows (classic film noir / horror look)
-PPV->Settings.bOverride_ColorSaturationShadows = true;
-PPV->Settings.ColorSaturationShadows = FVector4(0.5f, 0.5f, 0.5f, 1.0f);
-
-// Teal-orange grade — boost blue-greens in shadows, warm up highlights
-PPV->Settings.bOverride_ColorOffsetShadows = true;
-PPV->Settings.ColorOffsetShadows = FVector4(0.0f, 0.01f, 0.02f, 0.0f); // slight blue push in shadows
-PPV->Settings.bOverride_ColorGainHighlights = true;
-PPV->Settings.ColorGainHighlights = FVector4(1.05f, 0.98f, 0.9f, 1.0f);  // warm highlights
+// Desaturated shadows, warm highlights
+S.bOverride_ColorSaturationShadows = true;
+S.ColorSaturationShadows = FVector4(0.5f, 0.5f, 0.5f, 1.0f);
+S.bOverride_ColorGainHighlights = true;
+S.ColorGainHighlights = FVector4(1.05f, 0.98f, 0.9f, 1.0f);
 ```
 
-**Visual effect:** `ColorSaturation = FVector4(0,0,0,1)` produces full greyscale. The W (alpha) component of these vectors is a master scale applied equally to RGB.
+`ColorSaturation = FVector4(0, 0, 0, 1)` is full greyscale.
+
+Filmic tonemapper controls live alongside them: `FilmSlope`, `FilmToe`, `FilmShoulder`, `FilmBlackClip`, `FilmWhiteClip`.
 
 ---
 
-## Vignette
+## Vignette and Film Grain
 
-Darkens edges of the screen.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_VignetteIntensity` | bool | false | |
-| `VignetteIntensity` | float | 0.4 | 0 = no vignette, 1 = strong dark edges |
-
----
-
-## Film Grain
-
-Adds photographic grain to the final image.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_FilmGrainIntensity` | bool | false | |
-| `FilmGrainIntensity` | float | 0.0 | Overall grain strength |
-| `bOverride_FilmGrainIntensityShadows` | bool | false | |
-| `FilmGrainIntensityShadows` | float | 1.0 | Grain intensity in shadow regions |
-| `bOverride_FilmGrainIntensityMidtones` | bool | false | |
-| `FilmGrainIntensityMidtones` | float | 1.0 | Grain intensity in midtone regions |
-| `bOverride_FilmGrainIntensityHighlights` | bool | false | |
-| `FilmGrainIntensityHighlights` | float | 1.0 | Grain intensity in highlight regions |
-| `bOverride_FilmGrainShadowsMax` | bool | false | |
-| `FilmGrainShadowsMax` | float | 0.09 | Maximum luminance where shadows grain applies |
-| `bOverride_FilmGrainHighlightsMin` | bool | false | |
-| `FilmGrainHighlightsMin` | float | 0.5 | Minimum luminance where highlights grain applies |
+| Field | Type | Meaning |
+|-------|------|---------|
+| `VignetteIntensity` | float | 0 is off, 1 is heavy edge darkening |
+| `FilmGrainIntensity` | float | Overall grain strength |
+| `FilmGrainIntensityShadows` | float | Grain weighting in shadows |
+| `FilmGrainIntensityMidtones` | float | Grain weighting in midtones |
+| `FilmGrainIntensityHighlights` | float | Grain weighting in highlights |
+| `FilmGrainShadowsMax` | float | Luminance below which the shadow weighting applies |
+| `FilmGrainHighlightsMin` | float | Luminance above which the highlight weighting applies |
 
 ---
 
-## Ambient Occlusion (SSAO)
+## Ambient Occlusion
 
-Screen-space approximation of ambient occlusion (shadowing in crevices and corners).
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_AmbientOcclusionIntensity` | bool | false | |
-| `AmbientOcclusionIntensity` | float | 0.5 | 0 = off, 1 = full AO |
-| `bOverride_AmbientOcclusionRadius` | bool | false | |
-| `AmbientOcclusionRadius` | float | 200.0 | World-space sample radius in cm |
-| `bOverride_AmbientOcclusionRadiusInWS` | bool | false | |
-| `AmbientOcclusionRadiusInWS` | bool | false | If true, Radius is world-space cm; else view-space |
-| `bOverride_AmbientOcclusionBias` | bool | false | |
-| `AmbientOcclusionBias` | float | 3.0 | Bias to avoid self-occlusion on surfaces |
-| `bOverride_AmbientOcclusionPower` | bool | false | |
-| `AmbientOcclusionPower` | float | 2.0 | Power applied to AO result; higher = more contrast |
-| `bOverride_AmbientOcclusionQuality` | bool | false | |
-| `AmbientOcclusionQuality` | float | 50.0 | 0–100; number of samples |
-
-**Visual effect:** AO adds subtle shadowing where surfaces meet, grounding objects and adding depth. Increase `Radius` for large architectural scenes; decrease for small props.
+| Field | Type | Meaning |
+|-------|------|---------|
+| `AmbientOcclusionIntensity` | float | 0 is off, 1 is full occlusion |
+| `AmbientOcclusionRadius` | float | Sample radius |
+| `AmbientOcclusionRadiusInWS` | bitfield | When set, `AmbientOcclusionRadius` is world space rather than view space |
+| `AmbientOcclusionBias` | float | Bias that suppresses self-occlusion |
+| `AmbientOcclusionPower` | float | Exponent applied to the AO term |
+| `AmbientOcclusionQuality` | float | Sample count knob |
 
 ---
 
-## Lumen Global Illumination and Reflections (UE5)
+## Global Illumination and Reflections
 
-Lumen replaces SSAO, SSGI, and SSR for high-quality GI and reflections.
+| Field | Type | Meaning |
+|-------|------|---------|
+| `DynamicGlobalIlluminationMethod` | `TEnumAsByte<EDynamicGlobalIlluminationMethod::Type>` | `None`, `Lumen`, `ScreenSpace` (deprecated, `Engine/EngineTypes.h:463`), `Plugin` |
+| `ReflectionMethod` | `TEnumAsByte<EReflectionMethod::Type>` | `None`, `Lumen`, `ScreenSpace` |
+| `LumenSceneDetail` | float | Surface cache detail multiplier |
+| `LumenSceneLightingQuality` | float | Lumen scene lighting quality |
+| `LumenSceneLightingUpdateSpeed` | float | How fast scene lighting changes propagate |
+| `LumenFinalGatherQuality` | float | Final gather quality for diffuse GI |
+| `LumenFinalGatherLightingUpdateSpeed` | float | Final gather update rate |
+| `LumenMaxTraceDistance` | float | Maximum trace distance in cm |
+| `LumenReflectionQuality` | float | Reflection trace quality |
+| `LumenRayLightingMode` | `ELumenRayLightingModeOverride` | `Default`, `SurfaceCache`, `HitLightingForReflections`, `HitLighting` |
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_LumenSceneDetail` | bool | false | |
-| `LumenSceneDetail` | float | 1.0 | Surface cache resolution scale. Higher = better quality, higher cost |
-| `bOverride_LumenSceneLightingQuality` | bool | false | |
-| `LumenSceneLightingQuality` | float | 1.0 | Lighting pass quality. Range 0–4 |
-| `bOverride_LumenSceneLightingUpdateSpeed` | bool | false | |
-| `LumenSceneLightingUpdateSpeed` | float | 1.0 | How quickly scene lighting updates propagate |
-| `bOverride_LumenFinalGatherQuality` | bool | false | |
-| `LumenFinalGatherQuality` | float | 1.0 | GI final gather quality. Range 0–4 |
-| `bOverride_LumenFinalGatherLightingUpdateSpeed` | bool | false | |
-| `LumenFinalGatherLightingUpdateSpeed` | float | 1.0 | Update speed for final gather lighting |
-| `bOverride_LumenMaxTraceDistance` | bool | false | |
-| `LumenMaxTraceDistance` | float | 20000.0 | Maximum ray trace distance in cm |
-| `bOverride_LumenReflectionQuality` | bool | false | |
-| `LumenReflectionQuality` | float | 1.0 | Reflection quality. Range 0–4 |
-| `bOverride_LumenRayLightingMode` | bool | false | |
-| `LumenRayLightingMode` | ELumenRayLightingModeOverride | Default | `Default`, `SurfaceCache`, `HitLighting` |
+`EDynamicGlobalIlluminationMethod::Type` and `EReflectionMethod::Type` are declared in `Engine/EngineTypes.h`; `ELumenRayLightingModeOverride` in `Engine/Scene.h`.
 
-**Visual effect:**
-- Increasing `LumenSceneDetail` to 2–4 improves interior scenes where cache misses cause splotchy GI.
-- `LumenReflectionQuality = 2+` with `HitLighting` mode gives accurate mirror-like reflections at higher cost.
-- `LumenMaxTraceDistance` controls the effective GI range — reduce for indoor-only scenes to save performance.
+Raising `LumenSceneDetail` helps interiors where surface-cache misses produce splotchy GI. `HitLightingForReflections` trades GPU time for accurate mirror-like reflections. Reducing `LumenMaxTraceDistance` is a cheap win in enclosed levels.
 
 ---
 
-## Screen Space Global Illumination (SSGI, non-Lumen)
+## MegaLights
 
-Available when Lumen is disabled. Screen-space only.
+| Field | Type | Meaning |
+|-------|------|---------|
+| `bMegaLights` | bitfield | Enables MegaLights for views affected by this volume |
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_ScreenSpaceReflectionIntensity` | bool | false | |
-| `ScreenSpaceReflectionIntensity` | float | 100.0 | SSR strength (0 = off) |
-| `bOverride_ScreenSpaceReflectionQuality` | bool | false | |
-| `ScreenSpaceReflectionQuality` | float | 50.0 | SSR sample count (0–100) |
-| `bOverride_ScreenSpaceReflectionMaxRoughness` | bool | false | |
-| `ScreenSpaceReflectionMaxRoughness` | float | 0.6 | Max roughness for SSR (0–1) |
+```cpp
+S.bOverride_bMegaLights = true;
+S.bMegaLights = true;
+```
+
+The project default is `URendererSettings::bEnableMegaLights` (`r.MegaLights.EnableForProject`). MegaLights needs hardware ray tracing or, as fallback, software (Lumen) tracing data (`MegaLights::HasRequiredTracingData`, `Renderer/Private/MegaLights/MegaLights.cpp:541`), replaces the other direct-lighting and shadowing paths for the lights it handles, and skips directional lights unless `r.MegaLights.DirectionalLights=1` (default 0, `MegaLights.cpp:239`). Runtime CVars include `r.MegaLights.Allowed`, `r.MegaLights.HardwareRayTracing` and `r.MegaLights.Denoiser`.
+
+---
+
+## Screen Space Reflections
+
+Used when `ReflectionMethod` is `ScreenSpace`.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `ScreenSpaceReflectionIntensity` | float | SSR strength |
+| `ScreenSpaceReflectionQuality` | float | SSR sample count |
+| `ScreenSpaceReflectionMaxRoughness` | float | Roughness cutoff above which SSR stops contributing |
 
 ---
 
 ## Motion Blur
 
-Blurs moving objects proportional to velocity.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_MotionBlurAmount` | bool | false | |
-| `MotionBlurAmount` | float | 0.5 | Blur strength (0 = off) |
-| `bOverride_MotionBlurMax` | bool | false | |
-| `MotionBlurMax` | float | 5.0 | Maximum blur length as percentage of screen width |
-| `bOverride_MotionBlurTargetFPS` | bool | false | |
-| `MotionBlurTargetFPS` | int32 | 30 | Target FPS for motion blur normalization |
-| `bOverride_MotionBlurPerObjectSize` | bool | false | |
-| `MotionBlurPerObjectSize` | float | 0.5 | Threshold for per-object motion blur |
+| Field | Type | Meaning |
+|-------|------|---------|
+| `MotionBlurAmount` | float | Blur strength; 0 disables |
+| `MotionBlurMax` | float | Maximum blur length as a percentage of screen width |
+| `MotionBlurTargetFPS` | int32 | Frame rate the blur length is normalised to |
+| `MotionBlurPerObjectSize` | float | Screen-size threshold for per-object blur |
 
 ---
 
-## Chromatic Aberration
+## Lens Artefacts
 
-Simulates lens color fringing (RGB channel separation at screen edges).
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_SceneFringeIntensity` | bool | false | |
-| `SceneFringeIntensity` | float | 0.0 | 0 = off, 5.0 = visible fringe |
-| `bOverride_ChromaticAberrationStartOffset` | bool | false | |
-| `ChromaticAberrationStartOffset` | float | 0.0 | Radial start position (0 = center, 1 = edge) |
-
----
-
-## Camera Lens (Dirt Mask and Lens Flares)
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bOverride_LensFlareIntensity` | bool | false | |
-| `LensFlareIntensity` | float | 1.0 | Streak/flare strength around bright sources |
-| `bOverride_LensFlareBokehSize` | bool | false | |
-| `LensFlareBokehSize` | float | 3.0 | Bokeh lens flare size |
-| `bOverride_LensFlareThreshold` | bool | false | |
-| `LensFlareThreshold` | float | 8.0 | Luminance threshold for lens flares |
-| `bOverride_BloomDirtMaskIntensity` | bool | false | |
-| `BloomDirtMaskIntensity` | float | 0.0 | Camera lens dirt over bloom |
-| `bOverride_BloomDirtMask` | bool | false | |
-| `BloomDirtMask` | `UTexture*` | nullptr | Dirt mask texture |
+| Field | Type | Meaning |
+|-------|------|---------|
+| `SceneFringeIntensity` | float | Chromatic aberration strength |
+| `ChromaticAberrationStartOffset` | float | Radial start of the aberration, 0 at centre |
+| `LensFlareIntensity` | float | Flare strength around bright sources |
+| `LensFlareBokehSize` | float | Bokeh flare size |
+| `LensFlareThreshold` | float | Luminance threshold for flares |
 
 ---
 
-## Post-Process Materials (Blendables)
+## Blendables (Post-Process Materials)
 
-Post-process materials are added via the volume's blendable array:
+`FPostProcessSettings` holds a `FWeightedBlendables WeightedBlendables` array. Do not edit it directly; use:
 
 ```cpp
-// Material Domain must be set to "Post Process" in material editor.
-PPV->AddOrUpdateBlendable(PostProcessMaterial, 1.0f);
-
-// Via Settings directly (typed):
-PPV->Settings.AddBlendable(PostProcessMaterial, 0.5f);
-
-// Weighted blend — weight 0 = invisible, 1 = full effect
-// Multiple blendables are composited in array order.
+void AddBlendable(TScriptInterface<IBlendableInterface> InBlendableObject, float InWeight);
+void RemoveBlendable(TScriptInterface<IBlendableInterface> InBlendableObject);
 ```
 
-Blendable priorities within the post-process pipeline:
-1. Scene Color (before tone mapping) — use `Blendable Location: Before Tonemapping`
-2. After Tone Mapping — use `Blendable Location: After Tonemapping`
-3. SSR input — special location for SSR replacement
+`APostProcessVolume`, `UPostProcessComponent` and `UCameraComponent` each forward to `AddBlendable` through `AddOrUpdateBlendable(TScriptInterface<IBlendableInterface> InBlendableObject, float InWeight = 1.0f)`.
+
+```cpp
+// A material or a MID both satisfy IBlendableInterface.
+Volume->AddOrUpdateBlendable(OutlineMaterial, 1.0f);
+
+UMaterialInstanceDynamic* OutlineMID = UMaterialInstanceDynamic::Create(OutlineMaterial, this);
+OutlineMID->SetScalarParameterValue(TEXT("Thickness"), 2.f);
+Volume->AddOrUpdateBlendable(OutlineMID, 1.0f);
+```
+
+The material's `MaterialDomain` must be `MD_PostProcess` (`MaterialDomain.h`). Its `BlendableLocation` field selects where the pass runs; `EBlendableLocation` (`Engine/BlendableInterface.h`):
+
+| Value | Runs |
+|-------|------|
+| `BL_SceneColorBeforeDOF` | Between translucency distortion and depth of field |
+| `BL_SceneColorAfterDOF` | Between DOF and after-DOF translucency |
+| `BL_TranslucencyAfterDOF` | On the after-DOF translucency pass |
+| `BL_SSRInput` | Supplies the screen-space reflection input |
+| `BL_SceneColorBeforeBloom` | After translucency, before bloom |
+| `BL_ReplacingTonemapper` | Replaces the tonemapper entirely |
+| `BL_SceneColorAfterTonemapping` | After tonemapping, in display space |
+
+Ordering within one location is `UMaterial::BlendablePriority`. `UMaterial::bIsBlendable` controls whether several weighted instances of the material at one location are merged into one pass with interpolated parameters (`false` gives each its own pass; a material with a `UserSceneTexture` output is never merged, `Material.cpp:2097`), and `UMaterial::UserSceneTexture` names a user scene texture the pass writes.
 
 ---
 
 ## Volume Priority and Blending
 
-Multiple overlapping volumes blend based on:
-
-1. **Priority** — higher value wins when fully inside. Undefined order on tie.
-2. **BlendWeight** — 0 to 1; partial effect weight.
-3. **BlendRadius** — world-space distance from volume boundary where blend transitions.
-4. **bUnbound** — if true, volume applies everywhere (lowest effective priority among unbounded volumes unless Priority is set high).
+| Field | Effect |
+|-------|--------|
+| `Priority` | Higher wins where volumes overlap; order is undefined on ties |
+| `BlendWeight` | 0 contributes nothing, 1 contributes fully |
+| `BlendRadius` | World-space distance outside the volume over which the contribution ramps in |
+| `bUnbound` | Applies everywhere, ignoring the volume bounds |
+| `bEnabled` | Turns the volume off without changing its settings |
 
 ```cpp
-// Two volumes overlapping: the one with Priority = 10 overrides Priority = 1
-// for all properties both have bOverride set.
-
-PPVBackground->Priority = 1;
-PPVDanger->Priority = 10;
+BackgroundVolume->Priority = 1.f;
+DangerVolume->Priority = 10.f;   // wins wherever both apply
 ```
 
-Blend order from source documentation: the camera's final post-process settings are accumulated from lowest to highest priority, with each higher-priority volume blending over lower-priority settings according to BlendWeight.
+Only properties whose `bOverride_*` bit is set participate; everything else falls through to the next volume down.
 
 ---
 
-## Common Presets (C++ Snippets)
+## Presets
 
-### Horror / Dark Atmosphere
+### Dark and oppressive
 
 ```cpp
-auto& S = PPV->Settings;
+FPostProcessSettings& S = Volume->Settings;
 
-S.bOverride_BloomIntensity = true;       S.BloomIntensity = 0.2f;
-S.bOverride_VignetteIntensity = true;    S.VignetteIntensity = 1.0f;
-S.bOverride_ColorSaturation = true;      S.ColorSaturation = FVector4(0.6f, 0.6f, 0.6f, 1.0f);
+S.bOverride_BloomIntensity = true;            S.BloomIntensity = 0.2f;
+S.bOverride_VignetteIntensity = true;         S.VignetteIntensity = 1.0f;
+S.bOverride_ColorSaturation = true;           S.ColorSaturation = FVector4(0.6f, 0.6f, 0.6f, 1.0f);
 S.bOverride_AutoExposureMinBrightness = true; S.AutoExposureMinBrightness = 0.01f;
 S.bOverride_AutoExposureMaxBrightness = true; S.AutoExposureMaxBrightness = 1.0f;
-S.bOverride_FilmGrainIntensity = true;   S.FilmGrainIntensity = 0.8f;
+S.bOverride_FilmGrainIntensity = true;        S.FilmGrainIntensity = 0.8f;
 ```
 
-### High-Contrast Cinematic
+### High-contrast cinematic
 
 ```cpp
-auto& S = PPV->Settings;
+FPostProcessSettings& S = Volume->Settings;
 
-S.bOverride_BloomIntensity = true;       S.BloomIntensity = 0.5f;
-S.bOverride_ColorContrast = true;        S.ColorContrast = FVector4(1.3f, 1.3f, 1.3f, 1.0f);
-S.bOverride_ColorSaturation = true;      S.ColorSaturation = FVector4(1.2f, 1.2f, 1.2f, 1.0f);
-S.bOverride_DepthOfFieldFstop = true;    S.DepthOfFieldFstop = 2.0f;
+S.bOverride_BloomIntensity = true;            S.BloomIntensity = 0.5f;
+S.bOverride_ColorContrast = true;             S.ColorContrast = FVector4(1.3f, 1.3f, 1.3f, 1.0f);
+S.bOverride_ColorSaturation = true;           S.ColorSaturation = FVector4(1.2f, 1.2f, 1.2f, 1.0f);
+S.bOverride_DepthOfFieldFstop = true;         S.DepthOfFieldFstop = 2.0f;
 S.bOverride_DepthOfFieldFocalDistance = true; S.DepthOfFieldFocalDistance = 500.0f;
-S.bOverride_MotionBlurAmount = true;     S.MotionBlurAmount = 0.4f;
+S.bOverride_MotionBlurAmount = true;          S.MotionBlurAmount = 0.4f;
 ```
 
-### Sci-Fi / Tech UI Overlay
+### Tech overlay
 
 ```cpp
-auto& S = PPV->Settings;
+FPostProcessSettings& S = Volume->Settings;
 
-S.bOverride_BloomIntensity = true;      S.BloomIntensity = 2.0f;
-S.bOverride_SceneFringeIntensity = true; S.SceneFringeIntensity = 2.0f;
-S.bOverride_ColorSaturationHighlights = true;
-S.ColorSaturationHighlights = FVector4(0.7f, 1.2f, 1.4f, 1.0f); // teal highlights
-S.bOverride_VignetteIntensity = true;   S.VignetteIntensity = 0.6f;
+S.bOverride_BloomIntensity = true;             S.BloomIntensity = 2.0f;
+S.bOverride_SceneFringeIntensity = true;       S.SceneFringeIntensity = 2.0f;
+S.bOverride_ColorSaturationHighlights = true;  S.ColorSaturationHighlights = FVector4(0.7f, 1.2f, 1.4f, 1.0f);
+S.bOverride_VignetteIntensity = true;          S.VignetteIntensity = 0.6f;
 ```
 
-### Disable All Post-Process (Performance / Mobile)
+### Suppress a volume
 
 ```cpp
-// Set BlendWeight to 0 to suppress all post-process from a volume
-PPV->BlendWeight = 0.0f;
-
-// Or disable entirely
-PPV->bEnabled = false;
+Volume->BlendWeight = 0.0f;   // keeps the settings, contributes nothing
+Volume->bEnabled = false;     // removes it from the blend entirely
 ```

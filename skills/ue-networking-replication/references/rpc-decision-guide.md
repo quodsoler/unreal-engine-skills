@@ -1,393 +1,378 @@
 # RPC Decision Guide
 
-Reference for choosing the correct RPC type (Server, Client, NetMulticast) and
-reliability level (Reliable, Unreliable) in Unreal Engine multiplayer code.
-All patterns are grounded in real `APlayerController` usage from `PlayerController.h`.
+Choosing the RPC type (`Server`, `Client`, `NetMulticast`) and reliability (`Reliable`, `Unreliable`) in UE 5.8. Engine examples are quoted verbatim from `Engine/Source/Runtime/Engine/Classes/GameFramework/PlayerController.h` with line numbers.
 
 ---
 
-## RPC Type Quick Reference
+## Quick Reference
 
-| Specifier       | Called on  | Executes on              | Typical use                            |
-|-----------------|------------|--------------------------|----------------------------------------|
-| `Server`        | Client     | Server (Authority)       | Player input, purchase, ability use    |
-| `Client`        | Server     | Owning client only       | UI updates, player-specific feedback   |
-| `NetMulticast`  | Server     | Server + all clients     | World effects visible to everyone      |
+| Specifier | Called on | Executes on | Typical use |
+|---|---|---|---|
+| `Server` | owning client | server (authority) | player intent: fire, purchase, activate |
+| `Client` | server | owning client only | private feedback, UI, connection-scoped setup |
+| `NetMulticast` | server | server + every client the actor is relevant to | shared one-shot cosmetics |
+
+`Reliable` and `Unreliable` are only valid alongside one of the three above (`UObject/ObjectMacros.h`). `WithValidation` requires a `_Validate` body; UHT accepts it on any RPC (the engine even uses it on `Client` RPCs, `Controller.h:198`), but it only earns its keep on `Server` RPCs.
 
 ---
 
-## Decision Flowchart
+## Decision Flow
 
 ```
-Is this a request from a player to change game state?
-  YES --> use Server RPC (client calls, server executes)
-  NO  --> continue
+Is this a request from a player to change authoritative state?
+  yes -> Server RPC
+  no  -> continue
 
-Should this run only on one specific player's machine?
-  YES --> use Client RPC (server calls, owning client executes)
-  NO  --> continue
+Does exactly one player's machine need to react?
+  yes -> Client RPC
+  no  -> continue
 
-Should this run on the server AND every connected client simultaneously?
-  YES --> use NetMulticast RPC (server calls, all machines execute)
-  NO  --> reconsider: is property replication a better fit?
+Must every machine react at the same moment, with no recovery for late joiners?
+  yes -> NetMulticast RPC
+  no  -> use a replicated property instead
 ```
 
 ---
 
 ## Server RPC
 
-**Who calls it**: the client (specifically the owning client of the actor).
-**Who executes it**: the server.
-**Primary use**: forwarding player intent to the authoritative machine.
+```cpp
+// MyWeapon.h
+#pragma once
 
-All Server RPCs that change game state must include `WithValidation`. This generates
-a `_Validate` function the engine calls before `_Implementation`. Returning `false`
-from `_Validate` kicks the calling client.
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "Engine/NetSerialization.h"
+#include "MyWeapon.generated.h"
+
+UCLASS()
+class MYGAME_API AMyWeapon : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    UFUNCTION(Server, Reliable, WithValidation)
+    void ServerFireWeapon(FVector_NetQuantize MuzzleLocation, FVector_NetQuantizeNormal Direction);
+
+    UFUNCTION(NetMulticast, Unreliable)
+    void MulticastSpawnTracer(FVector_NetQuantize Start, FVector_NetQuantize End);
+
+protected:
+    UPROPERTY(EditDefaultsOnly, Category = "Weapon")
+    float WeaponDamage = 20.f;
+
+    UPROPERTY(EditDefaultsOnly, Category = "Weapon")
+    float MaxRange = 10000.f;
+};
+```
 
 ```cpp
-// Declaration
-UFUNCTION(Server, Reliable, WithValidation)
-void ServerFireWeapon(FVector_NetQuantize MuzzleLocation,
-                      FVector_NetQuantizeNormal Direction);
+// MyWeapon.cpp
+#include "MyWeapon.h"
+#include "MyCharacter.h"
+#include "Engine/World.h"
 
-// Implementation (.cpp)
-void AMyCharacter::ServerFireWeapon_Implementation(
-    FVector_NetQuantize MuzzleLocation,
-    FVector_NetQuantizeNormal Direction)
+void AMyWeapon::ServerFireWeapon_Implementation(FVector_NetQuantize MuzzleLocation, FVector_NetQuantizeNormal Direction)
 {
-    // Server performs authoritative hit trace
     FHitResult Hit;
     FCollisionQueryParams Params;
     Params.AddIgnoredActor(this);
+    Params.AddIgnoredActor(GetOwner());
 
-    if (GetWorld()->LineTraceSingleByChannel(
-            Hit, MuzzleLocation, MuzzleLocation + Direction * 10000.f,
-            ECC_Pawn, Params))
+    const FVector End = MuzzleLocation + Direction * MaxRange;
+    if (GetWorld()->LineTraceSingleByChannel(Hit, MuzzleLocation, End, ECC_Pawn, Params))
     {
         if (AMyCharacter* Victim = Cast<AMyCharacter>(Hit.GetActor()))
         {
-            Victim->ApplyDamage_Authority(WeaponDamage);
+            Victim->ApplyDamageOnServer(WeaponDamage);
         }
     }
 
-    // Spawn bullet tracer effect on all clients
-    MulticastSpawnTracer(MuzzleLocation, Hit.ImpactPoint);
+    MulticastSpawnTracer(MuzzleLocation, Hit.bBlockingHit ? FVector_NetQuantize(Hit.ImpactPoint) : FVector_NetQuantize(End));
 }
 
-bool AMyCharacter::ServerFireWeapon_Validate(
-    FVector_NetQuantize MuzzleLocation,
-    FVector_NetQuantizeNormal Direction)
+bool AMyWeapon::ServerFireWeapon_Validate(FVector_NetQuantize MuzzleLocation, FVector_NetQuantizeNormal Direction)
 {
-    // Reject zero directions
-    if (Direction.IsNearlyZero()) return false;
-    // Reject muzzle locations impossibly far from actor
-    if (FVector::Dist(MuzzleLocation, GetActorLocation()) > 500.f) return false;
-    return true;
+    if (Direction.IsNearlyZero())
+    {
+        return false;
+    }
+    return FVector::Dist(MuzzleLocation, GetActorLocation()) <= 500.f;
+}
+
+void AMyWeapon::MulticastSpawnTracer_Implementation(FVector_NetQuantize Start, FVector_NetQuantize End)
+{
+    // Cosmetic tracer; every declared RPC needs its _Implementation or the module fails to link.
 }
 ```
 
-Real examples from `PlayerController.h`:
+`AMyCharacter` declares the server-side entry point `void ApplyDamageOnServer(float Damage);` — see [replication patterns, Pattern 1](replication-patterns.md).
+
+Returning `false` from `_Validate` closes the calling client's connection, so validate only what a legitimate client can never violate. Reject impossible values; do not use `_Validate` for gameplay rules like cooldowns — put those in `_Implementation`.
+
+### Verbatim engine examples
 
 ```cpp
-// Player acknowledges pawn possession — must not be lost, Reliable
+// PlayerController.h:1472-1473 — possession handshake must not be lost
 UFUNCTION(reliable, server, WithValidation)
-void ServerAcknowledgePossession(class APawn* P);
+ENGINE_API void ServerAcknowledgePossession(class APawn* P);
 
-// Spectator position — sent frequently, OK to drop, Unreliable
-UFUNCTION(unreliable, server, WithValidation)
-void ServerSetSpectatorLocation(FVector NewLoc, FRotator NewRot);
-
-// Server restart — must not be dropped, Reliable
+// PlayerController.h:1495-1496 — respawn request
 UFUNCTION(reliable, server, WithValidation)
-void ServerRestartPlayer();
+ENGINE_API void ServerRestartPlayer();
 
-// Camera update — sent frequently, can be dropped, Unreliable
+// PlayerController.h:1499-1500 — spectator position, sent constantly, safe to drop
 UFUNCTION(unreliable, server, WithValidation)
-void ServerUpdateCamera(FVector_NetQuantize CamLoc, int32 CamPitchAndYaw);
+ENGINE_API void ServerSetSpectatorLocation(FVector NewLoc, FRotator NewRot);
+
+// PlayerController.h:1522-1523 — camera update, superseded every tick
+UFUNCTION(unreliable, server, WithValidation)
+ENGINE_API void ServerUpdateCamera(FVector_NetQuantize CamLoc, int32 CamPitchAndYaw);
 ```
 
-### When to use Reliable vs Unreliable for Server RPCs
+Note the pattern: handshakes and one-off state transitions are `reliable`; anything re-sent next tick is `unreliable`.
 
-| Scenario                          | Reliability  |
-|-----------------------------------|--------------|
-| Purchase, ability activation      | Reliable     |
-| Possession / respawn              | Reliable     |
-| Player name or setting change     | Reliable     |
-| Level streaming notification      | Reliable     |
-| Frequent position / camera update | Unreliable   |
-| High-frequency input relay        | Unreliable   |
+| Scenario | Reliability |
+|---|---|
+| Purchase, ability activation, respawn | Reliable |
+| Possession acknowledgement, level-load notification | Reliable |
+| Settings or name change | Reliable |
+| Camera / spectator position | Unreliable |
+| Per-tick input relay | Unreliable |
 
 ---
 
 ## Client RPC
 
-**Who calls it**: the server.
-**Who executes it**: the owning client of the actor.
-**Primary use**: sending player-specific information or triggering private feedback.
-
-`Client` RPCs do not need `WithValidation` — the server already has authority.
+`Client` RPCs rarely need `WithValidation` — the server is already authoritative (a few engine ones use it, e.g. `ClientSetLocation`, `Controller.h:198-199`).
 
 ```cpp
-// Declaration
+// MyPlayerController.h
 UFUNCTION(Client, Reliable)
 void ClientShowMatchResult(bool bWon, int32 FinalScore);
+```
 
-// Implementation
-void AMyPlayerController::ClientShowMatchResult_Implementation(
-    bool bWon, int32 FinalScore)
+```cpp
+// MyPlayerController.cpp
+#include "MyPlayerController.h"
+#include "MyHUD.h"
+
+void AMyPlayerController::ClientShowMatchResult_Implementation(bool bWon, int32 FinalScore)
 {
-    // Runs only on the owning client — safe to access local UI
-    if (UMyHUD* HUD = Cast<UMyHUD>(GetHUD()))
+    // Owning client only — local UI is safe to touch here.
+    // Not "MyHUD": that name shadows APlayerController::MyHUD (C4458, an error in UE builds).
+    if (AMyHUD* MatchHUD = Cast<AMyHUD>(GetHUD()))
     {
-        HUD->ShowMatchResult(bWon, FinalScore);
+        MatchHUD->DisplayMatchResult(bWon, FinalScore);
     }
 }
 ```
 
-Real examples from `PlayerController.h`:
+`AMyHUD` declares `void DisplayMatchResult(bool bWon, int32 FinalScore);` in its header; `AHUD` only exists on clients, so this path never runs on a dedicated server.
+
+### Verbatim engine examples
 
 ```cpp
-// Tell the client it's been muted — Reliable, player must know
+// PlayerController.h:944-945 — mute notification
 UFUNCTION(Reliable, Client)
-void ClientMutePlayer(FUniqueNetIdRepl PlayerId);
+ENGINE_API virtual void ClientMutePlayer(FUniqueNetIdRepl PlayerId);
 
-// Send a localized message to the owning client — Reliable
+// PlayerController.h:1468-1469 — localized message to one player
 UFUNCTION(Reliable, Client)
-void ClientReceiveLocalizedMessage(TSubclassOf<ULocalMessage> Message,
-    int32 Switch,
-    APlayerState* RelatedPlayerState_1,
-    APlayerState* RelatedPlayerState_2,
-    UObject* OptionalObject);
+ENGINE_API void ClientReceiveLocalizedMessage(TSubclassOf<ULocalMessage> Message, int32 Switch = 0, class APlayerState* RelatedPlayerState_1 = nullptr, class APlayerState* RelatedPlayerState_2 = nullptr, class UObject* OptionalObject = nullptr);
 
-// Client spectator waiting state — Reliable, state change must not be lost
-UFUNCTION(client, reliable)
-void ClientSetSpectatorWaiting(bool bWaiting);
+// PlayerController.h:453-454 — spectator state change
+UFUNCTION(client, reliable, Category=PlayerController)
+ENGINE_API void ClientSetSpectatorWaiting(bool bWaiting);
 
-// Async physics timestamp sync — Reliable, setup data
+// PlayerController.h:2334-2335 — network physics timestamp setup
 UFUNCTION(Client, Reliable)
-void ClientSetupNetworkPhysicsTimestamp(FAsyncPhysicsTimestamp Timestamp);
+ENGINE_API void ClientSetupNetworkPhysicsTimestamp(FAsyncPhysicsTimestamp Timestamp);
 
-// Time dilation update — Unreliable, continuously corrected
+// PlayerController.h:2338-2339 — continuously corrected, safe to drop
 UFUNCTION(Client, Unreliable)
-void ClientAckTimeDilation(float TimeDilation, int32 ServerStep);
+ENGINE_API void ClientAckTimeDilation(float TimeDilation, int32 ServerStep);
 ```
 
-### When to use Reliable vs Unreliable for Client RPCs
-
-| Scenario                                   | Reliability  |
-|--------------------------------------------|--------------|
-| UI state change (match result, kill feed)  | Reliable     |
-| Player kicked / game over notification     | Reliable     |
-| View target / camera set                   | Reliable     |
-| Sound / haptic triggered by server event   | Reliable     |
-| Camera time dilation correction            | Unreliable   |
-| High-frequency positional feedback effect  | Unreliable   |
+| Scenario | Reliability |
+|---|---|
+| Match result, kill feed, kick notice | Reliable |
+| View target change, spectator state | Reliable |
+| Connection or physics setup handshake | Reliable |
+| Time dilation / clock correction | Unreliable |
+| Per-frame positional feedback | Unreliable |
 
 ---
 
 ## NetMulticast RPC
 
-**Who calls it**: the server.
-**Who executes it**: the server AND all clients that have this actor replicated to them.
-**Primary use**: cosmetic world events that everyone should see.
+```cpp
+// MyExplosive.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "Engine/NetSerialization.h"
+#include "MyExplosive.generated.h"
+
+class UNiagaraSystem;
+class USoundBase;
+
+UCLASS()
+class MYGAME_API AMyExplosive : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    UFUNCTION(NetMulticast, Unreliable)
+    void MulticastPlayExplosion(FVector_NetQuantize Location);
+
+protected:
+    UPROPERTY(EditDefaultsOnly, Category = "FX")
+    TObjectPtr<UNiagaraSystem> ExplosionSystem;
+
+    UPROPERTY(EditDefaultsOnly, Category = "FX")
+    TObjectPtr<USoundBase> ExplosionSound;
+};
+```
 
 ```cpp
-// Declaration
-UFUNCTION(NetMulticast, Unreliable)
-void MulticastPlayExplosionEffect(FVector Location, float Radius);
+// MyExplosive.cpp
+#include "MyExplosive.h"
+#include "NiagaraFunctionLibrary.h"
+#include "Kismet/GameplayStatics.h"
+#include "Engine/World.h"
 
-// Implementation
-void AMyActor::MulticastPlayExplosionEffect_Implementation(
-    FVector Location, float Radius)
+void AMyExplosive::MulticastPlayExplosion_Implementation(FVector_NetQuantize Location)
 {
-    // Runs on server and all clients — guard so server doesn't spawn visual effects
-    if (!HasAuthority())
+    // Runs on the server too; skip cosmetics there.
+    if (GetNetMode() != NM_DedicatedServer)
     {
-        UGameplayStatics::SpawnEmitterAtLocation(
-            GetWorld(), ExplosionFX, Location);
-        UGameplayStatics::PlaySoundAtLocation(
-            GetWorld(), ExplosionSound, Location);
+        UNiagaraFunctionLibrary::SpawnSystemAtLocation(GetWorld(), ExplosionSystem, Location);
+        UGameplayStatics::PlaySoundAtLocation(GetWorld(), ExplosionSound, Location);
     }
-    // Both server and client: apply physics impulse to overlapping actors
-    ApplyExplosionImpulse(Location, Radius);
 }
 ```
 
-### Multicast vs Property Replication
+Guard with `GetNetMode() != NM_DedicatedServer` rather than `!HasAuthority()`: a listen-server host is the authority and still needs to see the effect.
 
-Prefer multicast for **one-shot events** (sounds, VFX, transient animations).
-Prefer **property replication** for **persistent state** (health, flags, positions).
+The multicast only reaches clients for whom the actor is currently relevant — an explosion on the far side of the map is silently skipped. Build.cs needs `"Niagara"` for `UNiagaraFunctionLibrary`.
 
-| Data type                          | Mechanism                        |
-|------------------------------------|----------------------------------|
-| Plays once, no recovery needed     | NetMulticast (Unreliable)        |
-| Plays once, must not be missed     | NetMulticast (Reliable)          |
-| Persists on clients that join late | UPROPERTY(Replicated)            |
-| Different value per client         | Client RPC                       |
-
----
-
-## Reliable vs Unreliable — Definitive Rules
-
-### Use Reliable when
-
-- The action has **permanent game state consequences** (purchase, death, spawn).
-- The receiver must **acknowledge** receipt to proceed (possession, level load).
-- The data is **not redundant** — there is no future update that carries the same info.
-- Dropping the packet would cause a **visible or gameplay-breaking desync**.
-
-### Use Unreliable when
-
-- The data is **superseded frequently** by the next tick's update (position, rotation).
-- It is purely **cosmetic** (hit sparks, footstep dust, screenshake).
-- Dropping it produces only a minor visual glitch, not a gameplay error.
-- The RPC is called **very often** (every tick or multiple times per second) — using
-  Reliable for high-frequency calls saturates the reliable channel and causes lag spikes.
-
-### Reliable Channel Saturation Warning
-
-The reliable channel is a FIFO queue. If too many reliable messages queue up (e.g.,
-a Server Reliable RPC called every frame), the connection will stall waiting for
-acknowledgments. This manifests as rubberbanding and eventually a timeout disconnect.
-
-**Rule**: never call a Reliable RPC more than once per server tick per connection.
+| Data | Mechanism |
+|---|---|
+| Plays once, loss acceptable | `NetMulticast, Unreliable` |
+| Plays once, must not be missed | `NetMulticast, Reliable` |
+| Must be correct for late joiners | `UPROPERTY(Replicated)` |
+| Different per client | `Client` RPC |
 
 ---
 
-## Ownership Requirement for RPCs
+## Reliable vs Unreliable
 
-RPCs will silently fail (not execute, not error) if the actor does not have a valid
-network connection through its ownership chain.
+Use **Reliable** when the call has permanent state consequences, when the receiver must acknowledge it to proceed, when no later update carries the same information, or when dropping it causes a visible desync.
 
-### Server RPC routing
+Use **Unreliable** when the next update supersedes this one, when the payload is purely cosmetic, or when the call happens more than once per second.
 
-The calling client must own the actor in the chain:
-`APlayerController -> APawn -> AWeapon`
+Reliable bunches are ordered and held until acknowledged. Flooding them — a reliable RPC called every frame — delays everything queued behind a lost packet, and once a channel has more than `RELIABLE_BUFFER` (512, `NetConnection.h:82`) unacked reliable bunches the connection is closed with "Outgoing reliable buffer overflow" (`DataChannel.cpp:1440-1445`). Keep per-tick traffic unreliable.
+
+---
+
+## Ownership Routing
+
+RPCs are dropped when the ownership chain does not reach a `UNetConnection`; the only sign is a `LogNet` Warning.
+
+### Server RPC
 
 ```
-Client calls WeaponActor->ServerFire()
-  -> Engine looks up WeaponActor->GetOwner() -> APawn
-  -> APawn->GetOwner() -> APlayerController
-  -> APlayerController->NetConnection == the calling client connection
-  -> RPC is routed correctly
+Client calls MyWeapon->ServerFireWeapon(...)
+  MyWeapon->GetOwner()            -> AMyCharacter
+  AMyCharacter->GetOwner()        -> AMyPlayerController
+  AMyPlayerController->NetConnection == the calling client's connection
+  -> routed
 ```
 
-If `WeaponActor->GetOwner()` is `nullptr` or another player's controller, the RPC
-will be dropped on the client. Fix: call `SetOwner(PlayerController)` on the server
-after spawning the weapon.
+If `GetOwner()` is `nullptr`, or resolves to a different player's controller, the call is dropped on the client with only `LogNet: Warning: UNetDriver::ProcessRemoteFunction: No owning connection for actor …` (`NetDriver.cpp:8274`). Fix it by calling `SetOwner(OwningPlayerController)` on the server after spawning, and by keeping `AActor::SetOwner` in sync when the pawn changes hands.
 
-### Client RPC routing
+### Client RPC
 
-The server must own the actor and it must be associated with a specific player's
-`NetConnection`. This is why most Client RPCs are called on `APlayerController`
-directly:
+The actor must resolve to one player's connection, which is why most `Client` RPCs are declared on `APlayerController`:
 
 ```cpp
-// Server code — send a message to a specific player
-APlayerController* PC = GetPlayerController(PlayerIndex);
-PC->ClientReceiveLocalizedMessage(Message, Switch, nullptr, nullptr, nullptr);
+// Server-side
+if (AMyPlayerController* PC = Cast<AMyPlayerController>(TargetController))
+{
+    PC->ClientShowMatchResult(true, FinalScore);
+}
 ```
 
-Calling a Client RPC on an actor with no owning player connection will silently fail.
+`AActor::GetNetConnection()` walks the owner chain; `APlayerController` overrides it to return its own `NetConnection` (`PlayerController.h:478`, `PlayerController.h:1891`).
 
 ---
 
 ## Common RPC Mistakes
 
-### Calling a Server RPC from the Server
+### Calling a Server RPC on the server
 
-A Server RPC called from the server's own code executes locally — the engine
-skips routing. This is not harmful but is misleading and wastes a function call.
-Prefer calling the `_Implementation` function directly from server code if you need
-to invoke the logic without network routing.
+It executes locally with no routing. Harmless but misleading; call the plain helper instead and keep the RPC for the client path.
 
-```cpp
-// MISLEADING — on the server, this just calls Implementation directly
-ServerDoThing();
+### Calling a Client or NetMulticast RPC on a client
 
-// CLEAR — explicitly call the implementation when you know you're on the server
-if (HasAuthority())
-{
-    ServerDoThing_Implementation(Params);
-}
-```
+It is never sent — it just runs locally on that client (`Actor.cpp:5569-5573`, `5587-5592`), so other machines never see it. Use a `Server` RPC to reach the authority, and have the authority issue the `Client`/`NetMulticast` call.
 
-### Calling a Client RPC from the Client
-
-A Client RPC called from the client is silently ignored — it does not route up to
-the server and back down. If you need to trigger something on the server that then
-responds to the client, use a Server RPC + Client RPC pair.
-
-### Using NetMulticast Instead of Property Replication for State
-
-Multicast RPCs are not replayed for clients that join after the call. If a new player
-joins after an explosion, they will not see the aftermath if it was communicated only
-via multicast. Use replicated properties for persistent state.
+### Using NetMulticast for state
 
 ```cpp
-// WRONG — late-joining clients miss this
+// Wrong: a player joining after this never learns the door is open
 MulticastSetDoorOpen(true);
 
-// CORRECT — new clients see the correct state on join
-bDoorOpen = true; // replicated property — MARK_PROPERTY_DIRTY if using Iris
+// Right: replicated state is correct for late joiners
+bDoorOpen = true;                                    // server only
+MARK_PROPERTY_DIRTY_FROM_NAME(AMyDoor, bDoorOpen, this); // only if bIsPushBased was set
 ```
 
-### Missing WithValidation on Server RPCs That Modify State
+The `MARK_PROPERTY_DIRTY_FROM_NAME` line is required only when the property was declared push-based via `FDoRepLifetimeParams::bIsPushBased`. It is unrelated to Iris and works with the classic net driver.
 
-Any Server RPC that changes game state (inventory, health, abilities) without
-validation is a security hole. Malicious clients can send arbitrary parameter values.
+### Server RPC without validation that mutates state
 
 ```cpp
-// INSECURE
+// Insecure: the client dictates the quantity
 UFUNCTION(Server, Reliable)
-void ServerAddItem(int32 ItemId, int32 Quantity); // client can claim any quantity
+void ServerAddItem(int32 ItemId, int32 Quantity);
 
-// SECURE
+// Secure: the server looks price and quantity up from its own data
 UFUNCTION(Server, Reliable, WithValidation)
-void ServerRequestPurchase(int32 ItemId); // server looks up price from data tables
+void ServerRequestPurchase(int32 ItemId);
 ```
 
-### RPC Parameters Containing Non-Replicated Object Pointers
+### Non-net-addressable parameters
 
-Object pointers in RPC parameters must be net-addressable. Passing a pointer to a
-locally spawned, non-replicated UObject will result in a `nullptr` on the remote side.
+A `UObject*` parameter only survives the trip if the object replicates and is already known to the receiver, or is stably named (an asset, a class, a map-placed actor). A locally spawned effect or a freshly created data object arrives as `nullptr`. Pass an integer id, an `FName`, a `TSubclassOf<>` or a `FGameplayTag` and resolve it on the remote side.
 
-```cpp
-// WRONG — LocalEffect is not replicated; remote gets nullptr
-ServerDoThingWithEffect(LocalEffect);
-
-// CORRECT — pass a data class reference or an ID, look it up on the remote side
-UFUNCTION(Server, Reliable, WithValidation)
-void ServerActivateEffectById(int32 EffectDataId);
-```
+Large payloads do not belong in RPC parameters: a `TArray` over roughly a kilobyte should be a replicated property (or a fast array) instead.
 
 ---
 
-## RPC vs Property Replication Decision
+## RPC vs Property Replication
 
-| Situation                                          | Preferred mechanism                        |
-|----------------------------------------------------|--------------------------------------------|
-| Value changes on server, clients just read it      | `UPROPERTY(Replicated)`                    |
-| Value changes, client needs custom callback logic  | `UPROPERTY(ReplicatedUsing = OnRep_Func)`  |
-| One-shot event, all clients react simultaneously   | `NetMulticast` RPC                         |
-| One-shot event, only one specific client reacts    | `Client` RPC                               |
-| Client requests server to do something             | `Server` RPC                               |
-| Ordering matters AND property replication is lossy | `Client` RPC (as noted in `PlayerController.h` comments) |
-| High-frequency cosmetic (dust, sparks)             | `NetMulticast Unreliable` RPC              |
-| Late-join clients must see current state           | `UPROPERTY(Replicated)` always             |
+| Situation | Mechanism |
+|---|---|
+| Server changes a value, clients only read it | `UPROPERTY(Replicated)` |
+| Clients need a callback when the value lands | `UPROPERTY(ReplicatedUsing = OnRep_Func)` |
+| One-shot event, everyone reacts together | `NetMulticast` RPC |
+| One-shot event, one player reacts | `Client` RPC |
+| Client asks the server to do something | `Server` RPC |
+| Late joiners must see the current state | `UPROPERTY(Replicated)` — always |
+| Value changes rarely but is compared every tick | `UPROPERTY(Replicated)` + push model |
+| Large collection with small per-frame deltas | `FFastArraySerializer` |
 
 ---
 
-## RPC Implementation Naming Convention
+## Generated Names
 
-UE generates the implementation and validation function names automatically from the
-declared function name:
+| Declared | You implement |
+|---|---|
+| `ServerFireWeapon` (`WithValidation`) | `ServerFireWeapon_Implementation`, `ServerFireWeapon_Validate` |
+| `ClientShowMatchResult` | `ClientShowMatchResult_Implementation` |
+| `MulticastPlayExplosion` | `MulticastPlayExplosion_Implementation` |
 
-| Declared name           | Generated names                                    |
-|-------------------------|----------------------------------------------------|
-| `ServerFireWeapon`      | `ServerFireWeapon_Implementation`, `ServerFireWeapon_Validate` |
-| `ClientShowResult`      | `ClientShowResult_Implementation`                  |
-| `MulticastPlayEffect`   | `MulticastPlayEffect_Implementation`               |
-
-The `UFUNCTION` macro declaration uses the base name. The body you write is always
-`_Implementation`. Only Server RPCs with `WithValidation` also need `_Validate`.
+Call sites always use the declared name; the generated thunk decides whether to route or to run locally. Never declare a body for the plain name — UHT generates it.

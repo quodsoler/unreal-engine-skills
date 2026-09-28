@@ -1,68 +1,74 @@
 # Editor Module Setup
 
-Complete boilerplate and registration patterns for Unreal Engine editor modules. All editor extension code must live in a module with `"Type": "Editor"` to ensure it is excluded from packaged builds.
+Boilerplate and registration patterns for a UE 5.8 editor module. Everything that touches `UnrealEd`, `PropertyEditor`, `Blutility`, `ToolMenus`, `AssetTools` or `AssetDefinition` must live in a module whose descriptor says `"Type": "Editor"`, so it is stripped from packaged builds.
 
 ---
 
-## Project Configuration
+## Why an editor module is separate
 
-### .uproject Module Entries
+Editor modules are built only for editor targets. `UnrealEd` and its dependants assert this in their own `Build.cs` (`UnrealEd.Build.cs:12-14` and `EditorStyle.Build.cs:13-15` throw a `BuildException` when `Target.bCompileAgainstEditor` is false). A Runtime module that unconditionally lists `UnrealEd` in `PublicDependencyModuleNames` or `PrivateDependencyModuleNames` therefore fails to build for Game, Client and Server targets, and the project will not package.
+
+The rule is directional:
+
+- Editor module → Runtime module: allowed and normal (`"MyGame"` in `PrivateDependencyModuleNames`).
+- Runtime module → Editor module: never unconditionally. `#if WITH_EDITOR` guards code, not the Build.cs dependency; engine runtime modules that need editor code add it under `if (Target.bBuildEditor) { PrivateDependencyModuleNames.Add("UnrealEd"); }` (`AIModule.Build.cs:31-34`) and wrap the includes in `#if WITH_EDITOR`. Prefer a separate editor module.
+
+Runtime classes expose editor behaviour through virtuals that already exist on `UObject`, guarded by `WITH_EDITOR`.
+
+---
+
+## Project configuration
 
 ```json
 {
   "Modules": [
-    {
-      "Name": "MyGame",
-      "Type": "Runtime",
-      "LoadingPhase": "Default"
-    },
-    {
-      "Name": "MyGameEditor",
-      "Type": "Editor",
-      "LoadingPhase": "PostEngineInit"
-    }
+    { "Name": "MyGame",       "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "MyGameEditor", "Type": "Editor",  "LoadingPhase": "PostEngineInit" }
   ]
 }
 ```
 
-**LoadingPhase guidance**:
+The same two keys apply in a `.uplugin`.
 
-| Phase | Use When |
+| LoadingPhase | Use when |
 |---|---|
-| `Default` | Module has no editor-UI dependencies |
-| `PostEngineInit` | Module registers detail customizations, menus, or editor modes — use this for all editor extension modules |
-| `PreDefault` | Module provides services needed before other modules load |
+| `Default` | Detail customizations, `UToolMenus::RegisterStartupCallback` menus, commands (engine `CommonUIEditor` registers its detail customizations at `Default`) |
+| `PostEngineInit` | `StartupModule` needs `GEditor`, editor subsystems or other engine-initialised state directly |
+| `PreDefault` | The module provides services other modules need before their own startup |
 
 ---
 
-## Directory Layout
+## Directory layout
 
 ```
 MyProject/
   Source/
-    MyGame/                         ← Runtime module
+    MyGame/                          <- Runtime module
       MyGame.Build.cs
-      MyGame.h
       Public/
       Private/
-    MyGameEditor/                   ← Editor module
+    MyGameEditor/                    <- Editor module
       MyGameEditor.Build.cs
-      MyGameEditor.h
       Public/
+        MyGameEditor.h
         Customizations/
-          FMyDataAssetCustomization.h
+          MyDataAssetCustomization.h
+          MyRangeCustomization.h
         Modes/
           MyEditorMode.h
         AssetTypes/
-          FMyAssetTypeActions.h
+          MyAssetDefinition.h
+          MyDataAssetFactory.h
       Private/
         MyGameEditorModule.cpp
         Customizations/
-          FMyDataAssetCustomization.cpp
+          MyDataAssetCustomization.cpp
+          MyRangeCustomization.cpp
         Modes/
           MyEditorMode.cpp
         AssetTypes/
-          FMyAssetTypeActions.cpp
+          MyAssetDefinition.cpp
+          MyDataAssetFactory.cpp
 ```
 
 ---
@@ -88,56 +94,31 @@ public class MyGameEditor : ModuleRules
 
         PrivateDependencyModuleNames.AddRange(new string[]
         {
-            // Editor framework
-            "UnrealEd",
-            "EditorFramework",
-
-            // Slate for editor UI
+            "UnrealEd",          // GEditor, UFactory, UEdMode, FScopedTransaction, toolkits
+            "EditorFramework",   // FEditorModeInfo, IToolkit
+            "EditorSubsystem",   // UEditorSubsystem
             "Slate",
-            "SlateCore",
-            "EditorStyle",         // FEditorStyle / FAppStyle
-
-            // Detail panel customization
-            "PropertyEditor",      // IDetailCustomization, FPropertyEditorModule
-
-            // Editor subsystems
-            "EditorSubsystem",     // UEditorSubsystem base class
-
-            // Blutility (editor utility widgets & scripted actions)
-            "Blutility",           // UEditorUtilityWidget, UAssetActionUtility, UActorActionUtility
-
-            // Menus and toolbars
-            "ToolMenus",           // UToolMenus
-
-            // Asset type actions and content browser integration
-            "AssetTools",          // FAssetTypeActions_Base, IAssetTools
-            "ContentBrowser",      // Content browser integration (if needed)
-
-            // Editor mode framework
-            "EditorInteractiveToolsFramework",  // for UInteractiveTool-based modes (UE5)
-
-            // Input
-            "InputCore",           // FKey, EKeys
-
-            // Your runtime module
-            "MyGame",
+            "SlateCore",         // FAppStyle, FSlateIcon
+            "InputCore",         // FKey, FInputChord
+            "PropertyEditor",    // IDetailCustomization, IPropertyTypeCustomization
+            "Blutility",         // UEditorUtilityWidget, UAssetActionUtility
+            "UMG", "UMGEditor",  // EditorUtilityWidget(Blueprint).h include UMG headers; Blutility links them privately
+            "ToolMenus",         // UToolMenus
+            "AssetTools",        // IAssetTools
+            "AssetDefinition",   // UAssetDefinition
+            "ContentBrowser",    // IContentBrowserSingleton (only if you drive the browser)
+            "LevelEditor",       // ULevelEditorSubsystem, FLevelEditorModule
+            "MyGame",            // your runtime module
         });
-
-        // Only include these when building for editor targets
-        if (Target.bBuildEditor)
-        {
-            PrivateDependencyModuleNames.AddRange(new string[]
-            {
-                "EditorScriptingUtilities",  // UEditorAssetLibrary, UEditorLevelLibrary
-            });
-        }
     }
 }
 ```
 
+`FAppStyle` lives in `SlateCore` (`Styling/AppStyle.h`), not in the `EditorStyle` module. Add `EditorInteractiveToolsFramework` and `InteractiveToolsFramework` only when the module builds `UInteractiveTool` classes for a `UEdMode`.
+
 ---
 
-## Module Header
+## Module header and implementation
 
 ```cpp
 // MyGameEditor.h
@@ -148,109 +129,73 @@ public class MyGameEditor : ModuleRules
 class FMyGameEditorModule : public IModuleInterface
 {
 public:
-    // IModuleInterface
+    //~ IModuleInterface
     virtual void StartupModule() override;
     virtual void ShutdownModule() override;
 
 private:
     void RegisterDetailCustomizations();
     void UnregisterDetailCustomizations();
+    void RegisterThumbnailRenderers();
+    void UnregisterThumbnailRenderers();
+    void RegisterMenus();
 
-    void RegisterAssetTypeActions();
-    void UnregisterAssetTypeActions();
-
-    void RegisterEditorModes();
-    void UnregisterEditorModes();
-
-    void RegisterMenuExtensions();
-
-    // Keep alive references for registered asset type actions
-    TArray<TSharedPtr<class IAssetTypeActions>> RegisteredAssetTypeActions;
+    static void OpenMyPanel();
 };
 ```
-
----
-
-## Module Implementation
 
 ```cpp
 // MyGameEditorModule.cpp
 #include "MyGameEditor.h"
 
-// Detail customizations
-#include "Customizations/FMyDataAssetCustomization.h"
-#include "Customizations/FMyStructCustomization.h"
-
-// Editor modes
-#include "Modes/MyEditorMode.h"
-
-// Asset type actions
-#include "AssetTypes/FMyAssetTypeActions.h"
-
-// Runtime types (from MyGame module)
+#include "Customizations/MyDataAssetCustomization.h"
+#include "Customizations/MyRangeCustomization.h"
 #include "MyDataAsset.h"
-#include "MyStruct.h"
+#include "MyRange.h"
+#include "MyThumbnailRenderer.h"
 
-// UE headers
 #include "PropertyEditorModule.h"
-#include "AssetToolsModule.h"
-#include "EditorModeRegistry.h"
 #include "ToolMenus.h"
-#include "Framework/Application/SlateApplication.h"
+#include "ToolMenuSection.h"
+#include "ToolMenuEntry.h"
+#include "ThumbnailRendering/ThumbnailManager.h"
 #include "Styling/AppStyle.h"
-
-IMPLEMENT_MODULE(FMyGameEditorModule, MyGameEditor)
-
-// ---- StartupModule ----------------------------------------------------------
+#include "Editor.h"
+#include "EditorUtilitySubsystem.h"
+#include "EditorUtilityWidgetBlueprint.h"
 
 void FMyGameEditorModule::StartupModule()
 {
     RegisterDetailCustomizations();
-    RegisterAssetTypeActions();
-    RegisterEditorModes();
+    RegisterThumbnailRenderers();
 
-    // Defer menu registration until Slate is ready
+    // Menus are not available until the editor has built them.
     UToolMenus::RegisterStartupCallback(
-        FSimpleMulticastDelegate::FDelegate::CreateRaw(
-            this, &FMyGameEditorModule::RegisterMenuExtensions));
+        FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FMyGameEditorModule::RegisterMenus));
 }
-
-// ---- ShutdownModule ---------------------------------------------------------
 
 void FMyGameEditorModule::ShutdownModule()
 {
-    // Menus must be unregistered before PropertyEditor / AssetTools modules unload
     UToolMenus::UnRegisterStartupCallback(this);
-    if (UToolMenus* ToolMenus = UToolMenus::TryGet())
-    {
-        ToolMenus->UnregisterOwner(this);
-    }
+    UToolMenus::UnregisterOwner(this);
 
-    UnregisterEditorModes();
-    UnregisterAssetTypeActions();
+    UnregisterThumbnailRenderers();
     UnregisterDetailCustomizations();
 }
 
-// ---- Detail Customizations --------------------------------------------------
-
 void FMyGameEditorModule::RegisterDetailCustomizations()
 {
-    if (!FModuleManager::Get().IsModuleLoaded("PropertyEditor"))
-    {
-        return;
-    }
     FPropertyEditorModule& PropertyModule =
         FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
 
     PropertyModule.RegisterCustomClassLayout(
         UMyDataAsset::StaticClass()->GetFName(),
-        FOnGetDetailCustomizationInstance::CreateStatic(
-            &FMyDataAssetCustomization::MakeInstance));
+        FOnGetDetailCustomizationInstance::CreateStatic(&FMyDataAssetCustomization::MakeInstance),
+        FRegisterCustomClassLayoutParams());
 
     PropertyModule.RegisterCustomPropertyTypeLayout(
-        FMyStruct::StaticStruct()->GetFName(),
-        FOnGetPropertyTypeCustomizationInstance::CreateStatic(
-            &FMyStructCustomization::MakeInstance));
+        FMyRange::StaticStruct()->GetFName(),
+        FOnGetPropertyTypeCustomizationInstance::CreateStatic(&FMyRangeCustomization::MakeInstance));
 
     PropertyModule.NotifyCustomizationModuleChanged();
 }
@@ -261,130 +206,164 @@ void FMyGameEditorModule::UnregisterDetailCustomizations()
     {
         return;
     }
+
     FPropertyEditorModule& PropertyModule =
         FModuleManager::GetModuleChecked<FPropertyEditorModule>("PropertyEditor");
-
-    PropertyModule.UnregisterCustomClassLayout(
-        UMyDataAsset::StaticClass()->GetFName());
-    PropertyModule.UnregisterCustomPropertyTypeLayout(
-        FMyStruct::StaticStruct()->GetFName());
+    PropertyModule.UnregisterCustomClassLayout(UMyDataAsset::StaticClass()->GetFName());
+    PropertyModule.UnregisterCustomPropertyTypeLayout(FMyRange::StaticStruct()->GetFName());
+    PropertyModule.NotifyCustomizationModuleChanged();
 }
 
-// ---- Asset Type Actions -----------------------------------------------------
-
-void FMyGameEditorModule::RegisterAssetTypeActions()
+void FMyGameEditorModule::RegisterThumbnailRenderers()
 {
-    IAssetTools& AssetTools =
-        FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
-
-    TSharedPtr<FMyAssetTypeActions> Actions =
-        MakeShareable(new FMyAssetTypeActions);
-    AssetTools.RegisterAssetTypeActions(Actions.ToSharedRef());
-    RegisteredAssetTypeActions.Add(Actions);
+    UThumbnailManager::Get().RegisterCustomRenderer(
+        UMyDataAsset::StaticClass(), UMyThumbnailRenderer::StaticClass());
 }
 
-void FMyGameEditorModule::UnregisterAssetTypeActions()
+void FMyGameEditorModule::UnregisterThumbnailRenderers()
 {
-    if (!FModuleManager::Get().IsModuleLoaded("AssetTools"))
+    if (UObjectInitialized())
     {
-        return;
+        UThumbnailManager::Get().UnregisterCustomRenderer(UMyDataAsset::StaticClass());
     }
-    IAssetTools& AssetTools =
-        FModuleManager::GetModuleChecked<FAssetToolsModule>("AssetTools").Get();
+}
 
-    for (const TSharedPtr<IAssetTypeActions>& Action : RegisteredAssetTypeActions)
+void FMyGameEditorModule::OpenMyPanel()
+{
+    if (UEditorUtilityWidgetBlueprint* WidgetBP = LoadObject<UEditorUtilityWidgetBlueprint>(
+            nullptr, TEXT("/Game/EditorWidgets/BP_MyTool.BP_MyTool")))
     {
-        AssetTools.UnregisterAssetTypeActions(Action.ToSharedRef());
+        GEditor->GetEditorSubsystem<UEditorUtilitySubsystem>()->SpawnAndRegisterTab(WidgetBP);
     }
-    RegisteredAssetTypeActions.Empty();
 }
 
-// ---- Editor Modes -----------------------------------------------------------
-
-void FMyGameEditorModule::RegisterEditorModes()
-{
-    FEditorModeRegistry::Get().RegisterMode<FMyEditorMode>(
-        FMyEditorMode::EM_MyMode,
-        FText::FromString("My Editor Mode"),
-        FSlateIcon(FAppStyle::GetAppStyleSetName(), "LevelEditor.SelectMode"),
-        true  // bVisible in the mode toolbar
-    );
-}
-
-void FMyGameEditorModule::UnregisterEditorModes()
-{
-    FEditorModeRegistry::Get().UnregisterMode(FMyEditorMode::EM_MyMode);
-}
-
-// ---- Menu Extensions --------------------------------------------------------
-
-void FMyGameEditorModule::RegisterMenuExtensions()
+void FMyGameEditorModule::RegisterMenus()
 {
     FToolMenuOwnerScoped OwnerScoped(this);
 
-    // Main menu extension
-    UToolMenu* WindowMenu =
-        UToolMenus::Get()->ExtendMenu("LevelEditor.MainMenu.Window");
-    {
-        FToolMenuSection& Section =
-            WindowMenu->FindOrAddSection("MyGameSection");
-        Section.Label = FText::FromString("My Game");
-
-        Section.AddMenuEntry(
-            "OpenMyPanel",
-            FText::FromString("My Tool Panel"),
-            FText::FromString("Open the My Game tool panel"),
-            FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Settings"),
-            FUIAction(FExecuteAction::CreateLambda([]()
-            {
-                // GEditor->GetEditorSubsystem<UEditorUtilitySubsystem>()
-                //     ->SpawnAndRegisterTab(WidgetBP);
-            }))
-        );
-    }
+    UToolMenu* WindowMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.MainMenu.Window");
+    FToolMenuSection& Section = WindowMenu->FindOrAddSection("MyGame");
+    Section.Label = FText::FromString("My Game");
+    Section.AddMenuEntry(
+        "OpenMyPanel",
+        FText::FromString("My Tool Panel"),
+        FText::FromString("Open the My Game tool panel"),
+        FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Settings"),
+        FUIAction(FExecuteAction::CreateStatic(&FMyGameEditorModule::OpenMyPanel)));
 }
+
+IMPLEMENT_MODULE(FMyGameEditorModule, MyGameEditor)
+```
+
+`IMPLEMENT_MODULE(FMyGameEditorModule, MyGameEditor)` goes last: the macro instantiates the class, so the declaration and both function definitions must already be visible. The second argument is the module name exactly as it appears in the descriptor and in `MyGameEditor.Build.cs`.
+
+---
+
+## Commands with TCommands
+
+`TCommands` (`Framework/Commands/Commands.h`, module `Slate`) gives menu entries a shared `FUICommandInfo` with a keyboard chord and a tooltip.
+
+```cpp
+// MyCommands.h
+#pragma once
+#include "Framework/Commands/Commands.h"
+#include "Styling/AppStyle.h"
+
+class FMyCommands : public TCommands<FMyCommands>
+{
+public:
+    FMyCommands()
+        : TCommands<FMyCommands>("MyGameEditor", INVTEXT("My Game Editor"),
+            NAME_None, FAppStyle::GetAppStyleSetName())
+    {
+    }
+
+    virtual void RegisterCommands() override;
+
+    TSharedPtr<FUICommandInfo> OpenPanel;
+};
+```
+
+```cpp
+// MyCommands.cpp
+#include "MyCommands.h"
+
+#define LOCTEXT_NAMESPACE "FMyCommands"
+
+void FMyCommands::RegisterCommands()
+{
+    UI_COMMAND(OpenPanel, "My Panel", "Opens the My Game panel",
+        EUserInterfaceActionType::Button, FInputChord());
+}
+
+#undef LOCTEXT_NAMESPACE
+```
+
+Call `FMyCommands::Register()` in `StartupModule` and `FMyCommands::Unregister()` in `ShutdownModule`. Bind with `CommandList->MapAction(FMyCommands::Get().OpenPanel, FExecuteAction::CreateStatic(&FMyGameEditorModule::OpenMyPanel))` and add the entry with the command overload:
+
+```cpp
+Section.AddMenuEntry(FMyCommands::Get().OpenPanel);
 ```
 
 ---
 
-## WITH_EDITOR Guards in Runtime Modules
-
-If a Runtime module needs to reference editor-only functionality (uncommon but valid for things like editor hints):
+## WITH_EDITOR in a runtime class
 
 ```cpp
-// SomeRuntimeClass.h
+// MyRuntimeSettings.h
+#pragma once
+#include "UObject/Object.h"
+#include "MyRuntimeSettings.generated.h"
+
 UCLASS()
-class MYGAME_API UMyRuntimeClass : public UObject
+class MYGAME_API UMyRuntimeSettings : public UObject
 {
     GENERATED_BODY()
 
 public:
+    UPROPERTY(EditAnywhere, Category = "Tuning")
+    float Speed = 600.f;
+
+    UPROPERTY(EditAnywhere, Category = "Tuning")
+    float MaxSpeed = 1200.f;
+
+    UPROPERTY(EditAnywhere, Category = "Tuning")
+    bool bEnableAdvanced = false;
+
+    UPROPERTY(EditAnywhere, Category = "Tuning", meta = (EditCondition = "bEnableAdvanced"))
+    float AdvancedSetting = 1.f;
+
 #if WITH_EDITOR
-    // Editor-only virtual, e.g. for detail panel hints
     virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
     virtual bool CanEditChange(const FProperty* InProperty) const override;
 #endif
 };
+```
 
-// SomeRuntimeClass.cpp
+```cpp
+// MyRuntimeSettings.cpp
+#include "MyRuntimeSettings.h"
+
 #if WITH_EDITOR
-void UMyRuntimeClass::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+void UMyRuntimeSettings::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
     Super::PostEditChangeProperty(PropertyChangedEvent);
+
     const FName PropertyName = PropertyChangedEvent.GetPropertyName();
-    if (PropertyName == GET_MEMBER_NAME_CHECKED(UMyRuntimeClass, Speed))
+    if (PropertyName == GET_MEMBER_NAME_CHECKED(UMyRuntimeSettings, Speed))
     {
         Speed = FMath::Clamp(Speed, 0.f, MaxSpeed);
     }
 }
 
-bool UMyRuntimeClass::CanEditChange(const FProperty* InProperty) const
+bool UMyRuntimeSettings::CanEditChange(const FProperty* InProperty) const
 {
     if (!Super::CanEditChange(InProperty))
     {
         return false;
     }
-    if (InProperty->GetFName() == GET_MEMBER_NAME_CHECKED(UMyRuntimeClass, AdvancedSetting))
+
+    if (InProperty->GetFName() == GET_MEMBER_NAME_CHECKED(UMyRuntimeSettings, AdvancedSetting))
     {
         return bEnableAdvanced;
     }
@@ -393,88 +372,345 @@ bool UMyRuntimeClass::CanEditChange(const FProperty* InProperty) const
 #endif
 ```
 
+Signatures from `CoreUObject/Public/UObject/Object.h`:
+`virtual void PostEditChangeProperty(struct FPropertyChangedEvent& PropertyChangedEvent)` and
+`virtual bool CanEditChange(const FProperty* InProperty) const`. `FPropertyChangedEvent::GetPropertyName()` is in `UObject/UnrealType.h`.
+
+For project settings pages, derive from `UDeveloperSettings` (`Engine/DeveloperSettings.h`, module `DeveloperSettings`) and override `GetContainerName()`, `GetCategoryName()` and `GetSectionName()` — that class is runtime-safe and needs no editor module.
+
 ---
 
-## Asset Factory (UFactory) Boilerplate
-
-Required to support "right-click > Create" in the Content Browser for a custom asset type:
+## Asset definition, factory and thumbnail
 
 ```cpp
-// MyCustomAssetFactory.h
+// MyAssetDefinition.h
 #pragma once
-#include "Factories/Factory.h"
-#include "MyCustomAssetFactory.generated.h"
+#include "AssetDefinitionDefault.h"
+#include "MyAssetDefinition.generated.h"
 
 UCLASS()
-class UMyCustomAssetFactory : public UFactory
+class MYGAMEEDITOR_API UMyAssetDefinition : public UAssetDefinitionDefault
 {
     GENERATED_BODY()
 
 public:
-    UMyCustomAssetFactory();
-
-    virtual UObject* FactoryCreateNew(
-        UClass* Class,
-        UObject* InParent,
-        FName Name,
-        EObjectFlags Flags,
-        UObject* Context,
-        FFeedbackContext* Warn) override;
-
-    virtual bool ShouldShowInNewMenu() const override { return true; }
+    virtual FText GetAssetDisplayName() const override;
+    virtual FLinearColor GetAssetColor() const override;
+    virtual TSoftClassPtr<UObject> GetAssetClass() const override;
+    virtual TConstArrayView<FAssetCategoryPath> GetAssetCategories() const override;
 };
+```
 
-// MyCustomAssetFactory.cpp
-#include "MyCustomAssetFactory.h"
-#include "MyCustomAsset.h"
+```cpp
+// MyAssetDefinition.cpp
+#include "MyAssetDefinition.h"
+#include "MyDataAsset.h"
 
-UMyCustomAssetFactory::UMyCustomAssetFactory()
+FText UMyAssetDefinition::GetAssetDisplayName() const
 {
-    SupportedClass = UMyCustomAsset::StaticClass();
+    return NSLOCTEXT("MyGameEditor", "MyDataAssetName", "My Data Asset");
+}
+
+FLinearColor UMyAssetDefinition::GetAssetColor() const
+{
+    return FLinearColor(FColor(200, 100, 50));
+}
+
+TSoftClassPtr<UObject> UMyAssetDefinition::GetAssetClass() const
+{
+    return UMyDataAsset::StaticClass();
+}
+
+TConstArrayView<FAssetCategoryPath> UMyAssetDefinition::GetAssetCategories() const
+{
+    static const auto Categories = { EAssetCategoryPaths::Gameplay };
+    return Categories;
+}
+```
+
+The definition is found from its CDO, so there is no registration call and nothing to unregister. `UAssetDefinitionDefault` (`UnrealEd/Public/AssetDefinitionDefault.h`) already implements
+`virtual EAssetCommandResult OpenAssets(const FAssetOpenArgs& OpenArgs) const` and
+`virtual EAssetCommandResult PerformAssetDiff(const FAssetDiffArgs& DiffArgs) const`; override `OpenAssets` only to open your own toolkit instead of the default one.
+
+Context-menu entries for the type are `UToolMenus` extensions of `ContentBrowser.AssetContextMenu` — a dynamic section on the menu, not a virtual on the definition.
+
+```cpp
+// MyDataAssetFactory.h
+#pragma once
+#include "Factories/Factory.h"
+#include "MyDataAssetFactory.generated.h"
+
+UCLASS()
+class MYGAMEEDITOR_API UMyDataAssetFactory : public UFactory
+{
+    GENERATED_BODY()
+
+public:
+    UMyDataAssetFactory();
+
+    virtual UObject* FactoryCreateNew(UClass* InClass, UObject* InParent, FName InName,
+        EObjectFlags Flags, UObject* Context, FFeedbackContext* Warn) override;
+    virtual bool ShouldShowInNewMenu() const override;
+};
+```
+
+```cpp
+// MyDataAssetFactory.cpp
+#include "MyDataAssetFactory.h"
+#include "MyDataAsset.h"
+
+UMyDataAssetFactory::UMyDataAssetFactory()
+{
+    SupportedClass = UMyDataAsset::StaticClass();
     bCreateNew = true;
-    bEditAfterNew = true;  // open editor immediately after creation
+    bEditAfterNew = true;
 }
 
-UObject* UMyCustomAssetFactory::FactoryCreateNew(
-    UClass* Class,
-    UObject* InParent,
-    FName Name,
-    EObjectFlags Flags,
-    UObject* Context,
-    FFeedbackContext* Warn)
+UObject* UMyDataAssetFactory::FactoryCreateNew(UClass* InClass, UObject* InParent, FName InName,
+    EObjectFlags Flags, UObject* Context, FFeedbackContext* Warn)
 {
-    return NewObject<UMyCustomAsset>(InParent, Class, Name, Flags);
+    return NewObject<UMyDataAsset>(InParent, InClass, InName, Flags);
+}
+
+bool UMyDataAssetFactory::ShouldShowInNewMenu() const
+{
+    return true;
 }
 ```
 
-The factory is auto-discovered by the editor; no explicit registration is needed. The `UFactory` subclass must be in the editor module.
+Factories are auto-discovered too. `UFactory` also offers `virtual bool ConfigureProperties()` for a pre-creation dialog and `virtual UClass* ResolveSupportedClass()` when one factory makes several types.
+
+```cpp
+// MyThumbnailRenderer.h
+#pragma once
+#include "ThumbnailRendering/ThumbnailRenderer.h"
+#include "MyThumbnailRenderer.generated.h"
+
+UCLASS()
+class MYGAMEEDITOR_API UMyThumbnailRenderer : public UThumbnailRenderer
+{
+    GENERATED_BODY()
+
+public:
+    virtual void Draw(UObject* Object, int32 X, int32 Y, uint32 Width, uint32 Height,
+        FRenderTarget* Viewport, FCanvas* Canvas, bool bAdditionalViewFamily) override;
+};
+```
+
+Register it with `UThumbnailManager::Get().RegisterCustomRenderer(UMyDataAsset::StaticClass(), UMyThumbnailRenderer::StaticClass())` and pair it with `UnregisterCustomRenderer(UMyDataAsset::StaticClass())`, as in the module implementation above.
 
 ---
 
-## Module Dependency Graph
+## Editor mode with a toolkit
 
-```
-MyGameEditor (Type: Editor)
-    depends on → MyGame (Type: Runtime)
-    depends on → PropertyEditor, UnrealEd, Blutility, ToolMenus, AssetTools
-    depends on → Slate, SlateCore, EditorStyle
+`UEdMode` subclasses are registered automatically: `UAssetEditorSubsystem::RegisterEditorModes` iterates every `UEdMode` CDO once `FCoreDelegates::OnAllModuleLoadingPhasesComplete` fires. Fill `Info` in the constructor; never call `FEditorModeRegistry` for a `UEdMode`.
 
-MyGame (Type: Runtime)
-    no editor dependencies
-    uses WITH_EDITOR guards for PostEditChangeProperty etc.
+```cpp
+// MyEditorMode.h
+#pragma once
+#include "Tools/UEdMode.h"
+#include "MyEditorMode.generated.h"
+
+UCLASS()
+class MYGAMEEDITOR_API UMyEditorMode : public UEdMode
+{
+    GENERATED_BODY()
+
+public:
+    static const FEditorModeID EM_MyEditorMode;
+
+    UMyEditorMode();
+
+    virtual void Enter() override;
+    virtual void Exit() override;
+    virtual void ModeTick(float DeltaTime) override;
+    virtual void CreateToolkit() override;
+    virtual bool UsesToolkits() const override;
+};
 ```
+
+```cpp
+// MyEditorMode.cpp
+#include "MyEditorMode.h"
+
+#include "Toolkits/BaseToolkit.h"
+#include "Styling/AppStyle.h"
+
+const FEditorModeID UMyEditorMode::EM_MyEditorMode = TEXT("EM_MyEditorMode");
+
+UMyEditorMode::UMyEditorMode()
+{
+    Info = FEditorModeInfo(
+        EM_MyEditorMode,
+        FText::FromString("My Editor Mode"),
+        FSlateIcon(FAppStyle::GetAppStyleSetName(), "LevelEditor.SelectMode"),
+        /*InVisibility=*/true);
+}
+
+void UMyEditorMode::Enter()
+{
+    Super::Enter();
+    // RegisterTool(FMyCommands::Get().MyTool, TEXT("MyTool"), NewObject<UMyToolBuilder>(this));
+}
+
+void UMyEditorMode::Exit()
+{
+    Super::Exit();
+}
+
+void UMyEditorMode::ModeTick(float DeltaTime)
+{
+}
+
+void UMyEditorMode::CreateToolkit()
+{
+    Toolkit = MakeShared<FModeToolkit>();
+}
+
+bool UMyEditorMode::UsesToolkits() const
+{
+    return true;
+}
+```
+
+`FEditorModeInfo` (`EditorFramework/Public/Tools/Modes.h`):
+
+```cpp
+FEditorModeInfo(FEditorModeID InID, FText InName = FText(), FSlateIcon InIconBrush = FSlateIcon(),
+    TAttribute<bool> InVisibility = false, int32 InPriorityOrder = MAX_int32);
+```
+
+`UEdMode` members you will use (`UnrealEd/Public/Tools/UEdMode.h`):
+
+```cpp
+virtual void Initialize();
+virtual void Enter();
+virtual void Exit();
+virtual void ModeTick(float DeltaTime);
+virtual void RegisterTool(TSharedPtr<FUICommandInfo> UICommand, FString ToolIdentifier,
+    UInteractiveToolBuilder* Builder, EToolsContextScope ToolScope = EToolsContextScope::Default);
+virtual bool ShouldToolStartBeAllowed(const FString& ToolIdentifier) const;
+virtual bool UsesToolkits() const;
+virtual void CreateToolkit();
+UEditorInteractiveToolsContext* GetInteractiveToolsContext(
+    EToolsContextScope ToolScope = EToolsContextScope::Default) const;
+FEditorModeTools* GetModeManager() const;
+const FEditorModeInfo& GetModeInfo() const;
+```
+
+`EToolsContextScope` is `Editor`, `EdMode` or `Default`. The mode's own context object is a `UEdModeInteractiveToolsContext` held in the protected `ModeToolsContext` member.
+
+Custom toolkit panel:
+
+```cpp
+class FMyEditorModeToolkit : public FModeToolkit
+{
+public:
+    virtual void Init(const TSharedPtr<IToolkitHost>& InitToolkitHost,
+        TWeakObjectPtr<UEdMode> InOwningMode) override;
+    virtual FName GetToolkitFName() const override;
+    virtual FText GetBaseToolkitName() const override;
+    virtual TSharedPtr<SWidget> GetInlineContent() const override;
+    virtual void GetToolPaletteNames(TArray<FName>& PaletteNames) const override;
+};
+```
+
+Viewport input: implement `ILegacyEdModeViewportInterface` (`UnrealEd/Public/Tools/LegacyEdModeInterfaces.h`) on the mode for `MouseMove(FEditorViewportClient*, FViewport*, int32 x, int32 y)`, `InputKey(FEditorViewportClient*, FViewport*, FKey, EInputEvent)`, `HandleClick(FEditorViewportClient*, HHitProxy*, const FViewportClick&)`, `InputDelta(FEditorViewportClient*, FViewport*, FVector&, FRotator&, FVector&)` and `Tick(FEditorViewportClient*, float)`. `Render(const FSceneView*, FViewport*, FPrimitiveDrawInterface*)` and `DrawHUD(FEditorViewportClient*, FViewport*, const FSceneView*, FCanvas*)` are on `ILegacyEdModeWidgetInterface`; `UBaseLegacyWidgetEdMode` (`Tools/LegacyEdModeWidgetHelpers.h`) implements both interfaces and forwards them to the `FLegacyEdModeWidgetHelper` your `CreateWidgetHelper()` returns.
+
+Activate and query through `FEditorModeTools` (`UnrealEd/Public/EditorModeManager.h`), reached with `GLevelEditorModeTools()`:
+
+```cpp
+GLevelEditorModeTools().ActivateMode(UMyEditorMode::EM_MyEditorMode, /*bToggle=*/false);
+const bool bActive = GLevelEditorModeTools().IsModeActive(UMyEditorMode::EM_MyEditorMode);
+UEdMode* Mode = GLevelEditorModeTools().GetActiveScriptableMode(UMyEditorMode::EM_MyEditorMode);
+GLevelEditorModeTools().DeactivateMode(UMyEditorMode::EM_MyEditorMode);
+```
+
+`FEdMode` (`UnrealEd/Public/EdMode.h`) is the legacy shared-pointer mode. It derives from `FLegacyEdModeWidgetHelper` and is the only mode kind that `FEditorModeRegistry::Get().RegisterMode<T>(FEditorModeID, FText Name, FSlateIcon IconBrush, bool bVisible, int32 PriorityOrder)` / `UnregisterMode(FEditorModeID)` handles. Write new modes as `UEdMode`.
 
 ---
 
-## Checklist: New Editor Module
+## Asset editor toolkit
 
-- [ ] `"Type": "Editor"` in .uproject
-- [ ] `"LoadingPhase": "PostEngineInit"` in .uproject
-- [ ] `Build.cs` references `UnrealEd`, `PropertyEditor`, `ToolMenus`, `Blutility` as needed
-- [ ] `IMPLEMENT_MODULE(FMyEditorModule, MyEditorModuleName)` in .cpp
-- [ ] All registrations in `StartupModule`
-- [ ] All unregistrations in `ShutdownModule` (guarded with `IsModuleLoaded` checks)
-- [ ] Menu registrations wrapped in `UToolMenus::RegisterStartupCallback`
-- [ ] Menu unregistration: `UnRegisterStartupCallback` + `UnregisterOwner`
-- [ ] `NotifyCustomizationModuleChanged()` called after detail customization registration
-- [ ] No `#include "EdMode.h"` or other editor headers pulled into Runtime module headers
+```cpp
+// MyAssetEditorToolkit.h
+#pragma once
+#include "Toolkits/AssetEditorToolkit.h"
+
+class UMyDataAsset;
+
+class FMyAssetEditorToolkit : public FAssetEditorToolkit
+{
+public:
+    void InitMyEditor(const EToolkitMode::Type Mode,
+        const TSharedPtr<IToolkitHost>& InitToolkitHost, UMyDataAsset* Asset);
+
+    //~ FAssetEditorToolkit
+    virtual FName GetToolkitFName() const override;
+    virtual FText GetBaseToolkitName() const override;
+    virtual FString GetWorldCentricTabPrefix() const override;
+    virtual void RegisterTabSpawners(const TSharedRef<FTabManager>& InTabManager) override;
+    virtual void UnregisterTabSpawners(const TSharedRef<FTabManager>& InTabManager) override;
+};
+```
+
+```cpp
+// MyAssetEditorToolkit.cpp
+#include "MyAssetEditorToolkit.h"
+#include "MyDataAsset.h"
+#include "Framework/Docking/TabManager.h"
+
+FName FMyAssetEditorToolkit::GetToolkitFName() const
+{
+    return FName("MyAssetEditor");
+}
+
+FText FMyAssetEditorToolkit::GetBaseToolkitName() const
+{
+    return INVTEXT("My Asset Editor");
+}
+
+FString FMyAssetEditorToolkit::GetWorldCentricTabPrefix() const
+{
+    return TEXT("MyAsset ");
+}
+
+void FMyAssetEditorToolkit::InitMyEditor(const EToolkitMode::Type Mode,
+    const TSharedPtr<IToolkitHost>& InitToolkitHost, UMyDataAsset* Asset)
+{
+    const TSharedRef<FTabManager::FLayout> Layout =
+        FTabManager::NewLayout("Standalone_MyAssetEditor_Layout_v1")
+        ->AddArea
+        (
+            FTabManager::NewPrimaryArea()
+            ->SetOrientation(Orient_Vertical)
+            ->Split
+            (
+                FTabManager::NewStack()
+                ->SetSizeCoefficient(1.f)
+                ->AddTab("MyAssetDetailsTab", ETabState::OpenedTab)
+            )
+        );
+
+    InitAssetEditor(Mode, InitToolkitHost, FName("MyAssetEditorApp"), Layout,
+        /*bCreateDefaultStandaloneMenu=*/true, /*bCreateDefaultToolbar=*/true, Asset);
+}
+```
+
+`EToolkitMode::Type` is `Standalone` or `WorldCentric` (`EditorFramework/Public/Toolkits/IToolkit.h`). `RegisterTabSpawners` / `UnregisterTabSpawners` must call `FAssetEditorToolkit::RegisterTabSpawners(InTabManager)` / `UnregisterTabSpawners(InTabManager)` before adding or removing your own spawners.
+
+---
+
+## Checklist: new editor module
+
+- [ ] `"Type": "Editor"` and a `LoadingPhase` (`Default`, or `PostEngineInit` if startup touches `GEditor`) in the `.uproject` or `.uplugin`
+- [ ] `Build.cs` lists `UnrealEd`, `Slate`, `SlateCore`, `PropertyEditor`, `ToolMenus`, `EditorSubsystem`, `Blutility`, `AssetTools`, `AssetDefinition` as needed
+- [ ] Runtime module has no dependency on any editor module
+- [ ] `FMyGameEditorModule : public IModuleInterface` declared, `StartupModule` and `ShutdownModule` defined, `IMPLEMENT_MODULE(FMyGameEditorModule, MyGameEditor)` last in the `.cpp`
+- [ ] `RegisterCustomClassLayout` / `RegisterCustomPropertyTypeLayout` paired with their `Unregister*` calls, guarded by `IsModuleLoaded("PropertyEditor")`
+- [ ] `NotifyCustomizationModuleChanged()` after registering and after unregistering
+- [ ] Menus built inside `UToolMenus::RegisterStartupCallback`, under a `FToolMenuOwnerScoped`
+- [ ] `UToolMenus::UnRegisterStartupCallback(this)` and `UToolMenus::UnregisterOwner(this)` in `ShutdownModule`
+- [ ] `RegisterCustomRenderer` paired with `UnregisterCustomRenderer`
+- [ ] `UEdMode`, `UAssetDefinition`, `UFactory` and `UEditorValidatorBase` subclasses left unregistered — they are discovered from their CDOs
+- [ ] No editor header included from a runtime module header

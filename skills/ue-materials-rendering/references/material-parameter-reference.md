@@ -1,216 +1,292 @@
 # Material Parameter Reference
 
-Common material parameter patterns, performance notes, and API quick-reference for C++ UE development.
+Verbatim C++ signatures for the material parameter APIs, plus naming, performance and debugging notes.
 
 ---
 
-## API Quick Reference
+## UMaterialInstanceDynamic
 
-### UMaterialInstanceDynamic (MaterialInstanceDynamic.h)
+`Engine/Source/Runtime/Engine/Public/Materials/MaterialInstanceDynamic.h`
 
-| Method | Signature | Notes |
-|--------|-----------|-------|
-| `Create` | `static UMaterialInstanceDynamic* Create(UMaterialInterface* ParentMaterial, UObject* InOuter, FName Name = NAME_None)` | Preferred factory; always cache result |
-| `SetScalarParameterValue` | `void SetScalarParameterValue(FName ParameterName, float Value)` | Parameter names are case-sensitive |
-| `SetVectorParameterValue` | `void SetVectorParameterValue(FName ParameterName, FLinearColor Value)` | Pass FLinearColor explicitly; no implicit conversion from FVector |
-| `SetTextureParameterValue` | `void SetTextureParameterValue(FName ParameterName, UTexture* Value)` | Accepts any UTexture subclass including render targets |
-| `SetDoubleVectorParameterValue` | `void SetDoubleVectorParameterValue(FName ParameterName, FVector4 Value)` | For double-precision world position use |
-| `InitializeScalarParameterAndGetIndex` | `bool InitializeScalarParameterAndGetIndex(const FName& Name, float Value, int32& OutIndex)` | Call once; use index in tight loops |
-| `SetScalarParameterByIndex` | `bool SetScalarParameterByIndex(int32 ParameterIndex, float Value)` | Fast path; index must come from same MID |
-| `InitializeVectorParameterAndGetIndex` | `bool InitializeVectorParameterAndGetIndex(const FName& Name, const FLinearColor& Value, int32& OutIndex)` | Same pattern as scalar index API |
-| `SetVectorParameterByIndex` | `bool SetVectorParameterByIndex(int32 ParameterIndex, const FLinearColor& Value)` | Fast path for vectors |
-| `K2_GetScalarParameterValue` | `float K2_GetScalarParameterValue(FName ParameterName)` | Returns current scalar value |
-| `K2_GetVectorParameterValue` | `FLinearColor K2_GetVectorParameterValue(FName ParameterName)` | Returns current vector value |
-| `K2_GetTextureParameterValue` | `UTexture* K2_GetTextureParameterValue(FName ParameterName)` | Returns current texture value |
-| `ClearParameterValues` | `void ClearParameterValues()` | Removes all overrides; falls back to parent |
-| `CopyParameterOverrides` | `void CopyParameterOverrides(UMaterialInstance* MaterialInstance)` | Copies all overrides from another instance |
-| `CopyMaterialUniformParameters` | `void CopyMaterialUniformParameters(UMaterialInterface* Source)` | Faster than K2_Copy; skips static params |
-| `K2_InterpolateMaterialInstanceParams` | `void K2_InterpolateMaterialInstanceParams(UMaterialInstance* A, UMaterialInstance* B, float Alpha)` | Output = lerp(A, B, Alpha) |
-| `SetNaniteOverride` | `void SetNaniteOverride(UMaterialInterface* InMaterial)` | UE5 — assign Nanite-compatible material |
+### Creation
 
-### UMaterialParameterCollectionInstance (MaterialParameterCollectionInstance.h)
-
-| Method | Signature | Notes |
-|--------|-----------|-------|
-| `SetScalarParameterValue` | `bool SetScalarParameterValue(FName ParameterName, float ParameterValue)` | Returns false if name not found |
-| `SetVectorParameterValue` | `bool SetVectorParameterValue(FName ParameterName, const FLinearColor& ParameterValue)` | Pass FLinearColor explicitly; no implicit conversion from FVector |
-| `GetScalarParameterValue` | `bool GetScalarParameterValue(FName ParameterName, float& OutParameterValue) const` | |
-| `GetVectorParameterValue` | `bool GetVectorParameterValue(FName ParameterName, FLinearColor& OutParameterValue) const` | |
-| `ForceReturnToDefaultValues` | `void ForceReturnToDefaultValues()` | Resets all overrides to collection defaults |
-
-Obtain the instance via:
 ```cpp
-UMaterialParameterCollectionInstance* Inst = GetWorld()->GetParameterCollectionInstance(CollectionAsset);
+static UMaterialInstanceDynamic* Create(class UMaterialInterface* ParentMaterial, class UObject* InOuter, FName Name = NAME_None);
 ```
 
-### UPrimitiveComponent — Material Slot API (PrimitiveComponent.h)
-
-| Method | Signature | Notes |
-|--------|-----------|-------|
-| `GetMaterial` | `UMaterialInterface* GetMaterial(int32 ElementIndex) const` | Returns current material for slot |
-| `SetMaterial` | `void SetMaterial(int32 ElementIndex, UMaterialInterface* Material)` | Replaces static material; does not create MID |
-| `SetMaterialByName` | `void SetMaterialByName(FName MaterialSlotName, UMaterialInterface* Material)` | Slot name lookup version |
-| `GetMaterialIndex` | `int32 GetMaterialIndex(FName MaterialSlotName) const` | Resolve slot name to index |
-| `GetMaterialSlotNames` | `TArray<FName> GetMaterialSlotNames() const` | All slot names on the component |
-| `CreateDynamicMaterialInstance` | `UMaterialInstanceDynamic* CreateDynamicMaterialInstance(int32 ElementIndex, UMaterialInterface* SourceMaterial = nullptr, FName OptionalName = NAME_None)` | Creates MID and assigns to slot |
-
----
-
-## Parameter Type Mapping
-
-| Material Parameter Type | C++ Setter | C++ Type |
-|------------------------|-----------|----------|
-| Scalar Parameter | `SetScalarParameterValue` | `float` |
-| Vector Parameter | `SetVectorParameterValue` | `FLinearColor` (pass FLinearColor explicitly; no implicit conversion from FVector) |
-| Texture Parameter | `SetTextureParameterValue` | `UTexture*` |
-| Runtime Virtual Texture | `SetRuntimeVirtualTextureParameterValue` | `URuntimeVirtualTexture*` |
-| Sparse Volume Texture | `SetSparseVolumeTextureParameterValue` | `USparseVolumeTexture*` |
-| Texture Collection | `SetTextureCollectionParameterValue` | `UTextureCollection*` |
-
-Static parameters (Static Bool, Static Switch, Static Component Mask) cannot be changed at runtime on a MID. Create a `UMaterialInstanceConstant` in the editor for different static permutations and use MIDs on top for dynamic parameters.
-
----
-
-## Performance Guidelines
-
-### MID Parameter Update Cost
-
-Parameter updates are low-cost individually. The overhead is:
-1. Name hash lookup (`FName` hashing — fast)
-2. Dirty flag on the uniform buffer
-3. GPU uniform buffer upload on the next render (batched, not per-parameter)
-
-For very high parameter counts (50+ parameters changed per frame per instance), use the index-based API to skip name lookup:
+### Setters by name
 
 ```cpp
-// One-time initialization
-int32 AlphaIdx = -1;
-int32 ColorIdx = -1;
+void SetScalarParameterValue(FName ParameterName, float Value);
+void SetVectorParameterValue(FName ParameterName, FLinearColor Value);
+void SetDoubleVectorParameterValue(FName ParameterName, FVector4 Value);
+void SetTextureParameterValue(FName ParameterName, class UTexture* Value);
+void SetRuntimeVirtualTextureParameterValue(FName ParameterName, class URuntimeVirtualTexture* Value);
+void SetSparseVolumeTextureParameterValue(FName ParameterName, class USparseVolumeTexture* Value);
+void SetTextureCollectionParameterValue(FName ParameterName, UTextureCollection* Value);
+void SetFontParameterValue(const FMaterialParameterInfo& ParameterInfo, class UFont* FontValue, int32 FontPage);
+void ClearParameterValues();
+```
+
+### Setters by parameter info
+
+Every setter above except `SetDoubleVectorParameterValue` and `SetSparseVolumeTextureParameterValue` has a `...ByInfo` twin taking `const FMaterialParameterInfo&` in place of the `FName`, which is how you reach parameters inside a material layer or blend:
+
+```cpp
+void SetScalarParameterValueByInfo(const FMaterialParameterInfo& ParameterInfo, float Value);
+void SetVectorParameterValueByInfo(const FMaterialParameterInfo& ParameterInfo, FLinearColor Value);
+void SetTextureParameterValueByInfo(const FMaterialParameterInfo& ParameterInfo, class UTexture* Value);
+void SetRuntimeVirtualTextureParameterValueByInfo(const FMaterialParameterInfo& ParameterInfo, class URuntimeVirtualTexture* Value);
+void SetTextureCollectionParameterValueByInfo(const FMaterialParameterInfo& ParameterInfo, UTextureCollection* Value);
+```
+
+`FMaterialParameterInfo` (`Materials/MaterialParameters.h`) carries `FName Name`, `TEnumAsByte<EMaterialParameterAssociation> Association` and `int32 Index`:
+
+```cpp
+FMaterialParameterInfo(FName InName = FName(), EMaterialParameterAssociation InAssociation = EMaterialParameterAssociation::GlobalParameter, int32 InIndex = INDEX_NONE);
+```
+
+`EMaterialParameterAssociation` is `LayerParameter`, `BlendParameter` or `GlobalParameter`.
+
+### Index-based fast path
+
+```cpp
+bool InitializeScalarParameterAndGetIndex(const FName& ParameterName, float Value, int32& OutParameterIndex);
+bool SetScalarParameterByIndex(int32 ParameterIndex, float Value);
+bool InitializeVectorParameterAndGetIndex(const FName& ParameterName, const FLinearColor& Value, int32& OutParameterIndex);
+bool SetVectorParameterByIndex(int32 ParameterIndex, const FLinearColor& Value);
+```
+
+```cpp
+// Once, during initialization
+int32 AlphaIdx = INDEX_NONE;
+int32 ColorIdx = INDEX_NONE;
 MyMID->InitializeScalarParameterAndGetIndex(TEXT("Alpha"), 1.0f, AlphaIdx);
 MyMID->InitializeVectorParameterAndGetIndex(TEXT("TintColor"), FLinearColor::White, ColorIdx);
 
-// Per-frame update — no FName hash lookup
+// Per frame, no FName hash
 MyMID->SetScalarParameterByIndex(AlphaIdx, NewAlpha);
 MyMID->SetVectorParameterByIndex(ColorIdx, NewColor);
 ```
 
-### MPC vs MID — When to Use Which
+Indices belong to one MID and one parent material. Do not share them between instances, and re-initialize if the parent changes.
 
-| Scenario | MPC | MID |
-|----------|-----|-----|
-| Global time-of-day color / intensity | Yes | No |
-| Weather parameters (rain, fog) | Yes | No |
-| Per-actor color / damage state | No | Yes |
-| Per-instance texture swap | No | Yes |
-| Drive 100+ materials at once | Yes | No (100 MID updates) |
-| Layered material parameter override | No | Yes |
+### Getters
 
-### Render Target Format Selection
-
-Choose the smallest format that meets precision needs:
-
-| Use Case | Recommended Format | Memory (512x512) |
-|----------|--------------------|-----------------|
-| LDR color (UI, minimap) | `RTF_RGBA8` | 1 MB |
-| HDR scene color | `RTF_RGBA16f` | 2 MB |
-| Depth data / single channel | `RTF_R16f` | 0.5 MB |
-| Float computation | `RTF_RGBA32f` | 4 MB |
-
-`RTF_RGBA32f` costs 4x more memory and bandwidth than `RTF_RGBA16f`. Avoid unless data requires full 32-bit precision.
-
-### Scene Capture Performance
-
-`USceneCaptureComponent2D` renders a full scene pass. Cost is proportional to:
-- Render target resolution
-- Capture source (`SCS_FinalColorLDR` is more expensive than `SCS_BaseColor`)
-- Geometry in the captured view
-- Post-process applied to capture
-
-Optimization options:
 ```cpp
-// Disable capture every frame; call manually when needed
-SceneCapture->bCaptureEveryFrame = false;
-SceneCapture->CaptureScene(); // trigger manually
+float K2_GetScalarParameterValue(FName ParameterName);
+float K2_GetScalarParameterValueByInfo(const FMaterialParameterInfo& ParameterInfo);
+FLinearColor K2_GetVectorParameterValue(FName ParameterName);
+FLinearColor K2_GetVectorParameterValueByInfo(const FMaterialParameterInfo& ParameterInfo);
+class UTexture* K2_GetTextureParameterValue(FName ParameterName);
+UTextureCollection* K2_GetTextureCollectionParameterValue(FName ParameterName);
+```
 
-// Exclude expensive show flags
+The typed forms on `UMaterialInterface` return success and take an info struct:
+
+```cpp
+bool GetScalarParameterValue(const FHashedMaterialParameterInfo& ParameterInfo, float& OutValue, bool bOveriddenOnly = false) const;
+bool GetVectorParameterValue(const FHashedMaterialParameterInfo& ParameterInfo, FLinearColor& OutValue, bool bOveriddenOnly = false) const;
+```
+
+### Copying and interpolating
+
+```cpp
+void CopyParameterOverrides(UMaterialInstance* MaterialInstance);
+void CopyInterpParameters(UMaterialInstance* Source);
+void CopyMaterialUniformParameters(UMaterialInterface* Source);
+void K2_CopyMaterialInstanceParameters(UMaterialInterface* Source, bool bQuickParametersOnly = false);
+void CopyScalarAndVectorParameters(const UMaterialInterface& SourceMaterialToCopyFrom, EShaderPlatform ShaderPlatform);
+void K2_InterpolateMaterialInstanceParams(UMaterialInstance* SourceA, UMaterialInstance* SourceB, float Alpha);
+void SetNaniteOverride(UMaterialInterface* InMaterial);
+```
+
+| Call | Copies | Cost |
+|---|---|---|
+| `CopyParameterOverrides` | only parameters explicitly overridden on the source | low |
+| `CopyInterpParameters` | the source instance's own scalar, vector, double-vector, texture and font overrides, no hierarchy walk (`MaterialInstanceDynamic.cpp:505`) | low |
+| `CopyMaterialUniformParameters` | uniform parameters, skips static parameters | low |
+| `CopyScalarAndVectorParameters` | scalar/vector for one `EShaderPlatform` | low |
+| `K2_CopyMaterialInstanceParameters` | all non-static parameters, walking the hierarchy (`bQuickParametersOnly` = `CopyMaterialUniformParameters`); static parameters are skipped (`MaterialInstance.cpp:2058`) | high |
+
+`CopyScalarAndVectorParameters` takes an `EShaderPlatform`; derive it with `GetFeatureLevelShaderPlatform(GetWorld()->GetFeatureLevel())` from `RHIGlobals.h`.
+
+---
+
+## UMaterialParameterCollectionInstance
+
+`Materials/MaterialParameterCollectionInstance.h`
+
+```cpp
+bool SetScalarParameterValue(FName ParameterName, float ParameterValue);
+bool SetVectorParameterValue(FName ParameterName, const FLinearColor& ParameterValue);
+bool SetVectorParameterValue(FName ParameterName, const FVector& ParameterValue);
+bool SetVectorParameterValue(FName ParameterName, const FVector4& ParameterValue);
+bool GetScalarParameterValue(FName ParameterName, float& OutParameterValue) const;
+bool GetVectorParameterValue(FName ParameterName, FLinearColor& OutParameterValue) const;
+void ForceReturnToDefaultValues();
+```
+
+Obtain the per-world instance:
+
+```cpp
+UMaterialParameterCollectionInstance* Inst = GetWorld()->GetParameterCollectionInstance(CollectionAsset);
+```
+
+`UMaterialParameterCollection` (`Materials/MaterialParameterCollection.h`) holds `TArray<FCollectionScalarParameter> ScalarParameters` and `TArray<FCollectionVectorParameter> VectorParameters`, plus queries `GetScalarParameterNames()`, `GetVectorParameterNames()`, `GetScalarParameterDefaultValue(FName, bool& bParameterFound)`, `GetVectorParameterDefaultValue(FName, bool& bParameterFound)`, `GetScalarParameterByName(FName)` and `GetVectorParameterByName(FName)`. There are no texture parameters in a collection.
+
+The Blueprint-facing wrapper (`Kismet/KismetMaterialLibrary.h`) does the world lookup for you:
+
+```cpp
+static void SetScalarParameterValue(UObject* WorldContextObject, UMaterialParameterCollection* Collection, FName ParameterName, float ParameterValue);
+static void SetVectorParameterValue(UObject* WorldContextObject, UMaterialParameterCollection* Collection, FName ParameterName, const FLinearColor& ParameterValue);
+static float GetScalarParameterValue(UObject* WorldContextObject, UMaterialParameterCollection* Collection, FName ParameterName);
+static FLinearColor GetVectorParameterValue(UObject* WorldContextObject, UMaterialParameterCollection* Collection, FName ParameterName);
+static class UMaterialInstanceDynamic* CreateDynamicMaterialInstance(UObject* WorldContextObject, class UMaterialInterface* Parent, FName OptionalName = NAME_None, EMIDCreationFlags CreationFlags = EMIDCreationFlags::None);
+```
+
+`EMIDCreationFlags` is `None` or `Transient`.
+
+---
+
+## UPrimitiveComponent material slots
+
+`Components/PrimitiveComponent.h`
+
+```cpp
+virtual class UMaterialInterface* GetMaterial(int32 ElementIndex) const override;
+virtual void SetMaterial(int32 ElementIndex, class UMaterialInterface* Material);
+virtual void SetMaterialByName(FName MaterialSlotName, class UMaterialInterface* Material);
+virtual int32 GetMaterialIndex(FName MaterialSlotName) const;
+virtual TArray<FName> GetMaterialSlotNames() const;
+virtual int32 GetNumMaterials() const override;
+virtual class UMaterialInstanceDynamic* CreateDynamicMaterialInstance(int32 ElementIndex, class UMaterialInterface* SourceMaterial = NULL, FName OptionalName = NAME_None);
+```
+
+`SetMaterial` swaps the static material and does not create a MID. `CreateDynamicMaterialInstance` with `SourceMaterial = nullptr` parents the new MID to whatever is already in the slot.
+
+---
+
+## Material usage flags
+
+`UMaterialInterface` exposes usage through accessors, never through the `bUsedWith*` fields:
+
+```cpp
+virtual bool GetUsageByFlag(EMaterialUsage Usage) const;
+virtual bool SetMaterialUsage(EMaterialUsage Usage);
+bool CheckMaterialUsage(EMaterialUsage Usage);
+bool CheckMaterialUsage_Concurrent(EMaterialUsage Usage) const;
+bool NeedsSetMaterialUsage_Concurrent(bool& bOutHasUsage, EMaterialUsage Usage) const;
+```
+
+`EMaterialUsage` (`Materials/MaterialInterface.h`): `MATUSAGE_SkeletalMesh`, `MATUSAGE_ParticleSprites`, `MATUSAGE_BeamTrails`, `MATUSAGE_MeshParticles`, `MATUSAGE_StaticLighting`, `MATUSAGE_MorphTargets`, `MATUSAGE_SplineMesh`, `MATUSAGE_InstancedStaticMeshes`, `MATUSAGE_GeometryCollections`, `MATUSAGE_Clothing`, `MATUSAGE_NiagaraSprites`, `MATUSAGE_NiagaraRibbons`, `MATUSAGE_NiagaraMeshParticles`, `MATUSAGE_GeometryCache`, `MATUSAGE_Water`, `MATUSAGE_HairStrands`, `MATUSAGE_LidarPointCloud`, `MATUSAGE_VirtualHeightfieldMesh`, `MATUSAGE_Nanite`, `MATUSAGE_Voxels`, `MATUSAGE_VolumetricCloud`, `MATUSAGE_HeterogeneousVolumes`, `MATUSAGE_StaticMesh`, `MATUSAGE_EditorCompositing`, `MATUSAGE_NeuralNetworks`, `MATUSAGE_MeshDeformer`, `MATUSAGE_InstancedSkinnedMesh`, `MATUSAGE_Curves`.
+
+`UMaterial::SetUsageByFlag(EMaterialUsage Usage, bool NewValue)` writes the flag without validating or recompiling — use `SetMaterialUsage` unless you know why you want the raw setter.
+
+---
+
+## Parameter type mapping
+
+| Material parameter node | Setter | C++ type |
+|---|---|---|
+| Scalar Parameter | `SetScalarParameterValue` | `float` |
+| Vector Parameter | `SetVectorParameterValue` | `FLinearColor` |
+| Vector Parameter (double precision) | `SetDoubleVectorParameterValue` | `FVector4` |
+| Texture Parameter | `SetTextureParameterValue` | `UTexture*` |
+| Runtime Virtual Texture | `SetRuntimeVirtualTextureParameterValue` | `URuntimeVirtualTexture*` |
+| Sparse Volume Texture | `SetSparseVolumeTextureParameterValue` | `USparseVolumeTexture*` |
+| Texture Collection | `SetTextureCollectionParameterValue` | `UTextureCollection*` |
+| Font Parameter | `SetFontParameterValue` | `UFont*` plus page index |
+
+`SetVectorParameterValue` also has inline `const FVector&` / `const FVector4&` overloads that convert to `FLinearColor` (`Materials/MaterialInstanceDynamic.h:112-113`); they are not exposed to Blueprint.
+
+Static switch, static bool and static component mask parameters are baked into the shader permutation and cannot change on a MID. Author a `UMaterialInstanceConstant` per permutation and parent the MID to the right one.
+
+---
+
+## MPC or MID
+
+| Scenario | Use |
+|---|---|
+| Time of day, weather, one global wetness value | Material parameter collection |
+| Anything read by 50+ materials at once | Material parameter collection |
+| Per-actor damage, tint, health fill | MID |
+| Per-instance texture swap | MID |
+| Parameters inside a material layer or blend | MID with `...ByInfo` setters |
+| A texture that must change globally | MID (collections hold no textures) |
+
+---
+
+## Render target format selection
+
+| Use | Format |
+|---|---|
+| LDR colour, UI, minimap | `RTF_RGBA8` |
+| sRGB-encoded colour | `RTF_RGBA8_SRGB` |
+| HDR scene colour | `RTF_RGBA16f` |
+| Single-channel data or depth | `RTF_R16f` |
+| Full float computation | `RTF_RGBA32f` |
+| Packed display output | `RTF_RGB10A2` |
+
+`RTF_RGBA32f` costs four times the memory and bandwidth of `RTF_RGBA16f`; reach for it only when 16-bit float genuinely loses precision.
+
+---
+
+## Scene capture cost control
+
+A `USceneCaptureComponent2D` runs a whole scene render. Cost scales with target resolution, capture source, visible geometry and any post process applied to the capture.
+
+```cpp
+// Capture on demand instead of every frame
+SceneCapture->bCaptureEveryFrame = false;
+SceneCapture->bCaptureOnMovement = false;
+SceneCapture->CaptureScene();
+
+// Trim expensive passes out of the capture
 SceneCapture->ShowFlags.SetAtmosphere(false);
 SceneCapture->ShowFlags.SetFog(false);
 SceneCapture->ShowFlags.SetBloom(false);
 SceneCapture->ShowFlags.SetMotionBlur(false);
 SceneCapture->ShowFlags.SetContactShadows(false);
 
-// Hide specific actors from capture
-SceneCapture->HiddenActors.Add(PlayerActor);
+// Restrict what is drawn
+SceneCapture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
+SceneCapture->ShowOnlyActors.Add(TargetActor);
+SceneCapture->ShowOnlyComponent(TargetComponent);
 
-// Use a low-resolution render target for distant/offscreen views
+// Or exclude a few actors from a normal capture
+SceneCapture->HiddenActors.Add(PlayerActor);
 ```
 
----
+The `ShowFlags.Set*` functions are generated from `Engine/Public/ShowFlagsValues.inl`; `Fog`, `Atmosphere`, `Bloom`, `MotionBlur` and `ContactShadows` are all declared there.
 
-## Common Material Parameter Names by Domain
-
-These are conventions, not enforced by the engine. Match whatever names the material artist has used.
-
-### PBR Base Parameters
-
-| Parameter Name | Type | Typical Range | Purpose |
-|----------------|------|--------------|---------|
-| `BaseColor` | Vector | — | Albedo color |
-| `Roughness` | Scalar | 0.0–1.0 | Surface roughness |
-| `Metallic` | Scalar | 0.0 or 1.0 | Metallic surface flag |
-| `Emissive` | Vector | — | Emissive color (HDR) |
-| `EmissiveIntensity` | Scalar | 0–100+ | Emissive brightness multiplier |
-| `Opacity` | Scalar | 0.0–1.0 | Translucency opacity |
-| `Normal` | Texture | — | Normal map override |
-
-### Damage / Destruction State
-
-| Parameter Name | Type | Purpose |
-|----------------|------|---------|
-| `DamageAmount` | Scalar | 0 = pristine, 1 = fully damaged |
-| `DamageMask` | Texture | Grayscale damage region mask |
-| `BurnAmount` | Scalar | Char/burn intensity |
-
-### Environmental / Weather
-
-| Parameter Name | Type | Purpose |
-|----------------|------|---------|
-| `RainWetness` | Scalar (MPC) | Surface wetness from rain |
-| `SnowAmount` | Scalar (MPC) | Snow coverage amount |
-| `WindStrength` | Scalar (MPC) | Foliage wind intensity |
-| `TimeOfDay` | Scalar (MPC) | 0.0–24.0 hour |
-
-### UI / HUD Materials
-
-| Parameter Name | Type | Purpose |
-|----------------|------|---------|
-| `HealthPercent` | Scalar | 0.0–1.0 health fraction |
-| `FillAmount` | Scalar | Progress bar fill |
-| `TintColor` | Vector | Icon or panel tint |
-| `MaskTexture` | Texture | Custom shape mask |
+Keep minimap and security-camera targets at 256–512 px. For large mirrors prefer planar reflections over a scene capture.
 
 ---
 
-## Debugging Parameter Issues
+## Parameter naming
 
-### Parameter Name Verification
+Names are `FName`s compared exactly, including case. `"basecolor"`, `"Base Color"` and `"Base_Color"` are three different parameters and none of them matches `"BaseColor"`. A mismatch fails silently — no warning, no log.
 
-Parameter names are stored as `FName` — case-sensitive exact match required. If `SetScalarParameterValue` has no visible effect:
+Conventional names, none of them enforced by the engine:
 
-1. Open the material in the Material Editor; confirm the exact `ParameterName` field value.
-2. Check if the parameter is inside a Material Function — use `SetScalarParameterValueByInfo` with `FMaterialParameterInfo` for layer-based access.
-3. Verify the MID's parent is the correct material (not already a MID of another MID pointing to the wrong base).
+| Domain | Typical names |
+|---|---|
+| PBR surface | `BaseColor`, `Roughness`, `Metallic`, `Emissive`, `EmissiveIntensity`, `Opacity`, `Normal` |
+| Damage state | `DamageAmount`, `DamageMask`, `BurnAmount` |
+| Environment (collection) | `RainWetness`, `SnowAmount`, `WindStrength`, `TimeOfDay` |
+| UI and HUD | `HealthPercent`, `FillAmount`, `TintColor`, `MaskTexture` |
 
-### MID Not Taking Effect on Mesh
+Match whatever the material author used; do not invent names in generated code.
 
-If `CreateDynamicMaterialInstance` returns a valid pointer but visual changes are not visible:
+---
 
-- Confirm `UPROPERTY()` on the cached pointer — if missing, the MID may have been GC'd.
-- Confirm the element index matches the correct material slot (`GetMaterialSlotNames()` to list them).
-- On skeletal meshes, verify the LOD 0 slot is being targeted; some materials are per-LOD.
+## Debugging
 
-### MPC Parameter Not Updating Shaders
+**A setter has no visible effect.** Confirm the parameter name in the material editor's `ParameterName` field. If the parameter lives inside a material function or layer, use the `...ByInfo` setter with an `FMaterialParameterInfo` carrying the right `Association` and `Index`. Confirm the MID's parent is the material you think it is.
 
-- Verify the collection asset reference in the component matches the collection asset the material references.
-- Parameter names in the collection are `FName` — case-sensitive.
-- Changes via `SetScalarParameterValue` on `UMaterialParameterCollectionInstance` queue a uniform buffer update; they are applied before the next frame render.
+**The MID exists but the mesh does not change.** Check the cached pointer is a `UPROPERTY` (otherwise it was collected), check the element index against `GetMaterialSlotNames()`, and on skeletal meshes check you targeted the slot the visible LOD actually uses.
+
+**A collection parameter never reaches the shader.** Check the collection asset the component references is the same asset the material samples, and check the parameter name case. Instance writes queue a uniform-buffer update that lands before the next frame renders.
+
+**A parameter reads back as the parent's value.** `GetScalarParameterValue` with `bOveriddenOnly = true` only returns values this instance overrides; pass `false` to fall through to the parent.

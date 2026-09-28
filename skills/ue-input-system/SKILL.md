@@ -1,363 +1,498 @@
 ---
 name: ue-input-system
-description: "Use this skill when implementing player input with Unreal Engine's Enhanced Input system. Also use when the user mentions 'Enhanced Input', 'input', 'input action', 'InputAction', 'mapping context', 'InputMappingContext', 'input binding', 'key binding', 'input trigger', 'input modifier', 'gamepad', or 'keyboard'. Covers ETriggerEvent, built-in triggers (Hold, Tap, Pulse, ChordAction, Combo), built-in modifiers (DeadZone, Scalar, Negate, SwizzleAxis), and custom trigger/modifier authoring. See references/input-action-reference.md for the full catalogue. For UI input modes, see ue-ui-umg-slate."
+description: "Use when wiring player input in Unreal C++ with Enhanced Input — input actions, mapping contexts, triggers, modifiers, binding handlers and runtime key rebinding. Also use when the user mentions 'Enhanced Input', 'UInputAction', 'UInputMappingContext', 'AddMappingContext', 'BindAction', 'SetupPlayerInputComponent', 'ETriggerEvent', 'input trigger', 'input modifier', 'SwizzleAxis', 'dead zone', 'WASD', 'gamepad', 'key rebinding', 'UEnhancedInputUserSettings' or 'input mapping priority'. For UI input modes and CommonUI routing, see ue-ui-umg-slate; for PlayerController/Pawn possession, see ue-gameplay-framework."
 metadata:
-  version: 1.0.0
+  version: "2.0.0"
+  engine: "5.8"
 ---
 
-# UE Enhanced Input System
+# UE Input System
 
-You are an expert in Unreal Engine's Enhanced Input system.
+Target engine: **UE 5.8**. APIs below are verified against the 5.8 headers; older forms are listed under "Deprecated — do not use".
 
-## Context Check
+Enhanced Input is the engine's only supported input path. It lives in the `EnhancedInput` plugin (`Engine/Plugins/EnhancedInput`, enabled by default in 5.8); add `"EnhancedInput"` to `PublicDependencyModuleNames` in your `Build.cs`, plus `"InputCore"` if you touch `FKey`/`EKeys` directly and `"GameplayTags"` if you use input-mode filtering or the user-settings failure-reason containers. The runtime pieces are `UEnhancedPlayerInput`, `UEnhancedInputComponent`, `UEnhancedInputLocalPlayerSubsystem`, the data assets `UInputAction` / `UInputMappingContext`, and `UEnhancedInputUserSettings` for player rebinding.
 
-Read `.agents/ue-project-context.md` before proceeding. Confirm:
+## Context
 
-- `EnhancedInput` plugin is listed as enabled
-- Target platforms (affects which modifiers are needed per platform)
-- Whether CommonUI is in use (it manages input mode switching automatically)
-- Whether the project still uses legacy input (migration may be needed)
+Read `.agents/ue-project-context.md` if it exists (module names, conventions, enabled plugins, GAS/networking setup). Do not stop if it is missing.
 
-## Information Gathering
+Identify the area from the request and the codebase. Ask only when two plausible readings would produce different code.
 
-Ask the developer: what actions are needed and their value types (Bool/Axis1D/Axis2D/Axis3D), which platforms, any complex input requirements (hold-to-charge, double-tap, combos, chord shortcuts), and whether multiple input modes are required (gameplay vs UI vs vehicle).
+| Request is about… | Go to |
+|---|---|
+| Plugin, module, ini setup | [Setup](#setup) |
+| Creating actions and mapping contexts | [Input Assets](#input-assets) |
+| Binding handlers in C++ | [Binding Actions in C++](#binding-actions-in-c) |
+| Which event to bind (`Started` vs `Triggered` vs `Completed`) | [Trigger Events](#trigger-events) |
+| Hold, tap, double-tap, pulse, chord | [Built-in Triggers](#built-in-triggers) |
+| Dead zones, sensitivity, WASD→2D, invert Y | [Built-in Modifiers](#built-in-modifiers) |
+| Adding/removing contexts, priority, split-screen | [Mapping Contexts and Priority](#mapping-contexts-and-priority) |
+| Enabling/disabling contexts by gameplay state | [Input Mode Filtering](#input-mode-filtering) |
+| Player key rebinding, settings screens, saving | [Runtime Key Rebinding](#runtime-key-rebinding) |
+| Input on actors with no PlayerController | [Input Without a PlayerController](#input-without-a-playercontroller) |
+| Per-platform mapping context swaps | [Per-Platform Input Data](#per-platform-input-data) |
+| Writing a new trigger or modifier | [Custom Triggers](#custom-triggers), [Custom Modifiers](#custom-modifiers) |
+| Menus, cursors, CommonUI | [UI Input Mode](#ui-input-mode) |
+| Debug overlays | [Debugging](#debugging) |
 
----
+Full per-class parameter tables live in [references/input-action-reference.md](references/input-action-reference.md).
 
-## Enhanced Input Setup
+## Setup
 
-### Plugin and Module
+```csharp
+// Build.cs
+PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput" });
+```
 
-`.uproject`: add `{ "Name": "EnhancedInput", "Enabled": true }` to Plugins.
-
-`Build.cs`: add `"EnhancedInput"` to `PublicDependencyModuleNames`.
-
-`DefaultInput.ini`:
+`DefaultInput.ini` — point the engine's default classes at Enhanced Input:
 ```ini
 [/Script/Engine.InputSettings]
 DefaultPlayerInputClass=/Script/EnhancedInput.EnhancedPlayerInput
 DefaultInputComponentClass=/Script/EnhancedInput.EnhancedInputComponent
 ```
 
-### UInputAction Asset
+Enhanced Input project settings live on `UEnhancedInputDeveloperSettings` (Project Settings → Engine → Enhanced Input), written to `DefaultInput.ini` under `[/Script/EnhancedInput.EnhancedInputDeveloperSettings]`. Keys that change C++ behaviour: `bEnableUserSettings`, `UserSettingsClass`, `DefaultPlayerMappableKeyProfileClass`, `InputSettingsSaveSlotName`, `bEnableWorldSubsystem`, `DefaultWorldInputClass`, `bEnableInputModeFiltering`, `DefaultMappingContextInputModeQuery`, `DefaultInputMode`, `bEnableDefaultMappingContexts`, `bSendTriggeredEventsWhenInputIsFlushed`.
 
-`UInputAction : UDataAsset`. Create one per logical player action. Key properties (from `InputAction.h`):
+## Input Assets
 
-```cpp
-EInputActionValueType ValueType = EInputActionValueType::Boolean;
-// Boolean | Axis1D (float) | Axis2D (FVector2D) | Axis3D (FVector)
+`UInputAction : UDataAsset` — one per logical player action. Properties that change C++ behaviour:
 
-EInputActionAccumulationBehavior AccumulationBehavior
-    = EInputActionAccumulationBehavior::TakeHighestAbsoluteValue;
-// TakeHighestAbsoluteValue — highest magnitude wins across all mappings to this action
-// Cumulative — all mapping values sum (W + S cancel each other for WASD)
+| Property | Default | Meaning |
+|---|---|---|
+| `ValueType` | `EInputActionValueType::Boolean` | `Boolean`, `Axis1D` (float), `Axis2D` (`FVector2D`), `Axis3D` (`FVector`) |
+| `AccumulationBehavior` | `TakeHighestAbsoluteValue` | Or `Cumulative` — all mappings sum, so W + S cancel |
+| `bConsumeInput` | `true` | Blocks lower-priority Enhanced Input mappings on the same keys |
+| `bConsumesActionAndAxisMappings` | `false` | Also blocks legacy Action/Axis mappings on those keys |
+| `bReserveAllMappings` | `false` | Mappings are not overridden by higher-priority contexts |
+| `bTriggerWhenPaused` | `false` | Action fires while the game is paused |
+| `Triggers` / `Modifiers` | empty | Action-level, applied **after** the per-mapping ones |
+| `PlayerMappableKeySettings` | `nullptr` | `UPlayerMappableKeySettings` — makes the action rebindable |
 
-bool bConsumeInput = true;  // blocks lower-priority Enhanced Input mappings to same keys
+`UInputMappingContext : UDataAsset` — key-to-action bindings, added and removed as a set.
 
-TArray<TObjectPtr<UInputTrigger>> Triggers;   // applied AFTER per-mapping triggers
-TArray<TObjectPtr<UInputModifier>> Modifiers; // applied AFTER per-mapping modifiers
-```
+| Member | Notes |
+|---|---|
+| `DefaultKeyMappings` | `FInputMappingContextMappingData`; read the array with `GetMappings()` |
+| `MappingProfileOverrides` | `TMap<FString, FInputMappingContextMappingData>` — per key-profile overrides |
+| `RegistrationTrackingMode` | `Untracked` (default) or `CountRegistrations` |
+| `InputModeFilterOptions` | `UseProjectDefaultQuery` (default), `UseCustomQuery`, `DoNotFilter` |
+| `MapKey(Action, Key)` / `UnmapKey(Action, Key)` | Editor/config-screen helpers, **not** a runtime rebinding API |
+| `HasMappingForInputAction(Action)` | Search default and profile-override mappings |
 
-### UInputMappingContext Asset
-
-`UInputMappingContext : UDataAsset`. Maps physical keys to actions.
-
-- `DefaultKeyMappings.Mappings` — `TArray<FEnhancedActionKeyMapping>` of key-to-action entries
-- `MappingProfileOverrides` — per-profile key overrides for player remapping support
-- `RegistrationTrackingMode`: `Untracked` (default, first Remove wins) or `CountRegistrations` (IMC stays until Remove called N times, safe when multiple systems share it)
-
----
+Each `FEnhancedActionKeyMapping` carries `Action`, `Key`, per-mapping `Triggers`, `Modifiers`, a `SettingBehavior` (`EPlayerMappableKeySettingBehaviors`: `InheritSettingsFromAction`, `OverrideSettings`, `IgnoreSettings`) and an optional `PlayerMappableKeySettings` override. Reach them with `GetPlayerMappableKeySettings()` and `GetMappingName()`.
 
 ## Binding Actions in C++
 
-### SetupPlayerInputComponent
-
 ```cpp
-// MyCharacter.h — declare assets and handlers
-UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
-TObjectPtr<UInputMappingContext> DefaultMappingContext;
-UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
-TObjectPtr<UInputAction> MoveAction;
-UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
-TObjectPtr<UInputAction> JumpAction;
+// MyCharacter.h
+#pragma once
 
-void Move(const FInputActionValue& Value);
-void StartJump();
-void StopJump();
+#include "CoreMinimal.h"
+#include "GameFramework/Character.h"
+#include "MyCharacter.generated.h"
+
+class UInputAction;
+class UInputMappingContext;
+struct FInputActionValue;
+
+UCLASS()
+class MYGAME_API AMyCharacter : public ACharacter
+{
+	GENERATED_BODY()
+
+public:
+	virtual void BeginPlay() override;
+	virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
+
+protected:
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputMappingContext> DefaultMappingContext;
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputAction> MoveAction;
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputAction> JumpAction;
+
+	void Move(const FInputActionValue& Value);
+	void StartJump();
+	void StopJump();
+};
 ```
 
 ```cpp
 // MyCharacter.cpp
+#include "MyCharacter.h"
+
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
+#include "InputActionValue.h"
+#include "Engine/LocalPlayer.h"
+#include "GameFramework/PlayerController.h"
 
 void AMyCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
-    Super::SetupPlayerInputComponent(PlayerInputComponent);
-    UEnhancedInputComponent* EIC = Cast<UEnhancedInputComponent>(PlayerInputComponent);
-    if (!EIC) { return; }
+	Super::SetupPlayerInputComponent(PlayerInputComponent);
 
-    EIC->BindAction(MoveAction, ETriggerEvent::Triggered, this, &AMyCharacter::Move);
-    EIC->BindAction(JumpAction, ETriggerEvent::Started,   this, &AMyCharacter::StartJump);
-    EIC->BindAction(JumpAction, ETriggerEvent::Completed, this, &AMyCharacter::StopJump);
+	UEnhancedInputComponent* EIC = Cast<UEnhancedInputComponent>(PlayerInputComponent);
+	if (!EIC)
+	{
+		return;
+	}
+
+	EIC->BindAction(MoveAction, ETriggerEvent::Triggered, this, &AMyCharacter::Move);
+	EIC->BindAction(JumpAction, ETriggerEvent::Started,   this, &AMyCharacter::StartJump);
+	EIC->BindAction(JumpAction, ETriggerEvent::Completed, this, &AMyCharacter::StopJump);
 }
 
 void AMyCharacter::BeginPlay()
 {
-    Super::BeginPlay();
-    if (APlayerController* PC = Cast<APlayerController>(GetController()))
-    {
-        if (auto* Sub = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(
-                PC->GetLocalPlayer()))
-        {
-            Sub->AddMappingContext(DefaultMappingContext, 0); // priority 0 = lowest
-        }
-    }
+	Super::BeginPlay();
+
+	APlayerController* PC = Cast<APlayerController>(GetController());
+	if (UEnhancedInputLocalPlayerSubsystem* Subsystem =
+			ULocalPlayer::GetSubsystemFromController<UEnhancedInputLocalPlayerSubsystem>(PC))
+	{
+		Subsystem->AddMappingContext(DefaultMappingContext, 0);
+	}
 }
-```
 
-### Callback Signatures
-
-`BindAction` accepts four delegate signatures:
-
-```cpp
-// No params — press/release without value needed
-void AMyCharacter::StartJump() { Jump(); }
-
-// FInputActionValue — for axis values
 void AMyCharacter::Move(const FInputActionValue& Value)
 {
-    const FVector2D Input = Value.Get<FVector2D>();
-    AddMovementInput(GetActorForwardVector(), Input.Y);
-    AddMovementInput(GetActorRightVector(),   Input.X);
+	const FVector2D Axis = Value.Get<FVector2D>();
+	AddMovementInput(GetActorForwardVector(), Axis.Y);
+	AddMovementInput(GetActorRightVector(), Axis.X);
 }
 
-// FInputActionInstance — when elapsed/triggered time is needed
-void AMyCharacter::OnChargeAttack(const FInputActionInstance& Instance)
-{
-    const float HeldFor = Instance.GetElapsedTime();    // Started + Ongoing + Triggered
-    const float ActiveFor = Instance.GetTriggeredTime(); // Triggered only
-}
-
-// Lambda variant
-EIC->BindActionValueLambda(InteractAction, ETriggerEvent::Triggered,
-    [this](const FInputActionValue& Value) { TryInteract(); });
+void AMyCharacter::StartJump() { Jump(); }
+void AMyCharacter::StopJump() { StopJumping(); }
 ```
 
-Storing and removing a binding:
+### Handler signatures
+
+`UEnhancedInputComponent::BindAction` returns `FEnhancedInputActionEventBinding&` and accepts a member function matching one of three native delegate signatures, or a `UFUNCTION` by name:
+
+| Signature | Handler |
+|---|---|
+| `FEnhancedInputActionHandlerSignature` | `void Handler()` |
+| `FEnhancedInputActionHandlerValueSignature` | `void Handler(const FInputActionValue& Value)` |
+| `FEnhancedInputActionHandlerInstanceSignature` | `void Handler(const FInputActionInstance& Instance)` |
+| `FEnhancedInputActionHandlerDynamicSignature` | `BindAction(Action, Event, Object, FName("OnFirePressed"))` |
+
+`FInputActionInstance` exposes `GetValue()`, `GetTriggerEvent()`, `GetElapsedTime()` (Started + Ongoing + Triggered), `GetTriggeredTime()` (Triggered only), `GetLastTriggeredWorldTime()`, `GetTriggers()`, `GetModifiers()` and `GetSourceAction()`.
+
+Lambdas and pollable values:
 ```cpp
-FEnhancedInputActionEventBinding& B =
-    EIC->BindAction(DebugAction, ETriggerEvent::Started, this, &AMyCharacter::DebugToggle);
-uint32 Handle = B.GetHandle();
-// ...
-EIC->RemoveBindingByHandle(Handle);        // remove one binding
-EIC->ClearBindingsForObject(this);         // remove all bindings for an object
+EIC->BindActionValueLambda(InteractAction, ETriggerEvent::Triggered,
+	[this](const FInputActionValue& Value) { TryInteract(Value.Get<bool>()); });
+
+EIC->BindActionInstanceLambda(ChargeAction, ETriggerEvent::Ongoing,
+	[this](const FInputActionInstance& Instance) { SetChargeProgress(Instance.GetElapsedTime()); });
+
+// No delegate — just reflects the current value, poll it from Tick
+FEnhancedInputActionValueBinding& LookBinding = EIC->BindActionValue(LookAction);
+const FVector2D LookAxis = LookBinding.GetValue().Get<FVector2D>();
 ```
 
----
+Removing bindings:
+```cpp
+FEnhancedInputActionEventBinding& Binding =
+	EIC->BindAction(JumpAction, ETriggerEvent::Started, this, &AMyCharacter::StartJump);
+const uint32 BindingHandle = Binding.GetHandle(); // uint32, EnhancedInputComponent.h:165
 
-## Trigger Events (ETriggerEvent)
+EIC->RemoveBindingByHandle(BindingHandle);   // one binding, later
+EIC->ClearBindingsForObject(this);           // every binding owned by this object; ClearActionBindings() drops all
+```
 
-Bitmask enum from `InputTriggers.h`:
+## Trigger Events
 
-| Event | State Transition | Use for |
-|---|---|---|
-| `Started` | None -> Ongoing/Triggered | First frame of input; press-once actions |
-| `Triggered` | *->Triggered, Triggered->Triggered | Every active frame; continuous movement |
-| `Ongoing` | Ongoing->Ongoing | Held but not yet triggered (charge build-up) |
-| `Canceled` | Ongoing->None | Released before trigger threshold |
-| `Completed` | Triggered->None | Input released after triggering; stop continuous actions |
+`ETriggerEvent` is a bitmask (`ENUM_CLASS_FLAGS`) describing the trigger-state transitions seen this tick.
 
-Note: `Completed` does not fire if any trigger on the same action reports `Ongoing` that frame.
+| Event | Bit | State transition | Bind it for |
+|---|---|---|---|
+| `Triggered` | `1 << 0` | None→Triggered, Ongoing→Triggered, Triggered→Triggered | Every active frame; continuous movement |
+| `Started` | `1 << 1` | None→Ongoing, None→Triggered | First frame of evaluation; press-once actions |
+| `Ongoing` | `1 << 2` | Ongoing→Ongoing | Held but not yet triggered (charge build-up) |
+| `Canceled` | `1 << 3` | Ongoing→None | Released before the trigger condition was met |
+| `Completed` | `1 << 4` | Triggered→None | Release after triggering; stop continuous actions |
 
----
+`Started` always fires before `Triggered` when both occur on the same tick. `Completed` does **not** fire on a tick where any trigger on the action reports `Ongoing` — split press and release into two actions if you need both reliably.
 
 ## Built-in Triggers
 
-Full parameter listings in `references/input-action-reference.md`.
+Per-class properties and defaults: [references/input-action-reference.md](references/input-action-reference.md).
 
-| Class | Name | Behavior |
+| Class | Display name | Behavior |
 |---|---|---|
-| `UInputTriggerDown` | Down | Every frame input exceeds threshold (implicit default) |
+| `UInputTriggerDown` | Down | Fires every frame the value is actuated (implicit default when an action has no triggers) |
 | `UInputTriggerPressed` | Pressed | Once on first actuation; holding does not repeat |
-| `UInputTriggerReleased` | Released | Once when input drops below threshold after actuation |
-| `UInputTriggerHold` | Hold | After `HoldTimeThreshold` s; `bIsOneShot=false` repeats every frame |
-| `UInputTriggerHoldAndRelease` | Hold And Release | On release after holding `HoldTimeThreshold` s |
-| `UInputTriggerTap` | Tap | Released within `TapReleaseTimeThreshold` s |
-| `UInputTriggerRepeatedTap` | Repeated Tap | N taps within `RepeatDelay` (`NumberOfTapsWhichTriggerRepeat=2` for double-tap) |
-| `UInputTriggerPulse` | Pulse | Repeatedly at `Interval` s while held; optional `TriggerLimit` |
-| `UInputTriggerChordAction` | Chorded Action | Only fires while `ChordAction` is active (Implicit type; auto-blocks solo key) |
-| `UInputTriggerCombo` | Combo (Beta) | All `ComboActions` completed in order within `TimeToPressKey` windows |
+| `UInputTriggerReleased` | Released | Once when the value drops below `ActuationThreshold` after actuation |
+| `UInputTriggerHold` | Hold | After `HoldTimeThreshold` seconds; `bIsOneShot = false` keeps firing |
+| `UInputTriggerHoldAndRelease` | Hold And Release | On release, if held at least `HoldTimeThreshold` |
+| `UInputTriggerTap` | Tap | Released within `TapReleaseTimeThreshold` |
+| `UInputTriggerRepeatedTap` | Repeated Tap | `NumberOfTapsWhichTriggerRepeat` taps, each gap under `RepeatDelay` |
+| `UInputTriggerPulse` | Pulse | Every `Interval` seconds while held; `TriggerLimit` caps the count |
+| `UInputTriggerChordAction` | Chorded Action | Only while `ChordAction` is triggered; injects a `UInputTriggerChordBlocker` into lower-priority mappings of the same key |
 
-Trigger type rules for multi-trigger evaluation: `Explicit` (default, at least one must fire), `Implicit` (all must fire), `Blocker` (blocks everything if active).
-
----
+`ETriggerType` decides how triggers combine on one action: `Explicit` (at least one must fire), `Implicit` (all must fire), `Blocker` (blocks everything while `IsBlocking` returns true). `ETriggerEventsSupported` (`None`, `Instant`, `Uninterruptible`, `Ongoing`, `All`) declares which `ETriggerEvent`s a trigger can ever produce.
 
 ## Built-in Modifiers
 
-Applied in array order. Mapping-level modifiers run before action-level modifiers.
+Per-mapping modifiers run first, then the action-level `Modifiers` array; each group runs in array order.
 
-| Class | Name | Effect |
+| Class | Display name | Effect |
 |---|---|---|
-| `UInputModifierDeadZone` | Dead Zone | Zero input below `LowerThreshold`; remap to 1 at `UpperThreshold`. Types: Axial, Radial, UnscaledRadial |
+| `UInputModifierDeadZone` | Dead Zone | Zero below `LowerThreshold`, remap to 1 at `UpperThreshold`; `Type` = `Axial`, `Radial`, `UnscaledRadial` |
 | `UInputModifierScalar` | Scalar | Multiply per axis by `FVector Scalar` |
 | `UInputModifierScaleByDeltaTime` | Scale By Delta Time | Multiply by frame DeltaTime |
-| `UInputModifierNegate` | Negate | Invert selected axes (`bX`, `bY`, `bZ`) |
-| `UInputModifierSwizzleAxis` | Swizzle Input Axis Values | Reorder axes; `YXZ` (default) swaps X/Y — maps 1D key onto Y of Axis2D action |
+| `UInputModifierNegate` | Negate | Invert the axes selected by `bX` / `bY` / `bZ` |
+| `UInputModifierSwizzleAxis` | Swizzle Input Axis Values | Reorder axes; `Order` defaults to `EInputAxisSwizzle::YXZ` |
 | `UInputModifierSmooth` | Smooth | Rolling average over recent samples |
-| `UInputModifierSmoothDelta` | Smooth Delta | Smoothed normalized delta; configurable interpolation (`Lerp`, `Interp_To`, ease curves) |
-| `UInputModifierResponseCurveExponential` | Response Curve - Exponential | `sign(x)*|x|^CurveExponent` per axis |
-| `UInputModifierResponseCurveUser` | Response Curve - User Defined | Separate `UCurveFloat` per axis |
-| `UInputModifierFOVScaling` | FOV Scaling | Scale by camera FOV for consistent angular speed across zoom levels |
-| `UInputModifierToWorldSpace` | To World Space | 2D axis -> world space (up/down = world X, left/right = world Y) |
+| `UInputModifierSmoothDelta` | Smooth Delta | Smoothed normalized delta; `SmoothingMethod`, `Speed`, `EasingExponent` |
+| `UInputModifierResponseCurveExponential` | Response Curve - Exponential | `sign(x) * pow(abs(x), CurveExponent)` per axis |
+| `UInputModifierResponseCurveUser` | Response Curve - User Defined | One `UCurveFloat` per axis |
+| `UInputModifierFOVScaling` | FOV Scaling | Scale by camera FOV for constant angular speed across zoom |
+| `UInputModifierToWorldSpace` | To World Space | 2D axis → world space |
 
-**WASD -> Axis2D recipe** (`AccumulationBehavior = Cumulative`):
-- `W`: `SwizzleAxis(YXZ)` → Y=+1
-- `S`: `SwizzleAxis(YXZ)` + `Negate(bY)` → Y=-1
-- `D`: none → X=+1
-- `A`: `Negate(bX)` → X=-1
+**WASD → Axis2D** (`AccumulationBehavior = Cumulative` on the action):
+- `W`: `Swizzle Input Axis Values (YXZ)` → Y = +1
+- `S`: `Swizzle Input Axis Values (YXZ)` + `Negate (bY)` → Y = −1
+- `D`: none → X = +1
+- `A`: `Negate (bX)` → X = −1
 
-**Gamepad stick**: `DeadZone(Radial, LowerThreshold=0.2)` per stick mapping.
+**Gamepad stick**: `Dead Zone (Radial, LowerThreshold = 0.2)` on each stick mapping.
+**Mouse look**: `Scalar(0.4, 0.4, 1.0)`, then `Smooth`, then `FOV Scaling` on the mapping.
 
-**Mouse look**: `[Scalar(0.4,0.4,1), Smooth, FOVScaling]` per mapping.
-
----
-
-## Mapping Context Priority
+## Mapping Contexts and Priority
 
 ```cpp
-// Higher integer = higher priority; wins key conflicts
-Subsystem->AddMappingContext(GameplayIMC, 0);
-Subsystem->AddMappingContext(VehicleIMC,  1);
+Subsystem->AddMappingContext(GameplayContext, 0);   // higher integer = higher priority
+Subsystem->AddMappingContext(VehicleContext, 1);
 
-// FModifyContextOptions — prevent ghost inputs on switch
-FModifyContextOptions Opts;
-Opts.bIgnoreAllPressedKeysUntilRelease = true;
-Subsystem->AddMappingContext(UIIMC, 2, Opts);
+FModifyContextOptions Options;
+Options.bForceImmediately = true;     // rebuild now instead of at end of frame
+Options.bNotifyUserSettings = true;   // register these mappings with UEnhancedInputUserSettings
+Subsystem->AddMappingContext(MenuContext, 2, Options);
 
-// Remove on mode exit
-Subsystem->RemoveMappingContext(VehicleIMC);
+Subsystem->RemoveMappingContext(VehicleContext);
+Subsystem->ClearAllMappings();
+
+int32 FoundPriority = 0;
+const bool bActive = Subsystem->HasMappingContext(GameplayContext, FoundPriority);
+const FInputActionValue Current = Subsystem->GetPlayerInput()->GetActionValue(MoveAction);
 ```
 
-When `bConsumeInput = true` on a `UInputAction` (the default), a higher-priority context that maps the same physical key will consume it, blocking all lower-priority bindings to that key from firing. This is intentional: use priority layering and `bConsumeInput` together to prevent input conflicts between modes (e.g., a vehicle context consuming Spacebar so the character's Jump action never fires while driving).
+`FModifyContextOptions` defaults: `bIgnoreAllPressedKeysUntilRelease = true`, `bForceImmediately = false`, `bNotifyUserSettings = false`. The first one already suppresses ghost inputs from keys held across a context switch — do not set it explicitly thinking it is opt-in; set it to `false` only when you deliberately want a held key to carry into the new context.
 
-### Split-Screen / Multiple Local Players
+`bConsumeInput = true` on a `UInputAction` (the default) means a higher-priority context mapping the same physical key blocks every lower-priority binding of that key. Use priority plus `bConsumeInput` to keep modes apart — a vehicle context consuming Spacebar stops the character's Jump action firing while driving.
 
-In split-screen, each local player has their own `UEnhancedInputLocalPlayerSubsystem`. Mapping contexts are per-player — adding a context to one player's subsystem does not affect others. To target a specific player, retrieve their subsystem directly from their `ULocalPlayer`:
+`RegistrationTrackingMode` on the IMC: `Untracked` (the first `RemoveMappingContext` wins, whatever the add count) or `CountRegistrations` (stays applied until removed as many times as it was added — use it when several systems share one IMC).
+
+Each local player owns a separate `UEnhancedInputLocalPlayerSubsystem`, so split-screen contexts never leak between players. Fetch a specific player's subsystem with `ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(LocalPlayer)` or `ULocalPlayer::GetSubsystemFromController<UEnhancedInputLocalPlayerSubsystem>(PlayerController)`. Simulate input without a device with `InjectInputForAction(Action, RawValue, Modifiers, Triggers)` or `InjectInputVectorForAction(Action, Value, Modifiers, Triggers)`.
+
+## Input Mode Filtering
+
+Gate whole mapping contexts on a gameplay-tag state instead of adding and removing them. Requires `bEnableInputModeFiltering` on `UEnhancedInputDeveloperSettings`.
+
+- The subsystem holds the current mode: `GetInputMode()`, `SetInputMode(Tags, Options)`, `AppendTagsToInputMode`, `AddTagToInputMode`, `RemoveTagsFromInputMode`, `RemoveTagFromInputMode` — all take an optional `FModifyContextOptions`.
+- Each `UInputMappingContext` chooses how it is matched via `InputModeFilterOptions`: `UseProjectDefaultQuery` (the project's `DefaultMappingContextInputModeQuery`), `UseCustomQuery` (the IMC's own `InputModeQueryOverride`), or `DoNotFilter`.
+- `UEnhancedInputDeveloperSettings::DefaultInputMode` seeds the mode on every new `UEnhancedPlayerInput`.
+- Contexts whose query fails stay registered but stop producing input, so priorities and registration counts are untouched.
 
 ```cpp
-// Access subsystem for a specific local player (e.g., player 2)
-if (ULocalPlayer* LP = PlayerController->GetLocalPlayer())
+Subsystem->SetInputMode(FGameplayTagContainer(MyGameplayTags::TAG_InputMode_Menu));
+```
+
+## Runtime Key Rebinding
+
+`UEnhancedInputUserSettings` (`UserSettings/EnhancedInputUserSettings.h`) is the sanctioned rebinding path. It is a `USaveGame`, created per subsystem when `bEnableUserSettings` is on, and saved to the slot named by `InputSettingsSaveSlotName`.
+
+```cpp
+#include "EnhancedInputSubsystems.h"
+#include "UserSettings/EnhancedInputUserSettings.h"
+
+void UMyRebindWidget::RebindKey(FName MappingName, const FKey& NewKey)
 {
-    if (auto* Sub = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(LP))
-    {
-        Sub->AddMappingContext(PlayerTwoIMC, 0);
-    }
+	UEnhancedInputLocalPlayerSubsystem* Subsystem =
+		ULocalPlayer::GetSubsystemFromController<UEnhancedInputLocalPlayerSubsystem>(GetOwningPlayer());
+	UEnhancedInputUserSettings* Settings = Subsystem ? Subsystem->GetUserSettings() : nullptr;
+	if (!Settings)
+	{
+		return;
+	}
+
+	FMapPlayerKeyArgs Args;
+	Args.MappingName = MappingName;
+	Args.Slot = EPlayerMappableKeySlot::First;
+	Args.NewKey = NewKey;
+
+	FGameplayTagContainer FailureReason;
+	Settings->MapPlayerKey(Args, FailureReason);
+	if (FailureReason.IsEmpty())
+	{
+		Settings->SaveSettings();
+	}
 }
 ```
 
----
+Register any IMC the settings UI must list — even one never added to the subsystem — with `RegisterInputMappingContext(IMC)`; adding a context with `bNotifyUserSettings = true` does it for you. Read mappings back with `FindMappingsInRow(MappingName)` and `FindCurrentMappingForSlot(MappingName, Slot)`, reset with `ResetAllPlayerKeysInRow` or `ResetKeyProfileIdToDefault`, and persist with `SaveSettings()` / `AsyncSaveSettings()`. Profile identifiers are `FString`, not `FGameplayTag` — `ProfileIdString`, `GetProfileIdString()`, `GetActiveKeyProfileId()`, `GetKeyProfileWithId()`, `SetActiveKeyProfile()`.
+
+An action or mapping is only rebindable if it carries a `UPlayerMappableKeySettings` (`Name`, `DisplayName`, `DisplayCategory`, `Metadata`, `SupportedKeyProfileIds`) — either on the `UInputAction` or on the `FEnhancedActionKeyMapping` with `SettingBehavior = OverrideSettings`. Full API and struct tables: [references/input-action-reference.md](references/input-action-reference.md).
+
+## Input Without a PlayerController
+
+`UEnhancedInputWorldSubsystem` (Experimental in 5.8) lets actors that will never be possessed receive input delegates. Enable it with `bEnableWorldSubsystem` in `UEnhancedInputDeveloperSettings`.
+
+```cpp
+#include "EnhancedInputComponent.h"
+#include "EnhancedInputSubsystems.h"
+#include "Engine/World.h"
+
+void AMyDoor::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// AddActorInputComponent reads AActor::InputComponent, created only for possessed actors.
+	if (!InputComponent)
+	{
+		InputComponent = NewObject<UEnhancedInputComponent>(this, TEXT("DoorInputComponent"));
+		InputComponent->RegisterComponent();
+	}
+
+	UEnhancedInputComponent* EIC = CastChecked<UEnhancedInputComponent>(InputComponent);
+	EIC->BindAction(OpenAction, ETriggerEvent::Started, this, &AMyDoor::Open);
+
+	if (UEnhancedInputWorldSubsystem* WorldInput =
+			GetWorld()->GetSubsystem<UEnhancedInputWorldSubsystem>())
+	{
+		WorldInput->AddActorInputComponent(this);
+		WorldInput->AddMappingContext(DoorContext, 0);
+	}
+}
+```
+
+Pair every `AddActorInputComponent` with `RemoveActorInputComponent` on `EndPlay`. The subsystem implements the same `IEnhancedInputSubsystemInterface` as the local-player one, so `AddMappingContext`, `InjectInputForAction` and friends behave identically — but it has no user settings and no local player.
+
+## Per-Platform Input Data
+
+`UEnhancedInputPlatformSettings` (`UPlatformSettings`, `UEnhancedInputPlatformSettings::Get()`) holds an `InputData` array of `UEnhancedInputPlatformData` subclasses. Each one defines `MappingContextRedirects`, a `TMap` swapping one `UInputMappingContext` for another on that platform; `GetContextRedirect(Context)` returns the replacement or the original. Use it to substitute a touch or console context without branching in gameplay code. Calling `Get()` needs `DeveloperSettings` in Build.cs (it inlines a `UPlatformSettingsManager` call).
 
 ## Custom Triggers
 
-Subclass `UInputTrigger`; override `UpdateState_Implementation` returning `ETriggerState::None / Ongoing / Triggered`:
+Subclass `UInputTrigger` and override `UpdateState_Implementation`, returning `ETriggerState::None`, `Ongoing` or `Triggered`.
 
 ```cpp
-UCLASS(EditInlineNew, meta=(DisplayName="Double Click"))
-class MYGAME_API UDoubleClickTrigger : public UInputTrigger
-{
-    GENERATED_BODY()
-public:
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Trigger Settings")
-    float DoubleClickThreshold = 0.3f;
-protected:
-    virtual ETriggerType GetTriggerType_Implementation() const override
-        { return ETriggerType::Explicit; }
-    virtual ETriggerState UpdateState_Implementation(
-        const UEnhancedPlayerInput* PlayerInput, FInputActionValue ModifiedValue, float DeltaTime) override;
-private:
-    float LastPressTime = 0.f;
-    bool bWasActuated = false;
-};
+// MyDoubleClickTrigger.h
+#pragma once
 
-ETriggerState UDoubleClickTrigger::UpdateState_Implementation(
-    const UEnhancedPlayerInput* PlayerInput, FInputActionValue ModifiedValue, float DeltaTime)
+#include "EnhancedPlayerInput.h"
+#include "Engine/World.h"
+#include "InputTriggers.h"
+#include "MyDoubleClickTrigger.generated.h"
+
+UCLASS(EditInlineNew, meta = (DisplayName = "Double Click"))
+class MYGAME_API UMyDoubleClickTrigger : public UInputTrigger
 {
-    const bool bActuated = IsActuated(ModifiedValue); // helper: magnitude >= ActuationThreshold
-    const float Now = PlayerInput->GetWorld()->GetTimeSeconds();
-    if (bActuated && !bWasActuated)
-    {
-        if ((Now - LastPressTime) <= DoubleClickThreshold)
-            { LastPressTime = 0.f; bWasActuated = bActuated; return ETriggerState::Triggered; }
-        LastPressTime = Now;
-    }
-    bWasActuated = bActuated;
-    return ETriggerState::None;
-}
+	GENERATED_BODY()
+
+public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trigger Settings")
+	float DoubleClickThreshold = 0.3f;
+
+protected:
+	virtual ETriggerType GetTriggerType_Implementation() const override { return ETriggerType::Explicit; }
+
+	virtual ETriggerState UpdateState_Implementation(
+		const UEnhancedPlayerInput* PlayerInput, FInputActionValue ModifiedValue, float DeltaTime) override
+	{
+		const bool bActuated = IsActuated(ModifiedValue);
+		const float Now = PlayerInput->GetWorld()->GetTimeSeconds();
+
+		ETriggerState Result = ETriggerState::None;
+		if (bActuated && !bWasActuated)
+		{
+			if ((Now - LastPressTime) <= DoubleClickThreshold)
+			{
+				LastPressTime = 0.f;
+				Result = ETriggerState::Triggered;
+			}
+			else
+			{
+				LastPressTime = Now;
+			}
+		}
+
+		bWasActuated = bActuated;
+		return Result;
+	}
+
+private:
+	float LastPressTime = 0.f;
+	bool bWasActuated = false;
+};
 ```
 
-`UInputTriggerTimedBase` provides `HeldDuration` and `CalculateHeldDuration` for time-based triggers.
-
----
+`IsActuated(Value)` is `Value.GetMagnitudeSq() >= ActuationThreshold * ActuationThreshold`. For time-based triggers derive from `UInputTriggerTimedBase`, which transitions to `Ongoing` on actuation and gives you `HeldDuration` plus `CalculateHeldDuration(PlayerInput, DeltaTime)` and `bAffectedByTimeDilation`. Override `IsBlocking(const ETriggerState State) const` for blockers and `GetDebugState() const` for the debug HUD. If your trigger keeps state across mapping rebuilds, override `ReceiveTriggerReinstanced_Implementation(const UInputTrigger* OldTrigger)` and call `Super`.
 
 ## Custom Modifiers
 
-Subclass `UInputModifier`; override `ModifyRaw_Implementation`:
-
+Subclass `UInputModifier` and override:
 ```cpp
-UCLASS(EditInlineNew, meta=(DisplayName="Clamp Magnitude"))
-class MYGAME_API UClampMagnitudeModifier : public UInputModifier
-{
-    GENERATED_BODY()
-public:
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category=Settings)
-    float MaxMagnitude = 1.0f;
-protected:
-    virtual FInputActionValue ModifyRaw_Implementation(
-        const UEnhancedPlayerInput* PlayerInput, FInputActionValue CurrentValue, float DeltaTime) override
-    {
-        FVector V = CurrentValue.Get<FVector>();
-        if (V.SizeSquared() > MaxMagnitude * MaxMagnitude)
-            V = V.GetSafeNormal() * MaxMagnitude;
-        return FInputActionValue(CurrentValue.GetValueType(), V);
-    }
-};
+virtual FInputActionValue ModifyRaw_Implementation(
+	const UEnhancedPlayerInput* PlayerInput, FInputActionValue CurrentValue, float DeltaTime) override;
 ```
 
----
-
-## Common Mistakes
-
-- **Mapping context not added**: Add via subsystem in `BeginPlay`/after `Possess`, not in `SetupPlayerInputComponent` (called earlier on some paths).
-- **Legacy binding on UEnhancedInputComponent**: `BindAction(FName,...)` and `BindAxis` are `= delete`. Compile error. Set `DefaultInputComponentClass` in `DefaultInput.ini`.
-- **Triggered for a button press**: `Triggered` fires every active frame. Use `Started` for press-once, `Completed` for release.
-- **Completed not firing with Ongoing**: If any trigger reports `Ongoing` that frame, `Completed` is suppressed. Use separate actions for clean press/release events.
-- **No dead zone on gamepad sticks**: Sticks produce non-zero resting values. Always add `DeadZone(Radial)` per stick mapping.
-- **Missing SwizzleAxis for WASD-to-2D**: Keyboard produces 1D. Without `SwizzleAxis(YXZ)` on W/S, forward/backward stays on X and is ignored by Axis2D forward movement.
-- **Replicating input actions**: Input is client-local. Replicate results (movement, ability activation), not trigger events.
-- **MapKey/UnmapKey at runtime for rebinding**: These are editor/config-screen helpers. Use subsystem player mappable key APIs or swap contexts instead.
-- **Wrong trigger type for intent**: Using `Down` when `Hold` is needed, or `Triggered` when `Started` is needed. Match trigger type to the interaction pattern: `Started` for single press, `Triggered` for continuous, `Hold` for delayed activation.
-
----
-
-## Legacy Input Migration
-
-To migrate from the legacy input system to Enhanced Input: search for `InputComponent->BindAction` and `InputComponent->BindAxis` calls and replace each with `UEnhancedInputComponent::BindAction`. Create a `UInputAction` data asset for every old action name, choosing the appropriate `ValueType` (Boolean for buttons, Axis1D for single-axis, Axis2D for stick/WASD). Create a `UInputMappingContext` asset and add key mappings corresponding to the old `DefaultInput.ini` `ActionMappings`/`AxisMappings` entries. Set `DefaultInputComponentClass` in `DefaultInput.ini` and enable the EnhancedInput plugin.
+The returned value is converted back to the action's `ValueType` before further processing, so you may return any shape internally — `FInputActionValue(CurrentValue.GetValueType(), Vector)` preserves it. Override `GetVisualizationColor_Implementation(FInputActionValue SampleValue, FInputActionValue FinalValue) const` to control the debug overlay colour. Worked example: [references/input-action-reference.md](references/input-action-reference.md).
 
 ## UI Input Mode
 
-Without CommonUI, manage input modes manually via `APlayerController::SetInputMode()`:
-```cpp
-PC->SetInputMode(FInputModeUIOnly());          // cursor captured by UI, no game input
-PC->SetInputMode(FInputModeGameAndUI());       // both UI and game receive input
-PC->SetInputMode(FInputModeGameOnly());        // full game input, UI events suppressed
-```
-CommonUI automates input routing through `UCommonActivatableWidget` stacks and eliminates most manual `SetInputMode` calls — see `ue-ui-umg-slate`.
+Without CommonUI, switch modes on the PlayerController with `SetInputMode(FInputModeUIOnly())`, `SetInputMode(FInputModeGameAndUI())` or `SetInputMode(FInputModeGameOnly())`.
 
----
+CommonUI routes input through `UCommonActivatableWidget` stacks and removes most manual `SetInputMode` calls. Enhanced Input and Common Input are unified: turn on `UCommonInputSettings::bEnableEnhancedInputSupport` (Project Settings → Game → Common Input; requires a restart) and CommonUI's click and back actions become `UInputAction` assets — `UCommonUIInputData::EnhancedInputClickAction` and `EnhancedInputBackAction` — instead of data-table rows. Widget stacks, activatable widgets and input configs belong to `ue-ui-umg-slate`.
+
+## Debugging
+
+`ShowDebug EnhancedInput` prints the applied mapping contexts, each action's value and trigger state, and each trigger's `GetDebugState()`. `ShowDebug WorldSubsystemInput` does the same for `UEnhancedInputWorldSubsystem`; `ShowDebug InputSettings` dumps the developer settings; `LogWorldSubsystemInput` at `VeryVerbose` logs every key the world subsystem processes.
+
+## Deprecated — do not use
+
+| Do not emit | Use in 5.8 | Source |
+|---|---|---|
+| `UInputTriggerCombo` | No replacement — build the sequence from `UInputTriggerChordAction`, timers, or a state machine | `UE_DEPRECATED(5.8)` in `InputTriggers.h:571` |
+| `FInputComboStepData`, `FInputCancelAction` | No replacement | `UE_DEPRECATED(5.8)` in `InputTriggers.h:530,551` |
+| `FEnhancedInputKeys::ComboKey` | No replacement | `UE_DEPRECATED(5.8)` in `EnhancedInputModule.h:20` |
+| `UInputMappingContext::Mappings` | `DefaultKeyMappings` / `GetMappings()` | `UE_DEPRECATED(5.7)` in `InputMappingContext.h:93` |
+| `UEnhancedInputPlatformSettings::LoadInputDataClasses()`, `InputDataClasses` | `GetInputData()` / `ForEachInputData()` | `UE_DEPRECATED(5.7)` in `EnhancedInputPlatformSettings.h:77,88` |
+| `UEnhancedPlayerInput::GetAppliedInputContexts()` | `GetAppliedInputContextData()` | `UE_DEPRECATED(5.6)` in `EnhancedPlayerInput.h:175` |
+| `FMapPlayerKeyArgs::ProfileId` (`FGameplayTag`), `SetKeyProfile(FGameplayTag)`, `GetCurrentKeyProfile()`, `GetCurrentKeyProfileIdentifier()`, `GetAllSavedKeyProfiles()`, `GetKeyProfileWithIdentifier()`, `ResetKeyProfileToDefault(FGameplayTag)`, `GetProfileIdentifer()` | `ProfileIdString` (`FString`), `SetActiveKeyProfile(FString)`, `GetActiveKeyProfile()`, `GetActiveKeyProfileId()`, `GetAllAvailableKeyProfiles()`, `GetKeyProfileWithId()`, `ResetKeyProfileIdToDefault(FString)`, `GetProfileIdString()` | `UE_DEPRECATED(5.6)` in `UserSettings/EnhancedInputUserSettings.h:86,706,730,722,754,776,673,327` |
+| `UPlayerMappableKeySettings::SupportedKeyProfiles` | `SupportedKeyProfileIds` (`TArray<FString>`) | `UE_DEPRECATED(5.6)` in `PlayerMappableKeySettings.h:62` |
+| `UEnhancedInputDeveloperSettings::bShouldLogAllWorldSubsystemInputs` | `LogWorldSubsystemInput` at `VeryVerbose` | `UE_DEPRECATED(5.6)` in `EnhancedInputDeveloperSettings.h:150` |
+| `UPlayerMappableInputConfig` | `UEnhancedInputUserSettings` | `UE_DEPRECATED(5.3)` in `PlayerMappableInputConfig.h:23` |
+| `UInputComponent::BindAxis`, `BindAction(FName, EInputEvent, Object, Func)`, `BindAxisKey`, `BindVectorAxis`, `BindKey`, `BindTouch`, `BindGesture` | `UEnhancedInputComponent::BindAction(UInputAction*, ETriggerEvent, Object, Func)` | `= delete` on `UEnhancedInputComponent`, `EnhancedInputComponent.h:613-634` |
+
+## Common Mistakes
+
+**Adding the mapping context in `SetupPlayerInputComponent`:** that call can run before the controller and local player are resolved. Add contexts in `BeginPlay`, `OnPossess`/`PossessedBy`, or a `PlayerControllerChanged` handler.
+
+**Setting `bIgnoreAllPressedKeysUntilRelease = true` "to be safe":** it is already the default on `FModifyContextOptions`. Only touch it to set `false`.
+
+**Binding `Triggered` for a button press:** `Triggered` fires every active frame. Use `Started` for press-once and `Completed` for release.
+
+**Expecting `Completed` alongside `Ongoing`:** `Completed` is suppressed on any tick where a trigger reports `Ongoing`. Split into two actions with their own triggers.
+
+**No dead zone on sticks:** analog sticks rest at non-zero. Add `Dead Zone (Radial)` to every stick mapping.
+
+**Missing swizzle for WASD:** a keyboard key produces a 1D value on X. Without `Swizzle Input Axis Values (YXZ)` on W and S, forward/back never reaches the Y component of an `Axis2D` action.
+
+**Calling `MapKey`/`UnmapKey` for player rebinding:** those mutate the IMC asset and are editor/config helpers. Use `UEnhancedInputUserSettings::MapPlayerKey` instead, and pass `bNotifyUserSettings = true` when adding contexts you want listed in a rebinding UI.
+
+**Replicating trigger events:** input is client-local. Replicate the result — movement input, ability activation — never the `ETriggerEvent`.
+
+**Legacy binding on a `UEnhancedInputComponent`:** `BindAxis` and the `FName` `BindAction` overloads are `= delete` and fail to compile. Migrate them rather than defining `ENHANCED_INPUT_ALLOW_LEGACY_BINDING=1`.
 
 ## Related Skills
 
-- `ue-gameplay-framework` — PlayerController input lifecycle, `Possess`/`UnPossess`, `SetupPlayerInputComponent`
-- `ue-ui-umg-slate` — `SetInputMode(FInputModeUIOnly())`/`FInputModeGameAndUI()`, cursor visibility, CommonUI `UCommonActivatableWidget` stacks
-- `ue-gameplay-abilities` — binding Enhanced Input actions to GAS ability activation via input ID tags
+- `ue-gameplay-framework` — `APlayerController`, possession, `SetupPlayerInputComponent` lifecycle
+- `ue-ui-umg-slate` — CommonUI activatable-widget stacks, input configs, cursor and focus
+- `ue-character-movement` — consuming `FInputActionValue` through `AddMovementInput`
+- `ue-gameplay-abilities` — activating abilities from input, `UAbilitySystemComponent` input IDs
+- `ue-actor-component-architecture` — `UActorComponent`/`UInputComponent` ownership, `EnableInput`, component-owned input
+- Also relevant: `ue-cpp-foundations`, `ue-game-features`, `ue-gameplay-cameras`, `ue-mover`

@@ -1,119 +1,155 @@
 # Mass Fragment Reference
 
-Built-in fragment types, shared fragments, and trait classes from the Mass Entity framework. All types verified from UE source headers.
+Built-in element types, shared fragments and traits, with the header and Build.cs module each one needs in UE 5.8. Headers under `Mass/` belong to the `MassCore` runtime module; the rest come from the MassGameplay, MassAI and MassCrowd plugins (all Experimental in 5.8).
 
 ---
 
-## Per-Entity Fragments
+## Element base types
 
-| Fragment | Header | Key Fields | Purpose |
-|----------|--------|------------|---------|
-| `FTransformFragment` | `MassCommonFragments.h` | `FTransform Transform` | Entity world transform (location, rotation, scale) |
-| `FMassVelocityFragment` | `MassMovementFragments.h` | `FVector Value` | Linear velocity vector |
-| `FMassForceFragment` | `MassMovementFragments.h` | `FVector Value` | Applied force vector (consumed by velocity processor) |
-| `FAgentRadiusFragment` | `MassCommonFragments.h` | `float Radius` | Agent collision/avoidance radius |
-| `FMassMoveTargetFragment` | `MassNavigationFragments.h` | `FVector Center`, `float DesiredSpeed`, `FMassMovementAction Action` | Navigation move target with speed and action |
-| `FMassRepresentationFragment` | `MassRepresentationFragments.h` | `EMassRepresentationType CurrentRepresentation`, `EMassRepresentationType PrevRepresentation` | Current and previous visual representation state |
-| `FMassRepresentationLODFragment` | `MassRepresentationFragments.h` | `TEnumAsByte<EMassLOD::Type> LOD`, `TEnumAsByte<EMassLOD::Type> PrevLOD`, `EMassVisibility Visibility`, `float LODSignificance` | Per-entity LOD level and visibility state |
+All declared in `Mass/EntityElementTypes.h` (module `MassCore`), all deriving from `FMassElement`. `MassEntityTypes.h` pulls them in transitively.
+
+| Base | Kind | Notes |
+|---|---|---|
+| `FMassFragment` | Per-entity data | Stored contiguously per chunk |
+| `FMassSparseFragment` | Per-entity data | Lives outside the archetype; add/remove causes no entity move |
+| `FMassTag` | Marker | Must declare no data members |
+| `FMassSparseTag` | Marker | Add/remove without an archetype change |
+| `FMassChunkFragment` | Per-chunk data | One instance per memory chunk |
+| `FMassSharedFragment` | Shared mutable | One instance shared by referencing entities |
+| `FMassConstSharedFragment` | Shared immutable | Configuration set at template build time |
+| `FMassRelation` | Relation type | Derives from `FMassTag`; declared in `MassEntityRelations.h` (module `MassEntity`) |
+
+---
+
+## Per-entity fragments
+
+| Fragment | Header | Module | Key fields |
+|---|---|---|---|
+| `FTransformFragment` | `Mass/EntityFragments.h` | `MassCore` | `FTransform Transform` (protected) |
+| `FAgentRadiusFragment` | `MassCommonFragments.h` | `MassCommon` | `float Radius = 40.f` |
+| `FAgentHeightFragment` | `MassCommonFragments.h` | `MassCommon` | `float Height = 180.f` |
+| `FMassVelocityFragment` | `MassMovementFragments.h` | `MassMovement` | `FVector Value` |
+| `FMassForceFragment` | `MassMovementFragments.h` | `MassMovement` | `FVector Value` |
+| `FMassMoveTargetFragment` | `MassNavigationFragments.h` | `MassNavigation` (MassAI) | `FVector Center`, `FVector Forward`, `float DistanceToGoal`, `float SlackRadius`, `FMassInt16Real DesiredSpeed`, `EMassMovementAction IntentAtGoal` |
+| `FMassRepresentationFragment` | `MassRepresentationFragments.h` | `MassRepresentation` | `EMassRepresentationType CurrentRepresentation`, `PrevRepresentation` |
+| `FMassRepresentationLODFragment` | `MassRepresentationFragments.h` | `MassRepresentation` | `TEnumAsByte<EMassLOD::Type> LOD`, `PrevLOD`, `EMassVisibility Visibility`, `float LODSignificance` |
+| `FMassCrowdLaneTrackingFragment` | `MassCrowdFragments.h` | `MassCrowd` | `FZoneGraphLaneHandle TrackedLaneHandle` |
+| `FMassChildOfFragment` | `Relations/MassChildOf.h` | `MassEntity` | `FMassEntityHandle Parent` |
 
 ### FTransformFragment
 
-The most common fragment. Stores a full `FTransform` with location, rotation, and scale. Access with `GetTransform()` (const) and `GetMutableTransform()` (mutable).
+`Transform` is protected. Use `GetTransform()` (const ref), `GetMutableTransform()` (mutable ref) and `SetTransform(const FTransform&)`. A converting constructor from `FTransform` exists, which is what makes `Builder.Add<FTransformFragment>(SpawnTransform)` work.
+
+This type moved into `MassCore`. `MassCommonFragments.h` only `#include`s it; `MassCommon` lists `MassCore` as a public dependency (`MassCommon.Build.cs:19`) so it resolves transitively, but include `Mass/EntityFragments.h` and add `MassCore` explicitly.
 
 ### FMassVelocityFragment / FMassForceFragment
 
-Both store an `FVector Value` field. Forces are consumed by the velocity integration processor each frame. Velocity is then consumed by movement processors that update `FTransformFragment`.
+Both hold a single `FVector Value`. Forces are integrated into velocity, velocity into `FTransformFragment`, by the processors in `Movement/MassMovementProcessors.h` (`UMassApplyMovementProcessor`).
 
 ### FMassMoveTargetFragment
 
-Used by navigation and crowd systems. Contains the desired move target position, speed, and a movement action enum indicating the current navigation intent (move, stand, animate).
+`DesiredSpeed` is an `FMassInt16Real`, not a float. The action is private: read it with `GetCurrentAction()` / `GetPreviousAction()` and change it with `CreateNewAction(EMassMovementAction, const UWorld&)`. `EMassMovementAction` (`MassNavigationTypes.h`) is `Stand`, `Move`, `Animate`.
 
 ---
 
-## Chunk Fragments
+## Chunk fragments
 
-Chunk fragments (`FMassChunkFragment`) store per-memory-chunk data shared across all entities in a chunk. `FMassRepresentationLODFragment` is NOT a chunk fragment — it is a per-entity `FMassFragment` (see Per-Entity Fragments above). Use `AddChunkFragment<T>()` in `BuildContext` only for types that inherit `FMassChunkFragment`.
+A chunk fragment derives from `FMassChunkFragment` and holds one instance per memory chunk. Add it to a template with `BuildContext.AddChunkFragment<T>()`, bind it with `Query.AddChunkRequirement<T>(Access, Presence)`, and read it with `Context.GetChunkFragment<T>()`. Chunk fragments are the only per-entity-adjacent data a `SetChunkFilter` predicate may read.
 
----
-
-## Shared Fragments (Per-Archetype)
-
-| Fragment | Type | Header | Key Fields |
-|----------|------|--------|------------|
-| `FMassRepresentationParameters` | Const Shared | `MassRepresentationFragments.h` | `EMassRepresentationType LODRepresentation[EMassLOD::Max]`, `float NotVisibleUpdateRate`, `bKeepLowResActors` |
-| `FMassMovementParameters` | Const Shared | `MassMovementFragments.h` | `float MaxSpeed`, `float MaxAcceleration`, `float DefaultDesiredSpeed` |
-
-### FMassRepresentationParameters
-
-Immutable const shared fragment configuring visual representation for an archetype. Defines `LODRepresentation[EMassLOD::Max]` which maps each LOD level to an `EMassRepresentationType` (e.g. `StaticMeshInstance`, `HighResSpawnedActor`, `LowResSpawnedActor`, or `None`). Also controls update rate for non-visible entities and actor retention behavior. Set via `UMassVisualizationTrait`.
-
-### FMassMovementParameters
-
-Immutable const shared fragment defining movement constraints for an archetype. Contains `MaxSpeed`, `MaxAcceleration`, `DefaultDesiredSpeed`, and movement style configurations. No `MaxDeceleration` field exists — deceleration is handled implicitly via force/velocity integration. Used by movement processors to generate desired velocities.
+`FMassRepresentationLODFragment` is **not** a chunk fragment — it is a per-entity `FMassFragment`.
 
 ---
 
-## Trait Classes
+## Shared and const shared fragments
 
-Traits are `UMassEntityTraitBase` subclasses that add fragments to entity templates during `BuildTemplate()`.
+| Fragment | Kind | Header | Module | Key fields |
+|---|---|---|---|---|
+| `FMassMovementParameters` | Const shared | `MassMovementFragments.h` | `MassMovement` | `float MaxSpeed = 200.f`, `float MaxAcceleration = 250.f`, `float DefaultDesiredSpeed = 140.f`, `float DefaultDesiredSpeedVariance = 0.1f` |
+| `FMassRepresentationParameters` | Const shared | `MassRepresentationFragments.h` | `MassRepresentation` | `EMassRepresentationType LODRepresentation[EMassLOD::Max]`, `float NotVisibleUpdateRate = 0.5f`, `uint8 bKeepLowResActors : 1` |
+| `FMassStateTreeSharedFragment` | Const shared | `MassStateTreeFragments.h` | `MassAIBehavior` (MassAI) | `TObjectPtr<UStateTree> StateTree` |
 
-| Trait | Header | Fragments Added | Purpose |
-|-------|--------|----------------|---------|
-| `UMassAssortedFragmentsTrait` | `MassEntityConfigAsset.h` | User-specified list | Add arbitrary fragments/tags via editor list |
-| `UMassVisualizationTrait` | `MassVisualizationTrait.h` | `FMassRepresentationFragment`, `FMassRepresentationParameters` | ISM visualization setup with LOD |
-| `UMassReplicationTrait` | `MassReplicationTrait.h` | Replication fragments | Network replication support |
+`FMassMovementParameters` has no deceleration field; deceleration falls out of the force/velocity integration.
 
-### UMassAssortedFragmentsTrait
+`FMassRepresentationParameters::LODRepresentation` maps each `EMassLOD::Type` slot to an `EMassRepresentationType`, which is how an entity is promoted to an actor up close and demoted back to an ISM instance at distance.
 
-The simplest trait. Exposes an editable list of fragment `UScriptStruct` types in the editor. Each listed type is added to the entity archetype. Use for adding custom fragments without writing a custom trait class.
-
-### UMassVisualizationTrait
-
-Configures ISM-based rendering. Adds both the per-entity `FMassRepresentationFragment` and the const shared `FMassRepresentationParameters`. Configure mesh assets via `StaticMeshInstanceDesc` and LOD distances via `LODParams` directly on the trait in the entity config editor. Note: this class is soft-deprecated; prefer `UMassMovableVisualizationTrait` or `UMassStationaryVisualizationTrait` for new work.
-
-### UMassReplicationTrait
-
-Enables Mass entity replication for multiplayer. Adds the necessary replication fragments and registers entities with the Mass replication system. Requires the MassReplication plugin module.
+Bind shared data with `Query.AddSharedRequirement<T>(Access, Presence)` or `Query.AddConstSharedRequirement<T>(Presence)`; read it with `Context.GetMutableSharedFragment<T>()` / `Context.GetConstSharedFragment<T>()`. `Presence::Any` is rejected for both.
 
 ---
 
-## MassCrowd Fragments
+## Traits
 
-| Type | Kind | Purpose |
-|------|------|---------|
-| `FMassCrowdTag` | Tag | Marks entity as part of the crowd system |
-| `FMassCrowdLaneTrackingFragment` | Fragment | Tracks current ZoneGraph lane and position along it |
+Traits derive from `UMassEntityTraitBase` (`MassEntityTraitBase.h`, module `MassSpawner`) and implement `BuildTemplate(FMassEntityTemplateBuildContext&, const UWorld&) const`. Optional validation is `ValidateTemplate(const FMassEntityTemplateBuildContext&, const UWorld&, FAdditionalTraitRequirements&) const` — three parameters.
 
-### MassCrowd Integration
+| Trait | Header | Module | Purpose |
+|---|---|---|---|
+| `UMassAssortedFragmentsTrait` | `MassAssortedFragmentsTrait.h` | `MassSpawner` | Editor-authored `Fragments` and `Tags` arrays of `FInstancedStruct` |
+| `UMassMovableVisualizationTrait` | `MassMovableVisualizationTrait.h` | `MassRepresentation` | ISM/actor visualization for moving agents |
+| `UMassStationaryVisualizationTrait` | `MassStationaryVisualizationTrait.h` | `MassRepresentation` | Visualization for agents that never move |
+| `UMassDistanceVisualizationTrait` | `MassDistanceVisualizationTrait.h` | `MassRepresentation` | Distance-driven representation switching |
+| `UMassReplicationTrait` | `MassReplicationTrait.h` | `MassReplication` | Registers the entity with Mass replication |
+| `UMassStateTreeTrait` | `MassStateTreeTrait.h` | `MassAIBehavior` (MassAI) | Attaches a State Tree asset to the entity |
+| `UMassCrowdMemberTrait` | `MassCrowdMemberTrait.h` | `MassCrowd` | Adds `FMassCrowdTag` and lane tracking |
+| `UMassSmartObjectUserTrait` | `MassSmartObjectUserTrait.h` | `MassSmartObjects` | Lets the entity claim Smart Objects |
 
-Entities tagged with `FMassCrowdTag` are processed by `UMassCrowdSubsystem`. The lane tracking fragment maintains the entity's current lane ID, distance along the lane, and lane-relative offset.
+`UMassVisualizationTrait` is soft-deprecated (its display name is "DEPRECATED Visualization"). It is still the base class of the movable and stationary traits and still owns the shared properties `StaticMeshInstanceDesc` (`FStaticMeshInstanceVisualizationDesc`), `SkinnedMeshInstanceDesc`, `HighResTemplateActor`, `LowResTemplateActor`, `Params` (`FMassRepresentationParameters`) and `LODParams` (`FMassVisualizationLODParameters`). Author new content against `UMassMovableVisualizationTrait` or `UMassStationaryVisualizationTrait`.
 
-ZoneGraph lanes define navigation paths as connected directed graphs. The crowd system handles:
-- Lane assignment and transitions
-- Density-based speed modulation
-- Waiting slot allocation at intersections
-- Avoidance between crowd agents
-
-`UMassCrowdSubsystem` is thread-safe (`TMassExternalSubsystemTraits<UMassCrowdSubsystem>::GameThreadOnly = false`) and can be accessed from parallel processors via `AddSubsystemRequirement`.
+Assign traits to a `UMassEntityConfigAsset` (a `UDataAsset` in `MassEntityConfigAsset.h`); `AMassSpawner` lists config assets in `EntityTypes` and spawns `Count` entities.
 
 ---
 
-## EMassRepresentationType Values
+## Enums
 
-| Value | Description |
-|-------|-------------|
-| `StaticMeshInstance` | Instanced static mesh (most efficient, distant) |
-| `HighResSpawnedActor` | Full actor spawned for high LOD (close-up, full gameplay) |
-| `LowResSpawnedActor` | Reduced actor for low-res LOD |
-| `None` | No visual representation |
+### EMassRepresentationType (`MassRepresentationTypes.h`, `MassRepresentation`)
 
-## EMassLOD Values
+| Value | Use |
+|---|---|
+| `HighResSpawnedActor` | Full actor, closest entities |
+| `LowResSpawnedActor` | Cheap actor at medium range |
+| `SkinnedMeshInstance` | Instanced skinned mesh |
+| `StaticMeshInstance` | Instanced static mesh, the bulk of a crowd |
+| `None` | Not rendered |
 
-| Value | Typical Usage |
-|-------|--------------|
-| `High` | Close to camera, actor representation |
-| `Medium` | Mid-range, full ISM detail |
-| `Low` | Far range, simplified ISM |
-| `Off` | Beyond render distance, simulation only |
+`UE::Mass::Representation::IsValidMeshRepresentation()` returns true for the two instanced-mesh values.
 
-LOD transitions are managed by the representation system. Entities promoted to `HighResSpawnedActor` at high LOD significance gain full gameplay capabilities (collision, animation, interaction). When demoted back to `StaticMeshInstance` at lower LODs, the actor is returned to a pool.
+### EMassLOD (`MassLODTypes.h`, `MassLOD`)
+
+`EMassLOD` is a namespaced enum — `namespace EMassLOD { enum Type : int { High, Medium, Low, Off, Max }; }` — so it is stored as `TEnumAsByte<EMassLOD::Type>` and `EMassLOD::Max` doubles as the array size for `LODRepresentation`.
+
+### EMassVisibility (`MassLODTypes.h`, `MassLOD`)
+
+`CanBeSeen`, `CulledByFrustum`, `CulledByDistance`, `Max`.
+
+### EMassObservedOperationFlags (`MassEntityTypes.h`, `MassEntity`)
+
+`None`, `AddElement`, `RemoveElement`, `CreateEntity`, `DestroyEntity`, `Add` (= `AddElement | CreateEntity`), `Remove` (= `RemoveElement | DestroyEntity`), `All`.
+
+### EMassCommandOperationType (`MassCommands.h`, `MassEntity`)
+
+Flush order is by bucket, not enum order (`MassCommandBuffer.cpp:110-119`): `Create`, `Add`, `ChangeComposition`, `Set`, then `Remove` and `Destroy` together; commands left as `None` run last.
+
+---
+
+## Crowd types
+
+| Type | Kind | Header |
+|---|---|---|
+| `FMassCrowdTag` | Tag | `MassCrowdFragments.h` |
+| `FMassCrowdLaneTrackingFragment` | Fragment | `MassCrowdFragments.h` |
+| `FMassCrowdObstacleFragment` | Fragment | `MassCrowdFragments.h` |
+| `UMassCrowdSubsystem` | World subsystem | `MassCrowdSubsystem.h` |
+
+`UMassCrowdSubsystem` derives from `UMassSubsystemBase` and tracks lane occupancy, density and waiting slots over a ZoneGraph. It specialises `TMassExternalSubsystemTraits<UMassCrowdSubsystem>` with `GameThreadOnly = false` and `ThreadSafeWrite = false`, so parallel processors may declare it through `AddSubsystemRequirement`.
+
+---
+
+## Signals
+
+`UMassSignalSubsystem` (`MassSignalSubsystem.h`, module `MassSignals`) wakes processors for specific entities instead of ticking every entity every frame. The signal name comes first:
+
+```cpp
+SignalSubsystem->SignalEntity(FName("MyGame.Damaged"), Entity);
+SignalSubsystem->DelaySignalEntity(FName("MyGame.Respawn"), Entity, 3.f);
+SignalSubsystem->SignalEntityDeferred(Context, FName("MyGame.Damaged"), Entity);
+```
+
+Processors that react to signals derive from `UMassSignalProcessorBase` (`MassSignalProcessorBase.h`), which is also the base of `UMassStateTreeProcessor`.

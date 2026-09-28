@@ -1,145 +1,176 @@
 # Replication Patterns
 
-Common patterns for replicating game state in Unreal Engine multiplayer projects.
-Each pattern includes the header declarations, implementation, and client callback.
+Worked examples for UE 5.8. Each pattern gives the header, the implementation and the client callback. Types are named `AMy*` / `UMy*` / `FMy*` and the module API macro is `MYGAME_API`.
 
 ---
 
-## Pattern 1: Health with OnRep Callback
-
-The most common pattern. Health is authoritative on the server. Clients receive the
-updated value and react via `OnRep_Health` (update HUD, play hurt effects).
+## Pattern 1: Health with an OnRep Callback
 
 ```cpp
-// AMyCharacter.h
-UPROPERTY(ReplicatedUsing = OnRep_Health)
-float Health;
+// MyCharacter.h
+#pragma once
 
-UPROPERTY(ReplicatedUsing = OnRep_MaxHealth)
-float MaxHealth;
+#include "CoreMinimal.h"
+#include "GameFramework/Character.h"
+#include "MyCharacter.generated.h"
 
-UFUNCTION()
-void OnRep_Health(float PreviousHealth);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FMyHealthChanged, float, OldHealth, float, NewHealth);
 
-UFUNCTION()
-void OnRep_MaxHealth(float PreviousMaxHealth);
+UCLASS()
+class MYGAME_API AMyCharacter : public ACharacter
+{
+    GENERATED_BODY()
 
-// Server RPC — clients request damage (usually called by server game logic instead)
-UFUNCTION(Server, Reliable, WithValidation)
-void ServerApplyHealing(float Amount);
+public:
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+    /** Server-side entry point for damage. */
+    void ApplyDamageOnServer(float Damage);
+
+    UPROPERTY(BlueprintAssignable)
+    FMyHealthChanged OnHealthChanged;
+
+protected:
+    UPROPERTY(ReplicatedUsing = OnRep_Health)
+    float Health = 100.f;
+
+    UPROPERTY(Replicated)
+    float MaxHealth = 100.f;
+
+    UFUNCTION()
+    void OnRep_Health(float PreviousHealth);
+
+    void PlayHurtReaction();
+    void HandleDeathOnServer();
+};
 ```
 
 ```cpp
-// AMyCharacter.cpp
+// MyCharacter.cpp
+#include "MyCharacter.h"
 #include "Net/UnrealNetwork.h"
 
-void AMyCharacter::GetLifetimeReplicatedProps(
-    TArray<FLifetimeProperty>& OutLifetimeProps) const
+void AMyCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
     Super::GetLifetimeReplicatedProps(OutLifetimeProps);
     DOREPLIFETIME(AMyCharacter, Health);
     DOREPLIFETIME(AMyCharacter, MaxHealth);
 }
 
-void AMyCharacter::OnRep_Health(float PreviousHealth)
+void AMyCharacter::ApplyDamageOnServer(float Damage)
 {
-    // Called on clients only — update UI and effects
-    OnHealthChanged.Broadcast(PreviousHealth, Health);
-    if (Health < PreviousHealth)
+    if (!HasAuthority())
     {
-        PlayHurtMontage();
+        return;
     }
-}
 
-void AMyCharacter::OnRep_MaxHealth(float PreviousMaxHealth)
-{
-    OnMaxHealthChanged.Broadcast(PreviousMaxHealth, MaxHealth);
-}
-
-// Called by game logic on server only
-void AMyCharacter::ApplyDamage_Authority(float Damage)
-{
-    if (!HasAuthority()) return;
     Health = FMath::Clamp(Health - Damage, 0.f, MaxHealth);
     if (Health <= 0.f)
     {
-        Die_Authority();
+        HandleDeathOnServer();
     }
 }
 
-void AMyCharacter::ServerApplyHealing_Implementation(float Amount)
+void AMyCharacter::OnRep_Health(float PreviousHealth)
 {
-    // Validate amount is positive and actor is alive
-    Health = FMath::Clamp(Health + Amount, 0.f, MaxHealth);
-}
-
-bool AMyCharacter::ServerApplyHealing_Validate(float Amount)
-{
-    return Amount > 0.f && Amount <= 500.f; // reject absurd values
+    // Clients only. Idempotent: relevancy changes re-fire this.
+    OnHealthChanged.Broadcast(PreviousHealth, Health);
+    if (Health < PreviousHealth)
+    {
+        PlayHurtReaction();
+    }
 }
 ```
+
+The server never runs `OnRep_Health`. If the host of a listen server also needs the reaction, call the same helper from `ApplyDamageOnServer`.
 
 ---
 
-## Pattern 2: Team Data (Owner-Only Private + All-Clients Public)
+## Pattern 2: Public State Plus Owner-Only Private State
 
-Split information based on who needs it. Score is public; private currency is owner-only.
+`APlayerState` replicates to every client, so private data needs `COND_OwnerOnly`.
 
 ```cpp
-// AMyPlayerState.h  (PlayerState replicates to all clients)
-UPROPERTY(ReplicatedUsing = OnRep_TeamId)
-int32 TeamId;
+// MyPlayerState.h
+#pragma once
 
-UPROPERTY(Replicated)
-int32 Score;
+#include "CoreMinimal.h"
+#include "GameFramework/PlayerState.h"
+#include "MyPlayerState.generated.h"
 
-UPROPERTY(Replicated)
-int32 Kills;
+UCLASS()
+class MYGAME_API AMyPlayerState : public APlayerState
+{
+    GENERATED_BODY()
 
-// Private to owning player only
-UPROPERTY(ReplicatedUsing = OnRep_Currency)
-int32 Currency;
+public:
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+    int32 GetTeamId() const { return TeamId; }
+
+protected:
+    UPROPERTY(ReplicatedUsing = OnRep_TeamId)
+    int32 TeamId = 0;
+
+    UPROPERTY(Replicated)
+    int32 Kills = 0;
+
+    /** Only the owning client receives this. */
+    UPROPERTY(ReplicatedUsing = OnRep_Currency)
+    int32 Currency = 0;
+
+    UFUNCTION()
+    void OnRep_TeamId();
+
+    UFUNCTION()
+    void OnRep_Currency();
+
+    void RefreshTeamVisuals();
+    void RefreshShopUI();
+};
 ```
 
 ```cpp
-// AMyPlayerState.cpp
-void AMyPlayerState::GetLifetimeReplicatedProps(
-    TArray<FLifetimeProperty>& OutLifetimeProps) const
+// MyPlayerState.cpp
+#include "MyPlayerState.h"
+#include "Net/UnrealNetwork.h"
+
+void AMyPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
     Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
-    DOREPLIFETIME(AMyPlayerState, TeamId);
-    DOREPLIFETIME(AMyPlayerState, Score);
+    DOREPLIFETIME_CONDITION(AMyPlayerState, TeamId, COND_InitialOrOwner);
     DOREPLIFETIME(AMyPlayerState, Kills);
-
-    // Only the owning client receives their own currency
     DOREPLIFETIME_CONDITION(AMyPlayerState, Currency, COND_OwnerOnly);
 }
 
 void AMyPlayerState::OnRep_TeamId()
 {
-    // Update team color, nameplate, etc. on all clients
-    OnTeamChanged.Broadcast(TeamId);
+    RefreshTeamVisuals();
 }
 
 void AMyPlayerState::OnRep_Currency()
 {
-    // Update shop UI — only fires on the owning client
-    OnCurrencyChanged.Broadcast(Currency);
+    RefreshShopUI();
 }
 ```
 
 ---
 
-## Pattern 3: Inventory Using FFastArraySerializer
+## Pattern 3: Inventory with FFastArraySerializer
 
-Efficient replicated inventory — only changed items are sent over the network,
-not the entire array.
+Only changed entries go over the wire instead of the whole array.
 
 ```cpp
-// InventoryTypes.h
+// MyInventoryTypes.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Net/Serialization/FastArraySerializer.h"
+#include "MyInventoryTypes.generated.h"
+
 USTRUCT(BlueprintType)
-struct FInventoryItem : public FFastArraySerializerItem
+struct MYGAME_API FMyInventoryItem : public FFastArraySerializerItem
 {
     GENERATED_BODY()
 
@@ -149,213 +180,312 @@ struct FInventoryItem : public FFastArraySerializerItem
     UPROPERTY()
     int32 Quantity = 0;
 
-    UPROPERTY()
-    float Durability = 1.0f;
-
-    void PreReplicatedRemove(const struct FInventoryList& InArraySerializer);
-    void PostReplicatedAdd(const struct FInventoryList& InArraySerializer);
-    void PostReplicatedChange(const struct FInventoryList& InArraySerializer);
+    void PreReplicatedRemove(const struct FMyInventoryList& InArraySerializer);
+    void PostReplicatedAdd(const struct FMyInventoryList& InArraySerializer);
+    void PostReplicatedChange(const struct FMyInventoryList& InArraySerializer);
 };
 
-USTRUCT()
-struct FInventoryList : public FFastArraySerializer
+USTRUCT(BlueprintType)
+struct MYGAME_API FMyInventoryList : public FFastArraySerializer
 {
     GENERATED_BODY()
 
     UPROPERTY()
-    TArray<FInventoryItem> Items;
+    TArray<FMyInventoryItem> Items;
 
     bool NetDeltaSerialize(FNetDeltaSerializeInfo& DeltaParms)
     {
-        return FFastArraySerializer::FastArrayDeltaSerialize<FInventoryItem, FInventoryList>(
-            Items, DeltaParms, *this);
+        return FFastArraySerializer::FastArrayDeltaSerialize<FMyInventoryItem, FMyInventoryList>(Items, DeltaParms, *this);
     }
+
+    /** Optional array-level hook, called once after each received update. */
+    void PostReplicatedReceive(const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters);
 };
 
 template<>
-struct TStructOpsTypeTraits<FInventoryList>
-    : public TStructOpsTypeTraitsBase2<FInventoryList>
+struct TStructOpsTypeTraits<FMyInventoryList> : public TStructOpsTypeTraitsBase2<FMyInventoryList>
 {
     enum { WithNetDeltaSerializer = true };
 };
 ```
 
 ```cpp
-// UMyInventoryComponent.h
-UCLASS()
-class UMyInventoryComponent : public UActorComponent
+// MyInventoryComponent.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Components/ActorComponent.h"
+#include "MyInventoryTypes.h"
+#include "MyInventoryComponent.generated.h"
+
+UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
+class MYGAME_API UMyInventoryComponent : public UActorComponent
 {
     GENERATED_BODY()
 
 public:
-    virtual void GetLifetimeReplicatedProps(
-        TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+    UMyInventoryComponent();
 
-    // Only the owning player sees their own inventory
-    UPROPERTY(ReplicatedUsing = OnRep_Inventory)
-    FInventoryList Inventory;
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
-    UFUNCTION()
-    void OnRep_Inventory();
+    void AddItemOnServer(int32 ItemId, int32 Quantity);
+    void RemoveItemOnServer(int32 ItemId);
 
-    // Server-side mutation
-    void AddItem_Authority(int32 ItemId, int32 Quantity);
-    void RemoveItem_Authority(int32 ItemId, int32 Quantity);
+protected:
+    UPROPERTY(Replicated)
+    FMyInventoryList Inventory;
 };
 ```
 
 ```cpp
-// UMyInventoryComponent.cpp
-void UMyInventoryComponent::GetLifetimeReplicatedProps(
-    TArray<FLifetimeProperty>& OutLifetimeProps) const
+// MyInventoryComponent.cpp
+#include "MyInventoryComponent.h"
+#include "Net/UnrealNetwork.h"
+
+UMyInventoryComponent::UMyInventoryComponent()
+{
+    SetIsReplicatedByDefault(true);
+}
+
+void UMyInventoryComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
     Super::GetLifetimeReplicatedProps(OutLifetimeProps);
     DOREPLIFETIME_CONDITION(UMyInventoryComponent, Inventory, COND_OwnerOnly);
 }
 
-void UMyInventoryComponent::AddItem_Authority(int32 ItemId, int32 Quantity)
+void UMyInventoryComponent::AddItemOnServer(int32 ItemId, int32 Quantity)
 {
-    if (!GetOwner()->HasAuthority()) return;
+    if (!GetOwner()->HasAuthority())
+    {
+        return;
+    }
 
-    // Find existing stack
-    for (FInventoryItem& Item : Inventory.Items)
+    for (FMyInventoryItem& Item : Inventory.Items)
     {
         if (Item.ItemId == ItemId)
         {
             Item.Quantity += Quantity;
-            Inventory.MarkItemDirty(Item); // tell FastArray this item changed
+            Inventory.MarkItemDirty(Item);
             return;
         }
     }
 
-    // Add new stack
-    FInventoryItem& NewItem = Inventory.Items.AddDefaulted_GetRef();
+    FMyInventoryItem& NewItem = Inventory.Items.AddDefaulted_GetRef();
     NewItem.ItemId = ItemId;
     NewItem.Quantity = Quantity;
     Inventory.MarkItemDirty(NewItem);
 }
 
-// Callbacks on client
-void FInventoryItem::PostReplicatedAdd(const FInventoryList& InArraySerializer)
+void UMyInventoryComponent::RemoveItemOnServer(int32 ItemId)
 {
-    // New item appeared in inventory — update UI
-}
-
-void FInventoryItem::PostReplicatedChange(const FInventoryList& InArraySerializer)
-{
-    // Existing item quantity or durability changed — update slot UI
-}
-
-void FInventoryItem::PreReplicatedRemove(const FInventoryList& InArraySerializer)
-{
-    // Item is about to be removed — clear UI slot
-}
-```
-
----
-
-## Pattern 4: Ability State (InitialOnly + Runtime Flags)
-
-Ability unlocks are set once; cooldowns and charges update dynamically.
-
-```cpp
-// UMyAbilityComponent.h
-// Which abilities are unlocked — sent once at spawn, never changes
-UPROPERTY(Replicated)
-TArray<int32> UnlockedAbilityIds;
-
-// Current cooldown end times per ability slot
-UPROPERTY(ReplicatedUsing = OnRep_Cooldowns)
-TArray<float> CooldownEndTimes;
-
-// Active ability flags bitmask
-UPROPERTY(ReplicatedUsing = OnRep_ActiveFlags)
-uint8 ActiveAbilityFlags;
-
-UFUNCTION()
-void OnRep_Cooldowns();
-
-UFUNCTION()
-void OnRep_ActiveFlags(uint8 PreviousFlags);
-```
-
-```cpp
-// UMyAbilityComponent.cpp
-void UMyAbilityComponent::GetLifetimeReplicatedProps(
-    TArray<FLifetimeProperty>& OutLifetimeProps) const
-{
-    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
-
-    // Unlocked abilities: all clients see which abilities a player has
-    DOREPLIFETIME_CONDITION(UMyAbilityComponent, UnlockedAbilityIds, COND_InitialOnly);
-
-    // Cooldowns: only the owning client needs exact cooldown timers
-    DOREPLIFETIME_CONDITION(UMyAbilityComponent, CooldownEndTimes, COND_OwnerOnly);
-
-    // Active flags: all clients see which abilities are currently active (for animation)
-    DOREPLIFETIME(UMyAbilityComponent, ActiveAbilityFlags);
-}
-
-void UMyAbilityComponent::OnRep_Cooldowns()
-{
-    // Refresh cooldown bar UI for owning player only
-}
-
-void UMyAbilityComponent::OnRep_ActiveFlags(uint8 PreviousFlags)
-{
-    // Determine which bits changed and trigger corresponding animations/effects
-    uint8 ChangedBits = ActiveAbilityFlags ^ PreviousFlags;
-    for (int32 i = 0; i < 8; ++i)
+    if (!GetOwner()->HasAuthority())
     {
-        if (ChangedBits & (1 << i))
-        {
-            bool bNowActive = (ActiveAbilityFlags & (1 << i)) != 0;
-            OnAbilityActivationChanged.Broadcast(i, bNowActive);
-        }
+        return;
+    }
+
+    const int32 Removed = Inventory.Items.RemoveAll(
+        [ItemId](const FMyInventoryItem& Item) { return Item.ItemId == ItemId; });
+
+    if (Removed > 0)
+    {
+        // Mandatory after a removal. MarkItemDirty alone does not cover it.
+        Inventory.MarkArrayDirty();
     }
 }
 ```
 
+```cpp
+// MyInventoryTypes.cpp
+#include "MyInventoryTypes.h"
+
+void FMyInventoryItem::PostReplicatedAdd(const FMyInventoryList& InArraySerializer)
+{
+    // New item arrived on the client.
+}
+
+void FMyInventoryItem::PostReplicatedChange(const FMyInventoryList& InArraySerializer)
+{
+    // Quantity changed on the client.
+}
+
+void FMyInventoryItem::PreReplicatedRemove(const FMyInventoryList& InArraySerializer)
+{
+    // Item is about to disappear on the client.
+}
+
+void FMyInventoryList::PostReplicatedReceive(const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters)
+{
+    // Runs once per received update; Parameters.OldArraySize is the size before it.
+}
+```
+
 ---
 
-## Pattern 5: Replicated Object Subobject (UE 5.1+ API)
+## Pattern 4: Push Model on a Hot Property
 
-A `UObject` subobject with its own replicated properties, registered via the modern API.
+Use when a property is compared every replication tick but changes rarely.
 
 ```cpp
-// UMyQuestData.h
+// MyTurret.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "MyTurret.generated.h"
+
 UCLASS()
-class UMyQuestData : public UObject
+class MYGAME_API AMyTurret : public AActor
 {
     GENERATED_BODY()
 
 public:
-    virtual void GetLifetimeReplicatedProps(
-        TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+    AMyTurret();
 
-    virtual bool IsSupportedForNetworking() const override { return true; }
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
+    void SetTargetIdOnServer(int32 NewTargetId);
+
+protected:
     UPROPERTY(Replicated)
-    int32 QuestId;
-
-    UPROPERTY(Replicated)
-    int32 Progress;
-
-    UPROPERTY(Replicated)
-    bool bCompleted;
+    int32 TargetId = INDEX_NONE;
 };
 ```
 
 ```cpp
-// AMyPlayerController.cpp — register the subobject during BeginPlay on server
+// MyTurret.cpp
+#include "MyTurret.h"
+#include "Net/UnrealNetwork.h"
+#include "Net/Core/PushModel/PushModel.h"
+
+AMyTurret::AMyTurret()
+{
+    bReplicates = true;
+    SetNetUpdateFrequency(5.f);
+    SetMinNetUpdateFrequency(1.f);
+}
+
+void AMyTurret::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+    FDoRepLifetimeParams Params;
+    Params.bIsPushBased = true;
+    DOREPLIFETIME_WITH_PARAMS_FAST(AMyTurret, TargetId, Params);
+}
+
+void AMyTurret::SetTargetIdOnServer(int32 NewTargetId)
+{
+    if (!HasAuthority() || TargetId == NewTargetId)
+    {
+        return;
+    }
+
+    TargetId = NewTargetId;
+    MARK_PROPERTY_DIRTY_FROM_NAME(AMyTurret, TargetId, this);
+}
+```
+
+Every write path to a push-based property must reach a `MARK_PROPERTY_DIRTY_FROM_NAME`. Route writes through one setter so there is a single place to get it right.
+
+---
+
+## Pattern 5: Replicated UObject Subobject
+
+`bReplicateUsingRegisteredSubObjectList` is **false** by default in 5.8. Without the constructor opt-in this pattern replicates nothing.
+
+```cpp
+// MyQuestData.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "UObject/Object.h"
+#include "MyQuestData.generated.h"
+
+UCLASS()
+class MYGAME_API UMyQuestData : public UObject
+{
+    GENERATED_BODY()
+
+public:
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+    virtual bool IsSupportedForNetworking() const override { return true; }
+
+    UPROPERTY(Replicated)
+    int32 QuestId = 0;
+
+    UPROPERTY(Replicated)
+    int32 Progress = 0;
+};
+```
+
+```cpp
+// MyQuestData.cpp
+#include "MyQuestData.h"
+#include "Net/UnrealNetwork.h"
+
+void UMyQuestData::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME(UMyQuestData, QuestId);
+    DOREPLIFETIME(UMyQuestData, Progress);
+}
+```
+
+```cpp
+// MyPlayerController.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/PlayerController.h"
+#include "MyPlayerController.generated.h"
+
+class UMyQuestData;
+
+UCLASS()
+class MYGAME_API AMyPlayerController : public APlayerController
+{
+    GENERATED_BODY()
+
+public:
+    AMyPlayerController();
+
+    virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+protected:
+    UPROPERTY(Replicated)
+    TObjectPtr<UMyQuestData> ActiveQuest;
+
+public:
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+};
+```
+
+```cpp
+// MyPlayerController.cpp
+#include "MyPlayerController.h"
+#include "MyQuestData.h"
+#include "Net/UnrealNetwork.h"
+
+AMyPlayerController::AMyPlayerController()
+{
+    bReplicateUsingRegisteredSubObjectList = true; // required: the engine default is false
+}
+
+void AMyPlayerController::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME_CONDITION(AMyPlayerController, ActiveQuest, COND_OwnerOnly);
+}
+
 void AMyPlayerController::BeginPlay()
 {
     Super::BeginPlay();
+
     if (HasAuthority())
     {
         ActiveQuest = NewObject<UMyQuestData>(this);
         ActiveQuest->QuestId = 42;
-        // Register with COND_OwnerOnly so only this player's client receives it
         AddReplicatedSubObject(ActiveQuest, COND_OwnerOnly);
     }
 }
@@ -364,163 +494,253 @@ void AMyPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     if (HasAuthority() && ActiveQuest)
     {
-        RemoveReplicatedSubObject(ActiveQuest);
+        DestroyReplicatedSubObjectOnRemotePeers(ActiveQuest);
     }
     Super::EndPlay(EndPlayReason);
 }
 ```
 
+`RemoveReplicatedSubObject` stops updates but leaves the client copy alive. `DestroyReplicatedSubObjectOnRemotePeers` deletes it remotely; `TearOffReplicatedSubObjectOnRemotePeers` leaves an orphaned local copy that the client owns from then on.
+
+### Legacy path
+
+When `bReplicateUsingRegisteredSubObjectList` is false the engine calls the virtual instead — it is not deprecated in 5.8:
+
 ```cpp
-// UMyQuestData.cpp
-void UMyQuestData::GetLifetimeReplicatedProps(
-    TArray<FLifetimeProperty>& OutLifetimeProps) const
+bool AMyLegacyActor::ReplicateSubobjects(UActorChannel* Channel, FOutBunch* Bunch, FReplicationFlags* RepFlags)
 {
-    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
-    DOREPLIFETIME(UMyQuestData, QuestId);
-    DOREPLIFETIME(UMyQuestData, Progress);
-    DOREPLIFETIME(UMyQuestData, bCompleted);
+    bool bWroteSomething = Super::ReplicateSubobjects(Channel, Bunch, RepFlags);
+    if (ActiveQuest)
+    {
+        bWroteSomething |= Channel->ReplicateSubobject(ActiveQuest, *Bunch, *RepFlags);
+    }
+    return bWroteSomething;
 }
+```
+
+Declared in the header as:
+
+```cpp
+virtual bool ReplicateSubobjects(class UActorChannel* Channel, class FOutBunch* Bunch, FReplicationFlags* RepFlags) override;
 ```
 
 ---
 
-## Pattern 6: Replicated Actor Movement (FRepMovement)
-
-For actors that move but do not use `UCharacterMovementComponent`, replicate movement
-via `bReplicateMovement` and the built-in `FRepMovement` struct.
+## Pattern 6: Replicated Movement Without CMC
 
 ```cpp
-// AMyVehicle.h
-AMyVehicle()
-{
-    bReplicates = true;
-    SetReplicateMovement(true); // enables FRepMovement replication via OnRep_ReplicatedMovement
-    SetNetUpdateFrequency(50.f);
-    NetPriority = 2.5f;
-}
+// MyVehicle.h
+#pragma once
 
-// Override to apply custom interpolation when movement data arrives on simulated proxies
-virtual void OnRep_ReplicatedMovement() override;
+#include "CoreMinimal.h"
+#include "GameFramework/Pawn.h"
+#include "MyVehicle.generated.h"
+
+UCLASS()
+class MYGAME_API AMyVehicle : public APawn
+{
+    GENERATED_BODY()
+
+public:
+    AMyVehicle();
+
+    virtual void OnRep_ReplicatedMovement() override;
+
+protected:
+    void SyncWheelPositions();
+};
 ```
 
 ```cpp
-// AMyVehicle.cpp
+// MyVehicle.cpp
+#include "MyVehicle.h"
+
+AMyVehicle::AMyVehicle()
+{
+    bReplicates = true;
+    SetReplicateMovement(true);
+    SetNetUpdateFrequency(50.f);
+    NetPriority = 2.5f;
+    SetPhysicsReplicationMode(EPhysicsReplicationMode::PredictiveInterpolation);
+}
+
 void AMyVehicle::OnRep_ReplicatedMovement()
 {
-    Super::OnRep_ReplicatedMovement(); // applies FRepMovement to root component
-
-    // Additional logic: apply physics state, snap wheels, etc.
+    Super::OnRep_ReplicatedMovement(); // applies FRepMovement to the root component
     SyncWheelPositions();
 }
 ```
 
-For physics-simulated actors, set `bRepPhysics = true` on the `FRepMovement` to
-include linear and angular velocity, allowing clients to simulate physics correctly.
+`FRepMovement` lives in `Engine/Classes/Engine/ReplicatedState.h`. When the root component simulates physics the engine sets `bRepPhysics` on it and includes linear and angular velocity. Characters using `UCharacterMovementComponent` must keep movement replication on (the `APawn` default, `Pawn.cpp:89`): simulated proxies are positioned from `ReplicatedMovement` via `ACharacter::PostNetReceiveLocationAndRotation` (`Character.cpp:2004`) and CMC smoothing, while the autonomous proxy uses CMC's own move RPCs.
 
 ---
 
-## Pattern 7: Custom Relevancy Override
-
-Override `IsNetRelevantFor` to implement game-specific relevancy (team-based, zone-based, etc.).
+## Pattern 7: Custom Relevancy
 
 ```cpp
-// AMyActor.h
-virtual bool IsNetRelevantFor(
-    const AActor* RealViewer,
-    const AActor* ViewTarget,
-    const FVector& SrcLocation) const override;
+// MyTeamActor.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "MyTeamActor.generated.h"
+
+UCLASS()
+class MYGAME_API AMyTeamActor : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    virtual bool IsNetRelevantFor(const AActor* RealViewer, const AActor* ViewTarget, const FVector& SrcLocation) const override;
+
+protected:
+    UPROPERTY(Replicated)
+    int32 TeamId = 0;
+};
 ```
 
 ```cpp
-// AMyActor.cpp — only replicate to players on the same team
-bool AMyActor::IsNetRelevantFor(
-    const AActor* RealViewer,
-    const AActor* ViewTarget,
-    const FVector& SrcLocation) const
-{
-    // Always relevant to owner
-    if (RealViewer == GetOwner()) return true;
+// MyTeamActor.cpp
+#include "MyTeamActor.h"
+#include "MyPlayerState.h"
+#include "GameFramework/PlayerController.h"
+#include "Net/UnrealNetwork.h"
 
-    // Check team
-    const AMyPlayerController* PC = Cast<AMyPlayerController>(RealViewer);
-    if (PC && PC->GetTeamId() == TeamId)
+// A UPROPERTY(Replicated) member makes UHT declare this override; it must be defined or linking fails.
+void AMyTeamActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME(AMyTeamActor, TeamId);
+}
+
+bool AMyTeamActor::IsNetRelevantFor(const AActor* RealViewer, const AActor* ViewTarget, const FVector& SrcLocation) const
+{
+    if (RealViewer == GetOwner())
     {
-        // Also respect distance — call default distance check
-        return Super::IsNetRelevantFor(RealViewer, ViewTarget, SrcLocation);
+        return true;
+    }
+
+    if (const APlayerController* PC = Cast<APlayerController>(RealViewer))
+    {
+        if (const AMyPlayerState* PS = PC->GetPlayerState<AMyPlayerState>())
+        {
+            if (PS->GetTeamId() == TeamId)
+            {
+                return Super::IsNetRelevantFor(RealViewer, ViewTarget, SrcLocation);
+            }
+        }
     }
 
     return false;
 }
 ```
 
+`IsNetRelevantFor` runs per connection per replication tick. Keep it branch-cheap; for large player counts move the policy into a replication graph node instead (see the Replication Graph section of the main skill file).
+
 ---
 
 ## Pattern 8: Dormancy for Rarely-Updated Actors
 
-Actors like pickups and map objectives update infrequently. Use dormancy to skip
-replication checks when nothing changes.
-
 ```cpp
-// AMyPickup.h
-AMyPickup()
-{
-    bReplicates = true;
-    NetDormancy = DORM_DormantAll; // start dormant
-    SetNetUpdateFrequency(1.f);
-}
+// MyPickup.h
+#pragma once
 
-void PickupCollected(ACharacter* Collector);
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "MyPickup.generated.h"
+
+UCLASS()
+class MYGAME_API AMyPickup : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    AMyPickup();
+
+    void CollectOnServer();
+
+protected:
+    UPROPERTY(ReplicatedUsing = OnRep_PickedUp)
+    bool bPickedUp = false;
+
+    UPROPERTY(EditDefaultsOnly, Category = "Pickup")
+    float RespawnTime = 30.f;
+
+    FTimerHandle RespawnTimer;
+
+    UFUNCTION()
+    void OnRep_PickedUp();
+
+    void RespawnOnServer();
+
+public:
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+};
 ```
 
 ```cpp
-// AMyPickup.cpp
-void AMyPickup::PickupCollected(ACharacter* Collector)
+// MyPickup.cpp
+#include "MyPickup.h"
+#include "Net/UnrealNetwork.h"
+#include "TimerManager.h"
+#include "Engine/World.h"
+
+AMyPickup::AMyPickup()
 {
-    if (!HasAuthority()) return;
+    bReplicates = true;
+    NetDormancy = DORM_Initial;   // map-placed pickups start dormant
+    SetNetUpdateFrequency(1.f);
+}
+
+void AMyPickup::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME(AMyPickup, bPickedUp);
+}
+
+void AMyPickup::CollectOnServer()
+{
+    if (!HasAuthority() || bPickedUp)
+    {
+        return;
+    }
 
     bPickedUp = true;
     SetActorHiddenInGame(true);
     SetActorEnableCollision(false);
+    FlushNetDormancy();   // one update, then dormant again
 
-    // Wake up for one replication update to push bPickedUp to clients, then re-dormant
-    FlushNetDormancy();
-
-    // Schedule respawn
-    GetWorldTimerManager().SetTimer(
-        RespawnTimer, this, &AMyPickup::Respawn_Authority, RespawnTime, false);
+    GetWorldTimerManager().SetTimer(RespawnTimer, this, &AMyPickup::RespawnOnServer, RespawnTime, false);
 }
 
-void AMyPickup::Respawn_Authority()
+void AMyPickup::RespawnOnServer()
 {
     bPickedUp = false;
     SetActorHiddenInGame(false);
     SetActorEnableCollision(true);
-    FlushNetDormancy(); // push respawn state, then return to dormant
+    FlushNetDormancy();
+}
+
+void AMyPickup::OnRep_PickedUp()
+{
+    SetActorHiddenInGame(bPickedUp);
+    SetActorEnableCollision(!bPickedUp);
 }
 ```
 
+`FlushNetDormancy()` sends one update and returns the actor to its dormancy state. The flush is diffed against the state kept at dormancy time, but a pickup that leaves and re-enters relevancy is re-sent in full, so `OnRep_PickedUp` must tolerate being called again.
+
 ---
 
-## Bandwidth Estimation Guide
+## Bandwidth Reference
 
-| Data Type                       | Approximate Bits per Update |
-|---------------------------------|-----------------------------|
-| `bool` (replicated)             | 1 bit + overhead (~8 bits)  |
-| `uint8`                         | 8 bits                      |
-| `int32`                         | 32 bits                     |
-| `float`                         | 32 bits                     |
-| `FVector` (full precision)      | 96 bits                     |
-| `FVector_NetQuantize`           | ~30-48 bits                 |
-| `FVector_NetQuantize10`         | ~30-48 bits (1/10 cm)       |
-| `FRotator` (full)               | 96 bits                     |
-| `FRotator` compressed           | ~24 bits                    |
-| `FRepMovement`                  | ~100-200 bits               |
-| RPC call overhead               | ~80-120 bits + params       |
+`FVector_NetQuantize` variants are declared in `Engine/Classes/Engine/NetSerialization.h`:
 
-Use `FVector_NetQuantize` variants for world positions and directions to halve
-bandwidth compared to raw `FVector`. The precision tiers are:
+| Type | Precision | Bits per component |
+|---|---|---|
+| `FVector_NetQuantize` | 0 decimal places (1 cm) | up to 20 |
+| `FVector_NetQuantize10` | 1 decimal place | up to 24 |
+| `FVector_NetQuantize100` | 2 decimal places | up to 30 |
+| `FVector_NetQuantizeNormal` | unit vector, range -1..+1 | 16 |
 
-- `FVector_NetQuantize` — 1 cm precision
-- `FVector_NetQuantize10` — 0.1 cm precision
-- `FVector_NetQuantize100` — 0.01 cm precision
-- `FVector_NetQuantizeNormal` — unit vector, ~16 bits
+Cheapest wins, in order: do not replicate it at all (derive it client-side) → replicate a quantized or packed form → replicate the raw type. Pack booleans into a bitmask before replicating eight separate `bool` properties, and prefer `uint8`/`int16` ids over `FString` names.

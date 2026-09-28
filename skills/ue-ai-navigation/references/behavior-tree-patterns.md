@@ -1,230 +1,415 @@
 # Behavior Tree Patterns
 
-Common, reusable Behavior Tree structures for UE AI. Each pattern shows the tree topology, required Blackboard keys, and key C++ touchpoints from the AIModule source.
+Reusable Behavior Tree structures and the C++ that backs them, for UE 5.8 (`AIModule`). Every class, virtual and macro below exists in `Engine/Source/Runtime/AIModule/Classes/BehaviorTree`.
 
 ---
 
 ## Blackboard Keys (Common Set)
 
-Define these in your `UBlackboardData` asset as a baseline. Extend per-character:
+Define these in your `UBlackboardData` asset as a baseline and extend per character:
 
 | Key Name | Type | Description |
-|----------|------|-------------|
+|---|---|---|
 | `TargetActor` | Object (AActor) | Current enemy/target |
 | `LastKnownLocation` | Vector | Last confirmed target location |
 | `PatrolLocation` | Vector | Current patrol waypoint |
 | `HomeLocation` | Vector | Spawn/home position |
 | `InvestigateLocation` | Vector | Sound/sight disturbance location |
 | `CoverLocation` | Vector | EQS-found cover position |
-| `IsAlerted` | Bool | Has AI been alerted |
+| `IsAlerted` | Bool | Has the AI been alerted |
 | `IsInCombat` | Bool | Actively fighting |
-| `AttackCooldown` | Bool | Tag cooldown sentinel (used with BTDecorator_TagCooldown) |
-| `StateFloat` | Float | Generic float (health %, threat score, etc.) |
+| `PatrolIndex` | Int | Index into the patrol spline |
+| `PatrolWaitTime` | Float | Seconds to wait at the current waypoint |
+
+Nodes should reach these through a `FBlackboardKeySelector` `UPROPERTY`, never a hard-coded `FName`.
+
+---
+
+## Custom task with node memory (full source)
+
+The attack task referenced in the skill body, header and `.cpp`. Per-AI state lives in `FMyAttackTaskMemory`, not in node members.
+
+```cpp
+// MyBTTask_Attack.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "BehaviorTree/BTTaskNode.h"
+#include "BehaviorTree/BehaviorTreeTypes.h"
+#include "MyBTTask_Attack.generated.h"
+
+struct FMyAttackTaskMemory
+{
+    float ElapsedTime = 0.f;
+    TWeakObjectPtr<AActor> CachedTarget;
+};
+
+UCLASS()
+class MYGAME_API UMyBTTask_Attack : public UBTTaskNode
+{
+    GENERATED_BODY()
+
+public:
+    UMyBTTask_Attack();
+
+    UPROPERTY(EditAnywhere, Category = "Attack")
+    FBlackboardKeySelector TargetKey;
+
+    UPROPERTY(EditAnywhere, Category = "Attack", meta = (ClampMin = "0.0"))
+    float AttackDuration = 1.5f;
+
+protected:
+    virtual EBTNodeResult::Type ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;
+    virtual void TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds) override;
+    virtual EBTNodeResult::Type AbortTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;
+    virtual uint16 GetInstanceMemorySize() const override { return sizeof(FMyAttackTaskMemory); }
+};
+```
+
+```cpp
+// MyBTTask_Attack.cpp
+#include "MyBTTask_Attack.h"
+
+#include "AIController.h"
+#include "BehaviorTree/BlackboardComponent.h"
+
+UMyBTTask_Attack::UMyBTTask_Attack()
+{
+    NodeName = TEXT("Attack");
+    INIT_TASK_NODE_NOTIFY_FLAGS();
+}
+
+EBTNodeResult::Type UMyBTTask_Attack::ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
+{
+    UBlackboardComponent* Blackboard = OwnerComp.GetBlackboardComponent();
+    AActor* Target = Blackboard ? Cast<AActor>(Blackboard->GetValueAsObject(TargetKey.SelectedKeyName)) : nullptr;
+    if (!IsValid(Target))
+    {
+        return EBTNodeResult::Failed;
+    }
+
+    FMyAttackTaskMemory* Memory = CastInstanceNodeMemory<FMyAttackTaskMemory>(NodeMemory);
+    Memory->ElapsedTime = 0.f;
+    Memory->CachedTarget = Target;
+    return EBTNodeResult::InProgress;
+}
+
+void UMyBTTask_Attack::TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
+{
+    FMyAttackTaskMemory* Memory = CastInstanceNodeMemory<FMyAttackTaskMemory>(NodeMemory);
+    Memory->ElapsedTime += DeltaSeconds;
+
+    if (!Memory->CachedTarget.IsValid())
+    {
+        FinishLatentTask(OwnerComp, EBTNodeResult::Failed);
+        return;
+    }
+    if (Memory->ElapsedTime >= AttackDuration)
+    {
+        FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
+    }
+}
+
+EBTNodeResult::Type UMyBTTask_Attack::AbortTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
+{
+    FMyAttackTaskMemory* Memory = CastInstanceNodeMemory<FMyAttackTaskMemory>(NodeMemory);
+    Memory->CachedTarget.Reset();
+    return EBTNodeResult::Aborted;
+}
+```
+
+`CastInstanceNodeMemory<T>()` checks `sizeof(T) <= GetInstanceMemorySize()` and fails the check otherwise. When the memory struct holds non-trivially-destructible members, also override:
+
+```cpp
+virtual void InitializeMemory(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, EBTMemoryInit::Type InitType) const override;
+virtual void CleanupMemory(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, EBTMemoryClear::Type CleanupType) const override;
+```
+
+and implement them with the `UBTNode` helpers, which placement-new and destroy correctly:
+
+```cpp
+void UMyBTTask_Attack::InitializeMemory(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, EBTMemoryInit::Type InitType) const
+{
+    InitializeNodeMemory<FMyAttackTaskMemory>(NodeMemory, InitType);
+}
+
+void UMyBTTask_Attack::CleanupMemory(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, EBTMemoryClear::Type CleanupType) const
+{
+    CleanupNodeMemory<FMyAttackTaskMemory>(NodeMemory, CleanupType);
+}
+```
+
+---
+
+## Custom decorator
+
+```cpp
+// MyBTDecorator_HealthBelow.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "BehaviorTree/BTDecorator.h"
+#include "MyBTDecorator_HealthBelow.generated.h"
+
+UCLASS()
+class MYGAME_API UMyBTDecorator_HealthBelow : public UBTDecorator
+{
+    GENERATED_BODY()
+
+public:
+    UMyBTDecorator_HealthBelow();
+
+    UPROPERTY(EditAnywhere, Category = "Condition", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float HealthThresholdNormalized = 0.3f;
+
+protected:
+    virtual bool CalculateRawConditionValue(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const override;
+};
+
+// MyBTDecorator_HealthBelow.cpp
+#include "MyBTDecorator_HealthBelow.h"
+
+#include "AIController.h"
+#include "MyHealthInterface.h"
+
+UMyBTDecorator_HealthBelow::UMyBTDecorator_HealthBelow()
+{
+    NodeName = TEXT("Health Below");
+    INIT_DECORATOR_NODE_NOTIFY_FLAGS();
+    bAllowAbortLowerPri = true;
+    bAllowAbortChildNodes = true;
+    FlowAbortMode = EBTFlowAbortMode::Both;
+}
+
+bool UMyBTDecorator_HealthBelow::CalculateRawConditionValue(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const
+{
+    const AAIController* Controller = OwnerComp.GetAIOwner();
+    const APawn* Pawn = Controller ? Controller->GetPawn() : nullptr;
+    const IMyHealthInterface* Health = Cast<IMyHealthInterface>(Pawn);
+    return Health && Health->GetNormalizedHealth() < HealthThresholdNormalized;
+}
+```
+
+`CalculateRawConditionValue` is `const` — it must not mutate the blackboard or the node. `bAllowAbortLowerPri` and `bAllowAbortChildNodes` decide which `FlowAbortMode` values the editor details panel offers; both already default to `true` in `UBTDecorator` (`BTDecorator.cpp:14-15`), so setting them here only documents intent (set them `false` to forbid a mode).
+
+Line-of-sight variant: `OwnerComp.GetAIOwner()->LineOfSightTo(Target)` (`AAIController::LineOfSightTo(const AActor* Other, FVector ViewPoint = FVector(ForceInit), bool bAlternateChecks = false) const`).
+
+---
+
+## Custom service
+
+```cpp
+// MyBTService_UpdateTarget.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "BehaviorTree/BTService.h"
+#include "BehaviorTree/BehaviorTreeTypes.h"
+#include "MyBTService_UpdateTarget.generated.h"
+
+UCLASS()
+class MYGAME_API UMyBTService_UpdateTarget : public UBTService
+{
+    GENERATED_BODY()
+
+public:
+    UMyBTService_UpdateTarget();
+
+    UPROPERTY(EditAnywhere, Category = "Target")
+    FBlackboardKeySelector TargetKey;
+
+protected:
+    virtual void TickNode(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds) override;
+};
+
+// MyBTService_UpdateTarget.cpp
+#include "MyBTService_UpdateTarget.h"
+
+#include "AIController.h"
+#include "BehaviorTree/BlackboardComponent.h"
+#include "GameFramework/Pawn.h"
+#include "Perception/AIPerceptionComponent.h"
+
+UMyBTService_UpdateTarget::UMyBTService_UpdateTarget()
+{
+    NodeName = TEXT("Update Target");
+    Interval = 0.5f;
+    RandomDeviation = 0.1f;
+    INIT_SERVICE_NODE_NOTIFY_FLAGS();
+}
+
+void UMyBTService_UpdateTarget::TickNode(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
+{
+    Super::TickNode(OwnerComp, NodeMemory, DeltaSeconds);
+
+    AAIController* Controller = OwnerComp.GetAIOwner();
+    UAIPerceptionComponent* Perception = Controller ? Controller->GetAIPerceptionComponent() : nullptr;
+    UBlackboardComponent* Blackboard = OwnerComp.GetBlackboardComponent();
+    if (!Perception || !Blackboard || !Controller->GetPawn())
+    {
+        return;
+    }
+
+    TArray<AActor*> Hostiles;
+    Perception->GetPerceivedHostileActors(Hostiles);
+
+    const FVector MyLocation = Controller->GetPawn()->GetActorLocation();
+    AActor* Best = nullptr;
+    double BestDistSq = TNumericLimits<double>::Max();
+    for (AActor* Hostile : Hostiles)
+    {
+        const double DistSq = FVector::DistSquared(MyLocation, Hostile->GetActorLocation());
+        if (DistSq < BestDistSq)
+        {
+            BestDistSq = DistSq;
+            Best = Hostile;
+        }
+    }
+    Blackboard->SetValueAsObject(TargetKey.SelectedKeyName, Best);
+}
+```
+
+`UBTService::TickNode` already has an implementation in the base class, so call `Super::TickNode(OwnerComp, NodeMemory, DeltaSeconds)`. Override `OnSearchStart(FBehaviorTreeSearchData& SearchData)` when the service must refresh data at the moment the branch is selected rather than on its interval.
 
 ---
 
 ## Pattern 1: Patrol / Chase / Attack
 
-Classic three-phase NPC AI. The root Selector tries Combat first (highest priority), then Alerted search, then idle patrol.
+The root Selector tries Combat first (highest priority), then the alerted search, then idle patrol.
 
 ```
 Root [Selector]
 ├── [Sequence] "Combat" — BTDecorator_Blackboard(TargetActor, IsSet, AbortBoth)
-│   ├── [Service] UpdateTarget (0.3s interval — re-scores nearest hostile)
-│   ├── BTTask_MoveTo (TargetActor key, AcceptRadius=150)
-│   └── BTTask_RunEQSQuery (AttackPositionQuery → CoverLocation)
-│       └── [Sequence] "Attack Sequence"
-│           ├── BTTask_RotateToFaceBBEntry (TargetActor)
-│           └── MyBTTask_FireWeapon
-│               └── BTDecorator_Cooldown (2.0s, AbortSelf)
+│   ├── [Service] MyBTService_UpdateTarget (0.5 s interval)
+│   ├── BTTask_MoveTo (TargetActor key, AcceptableRadius=150)
+│   └── [Sequence] "Attack Sequence"
+│       ├── BTTask_RotateToFaceBBEntry (TargetActor)
+│       └── MyBTTask_Attack
+│           └── BTDecorator_Cooldown (2.0 s)
 │
 ├── [Sequence] "Investigate" — BTDecorator_Blackboard(InvestigateLocation, IsSet, AbortBoth)
-│   ├── BTTask_MoveTo (InvestigateLocation, AcceptRadius=100)
-│   ├── BTTask_Wait (2.0s)
+│   ├── BTTask_MoveTo (InvestigateLocation, AcceptableRadius=100)
+│   ├── BTTask_Wait (2.0 s)
 │   └── MyBTTask_ClearInvestigateLocation
 │
 └── [Sequence] "Patrol"
-    ├── [Service] PickNextPatrolPoint (5.0s interval, calls EQS or patrol spline)
-    ├── BTTask_MoveTo (PatrolLocation, AcceptRadius=50)
-    └── BTTask_Wait (WaitBlackboardTime key="PatrolWait")
+    ├── MyBTTask_GetNextSplinePoint (writes PatrolLocation + PatrolWaitTime)
+    ├── BTTask_MoveTo (PatrolLocation, AcceptableRadius=50)
+    └── BTTask_WaitBlackboardTime (BlackboardKey=PatrolWaitTime)
 ```
 
-### Perception Wiring
-
-`OnTargetPerceptionUpdated` on the AIController:
+Perception feeds the keys from the controller:
 
 ```cpp
-void AEnemyAIController::OnTargetPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus)
+void AMyAIController::HandleTargetPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus)
 {
-    UBlackboardComponent* BB = GetBlackboardComponent();
-
-    if (Stimulus.WasSuccessfullySensed())
+    UBlackboardComponent* BlackboardComp = GetBlackboardComponent();
+    if (!BlackboardComp)
     {
-        if (Stimulus.Type == UAISense::GetSenseID<UAISense_Sight>())
+        return;
+    }
+
+    if (Stimulus.WasSuccessfullySensed() && Stimulus.Type == UAISense::GetSenseID<UAISense_Sight>())
+    {
+        BlackboardComp->SetValueAsObject(TEXT("TargetActor"), Actor);
+        BlackboardComp->SetValueAsVector(TEXT("LastKnownLocation"), Stimulus.StimulusLocation);
+    }
+    else if (Stimulus.WasSuccessfullySensed() && Stimulus.Type == UAISense::GetSenseID<UAISense_Hearing>())
+    {
+        if (!BlackboardComp->GetValueAsObject(TEXT("TargetActor")))
         {
-            BB->SetValueAsObject(TEXT("TargetActor"), Actor);
-            BB->SetValueAsVector(TEXT("LastKnownLocation"), Stimulus.StimulusLocation);
-        }
-        else if (Stimulus.Type == UAISense::GetSenseID<UAISense_Hearing>())
-        {
-            // Only set investigate location if we don't already have a visual target
-            if (!BB->GetValueAsObject(TEXT("TargetActor")))
-            {
-                BB->SetValueAsVector(TEXT("InvestigateLocation"), Stimulus.StimulusLocation);
-            }
+            BlackboardComp->SetValueAsVector(TEXT("InvestigateLocation"), Stimulus.StimulusLocation);
         }
     }
     else
     {
-        // Lost sight — remember last known location
-        BB->SetValueAsVector(TEXT("LastKnownLocation"), Stimulus.StimulusLocation);
-        // Do NOT clear TargetActor — let the search phase handle it
+        // Lost the target: keep the last known location so the search branch can run.
+        BlackboardComp->SetValueAsVector(TEXT("LastKnownLocation"), Stimulus.StimulusLocation);
     }
 }
 ```
+
+Name the local `BlackboardComp`, not `Blackboard`: `AAIController` has a protected `Blackboard` member (`AIController.h:148`), and a local that shadows it fails the build (C4458, which UE treats as an error).
 
 ---
 
 ## Pattern 2: Combat with Cover and Repositioning
 
-AI actively seeks cover, attacks from cover, repositions when suppressed.
-
 ```
 Root [Selector]
 ├── [Sequence] "Take Cover" — BTDecorator_Blackboard(IsInCombat, IsSet, AbortBoth)
-│   ├── [Service] RunEQSCoverService (1.0s — updates CoverLocation)
-│   ├── BTTask_MoveTo (CoverLocation, AcceptRadius=80)
+│   ├── [Service] BTService_RunEQS (CoverQuery → CoverLocation, 1.0 s)
+│   ├── BTTask_MoveTo (CoverLocation, AcceptableRadius=80)
 │   └── [Selector] "Attack or Wait"
 │       ├── [Sequence] "Peek and Shoot"
 │       │   ├── BTDecorator_Blackboard(TargetActor, IsSet)
 │       │   ├── BTTask_RotateToFaceBBEntry (TargetActor)
-│       │   └── MyBTTask_FireWeapon
-│       │       └── BTDecorator_Cooldown (1.5s)
-│       └── BTTask_Wait (1.0s)  ← suppress-wait when no LoS
+│       │   └── MyBTTask_Attack
+│       │       └── BTDecorator_Cooldown (1.5 s)
+│       └── BTTask_Wait (1.0 s)
 │
 └── [Sequence] "Find Enemy"
-    ├── BTTask_RunEQSQuery (LastKnownLocationSearch)
-    ├── BTTask_MoveTo (PatrolLocation, AcceptRadius=100)
-    └── BTTask_Wait (3.0s)
+    ├── BTTask_RunEQSQuery (LastKnownLocationSearch → PatrolLocation)
+    ├── BTTask_MoveTo (PatrolLocation, AcceptableRadius=100)
+    └── BTTask_Wait (3.0 s)
 ```
 
-### Cover Query Service (C++)
-
-```cpp
-// BTService_FindCover.cpp
-void UBTService_FindCover::TickNode(
-    UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
-{
-    AAIController* Controller = OwnerComp.GetAIOwner();
-    UBlackboardComponent* BB = OwnerComp.GetBlackboardComponent();
-
-    if (!CoverQuery) { return; }
-
-    FEnvQueryRequest Request(CoverQuery, Controller);
-    Request.Execute(EEnvQueryRunMode::RandomBest25Pct,
-        FQueryFinishedSignature::CreateWeakLambda(Controller,
-        [BB](TSharedPtr<FEnvQueryResult> Result)
-        {
-            if (Result.IsValid() && Result->IsSuccessful())
-            {
-                BB->SetValueAsVector(TEXT("CoverLocation"), Result->GetItemAsLocation(0));
-            }
-        }));
-}
-```
+`UBTService_RunEQS` ships with the engine (`BehaviorTree/Services/BTService_RunEQS.h`) — prefer it over a hand-written service that calls `FEnvQueryRequest::Execute` on a timer. If you do write your own, capture nothing raw: use `FQueryFinishedSignature::CreateWeakLambda(Controller, Lambda)` so the callback dies with the controller.
 
 ---
 
-## Pattern 3: Flee (Health Threshold Trigger)
-
-AI retreats when health drops below a threshold, uses EQS to find a safe escape point.
+## Pattern 3: Flee (health threshold trigger)
 
 ```
 Root [Selector]
-├── [Sequence] "Flee" — MyBTDecorator_HealthBelow(30%, AbortBoth)
+├── [Sequence] "Flee" — MyBTDecorator_HealthBelow(0.3, AbortBoth)
 │   ├── BTTask_RunEQSQuery (FleePointQuery → PatrolLocation)
-│   │    ← FleePointQuery: DonutGenerator(self, minR=500, maxR=2000)
-│   │       + Trace test (not visible from TargetActor location)
-│   │       + Pathfinding test (reachable)
-│   ├── BTTask_MoveTo (PatrolLocation, AcceptRadius=100, AllowPartialPath=true)
-│   └── BTTask_Wait (5.0s)  ← catch breath before re-evaluating
+│   │    ← Donut generator around self + Trace test (no LoS from TargetActor)
+│   │      + Pathfinding test (PathExist)
+│   ├── BTTask_MoveTo (PatrolLocation, AcceptableRadius=100)
+│   └── BTTask_Wait (5.0 s)
 │
-└── [Sequence] "Normal Combat" (same as Pattern 1 combat branch)
-```
-
-### Health Threshold Decorator (C++)
-
-```cpp
-// BTDecorator_HealthBelow.h
-UCLASS()
-class UBTDecorator_HealthBelow : public UBTDecorator
-{
-    GENERATED_BODY()
-public:
-    UBTDecorator_HealthBelow() { bAllowAbortLowerPri = true; bAllowAbortChildNodes = true; }
-
-    UPROPERTY(EditAnywhere, Category = "Condition", meta = (ClampMin = 0, ClampMax = 1))
-    float HealthThresholdNormalized = 0.3f;
-
-protected:
-    virtual bool CalculateRawConditionValue(
-        UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const override
-    {
-        APawn* Pawn = OwnerComp.GetAIOwner()->GetPawn();
-        IMyHealthInterface* HealthInterface = Cast<IMyHealthInterface>(Pawn);
-        if (!HealthInterface) { return false; }
-        return HealthInterface->GetNormalizedHealth() < HealthThresholdNormalized;
-    }
-};
+└── [Sequence] "Normal Combat" (the combat branch from Pattern 1)
 ```
 
 ---
 
-## Pattern 4: Investigate Sound / Disturbance
-
-AI pauses current activity, moves to sound source, looks around, then resumes.
+## Pattern 4: Investigate sound / disturbance
 
 ```
 Root [Selector]
 ├── [Sequence] "Investigate" — BTDecorator_Blackboard(InvestigateLocation, IsSet, AbortBoth)
-│   ├── BTTask_MoveTo (InvestigateLocation, AcceptRadius=100)
-│   ├── MyBTTask_LookAround (rotates pawn 360° over 3s)
-│   │   └── BTDecorator_TimeLimit (5.0s) ← abort if takes too long
+│   ├── BTTask_MoveTo (InvestigateLocation, AcceptableRadius=100)
+│   ├── MyBTTask_LookAround
+│   │   └── BTDecorator_TimeLimit (5.0 s)
 │   └── MyBTTask_ClearBBKey (InvestigateLocation)
-│        ← clears BB so decorator deactivates and lower priority resumes
 │
-├── [Sequence] "Combat" (as before)
-│
-└── [Sequence] "Patrol" (as before)
+├── [Sequence] "Combat" (as Pattern 1)
+└── [Sequence] "Patrol" (as Pattern 1)
 ```
 
-### LookAround Task (C++)
+A look-around task rotates the pawn by driving focus, then finishes latently:
 
 ```cpp
-// BTTask_LookAround.cpp
-EBTNodeResult::Type UBTTask_LookAround::ExecuteTask(
-    UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
+void UMyBTTask_LookAround::TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
 {
-    auto* Mem = CastInstanceNodeMemory<FBTLookAroundMemory>(NodeMemory);
-    Mem->ElapsedTime = 0.f;
-    Mem->StartYaw = OwnerComp.GetAIOwner()->GetPawn()->GetActorRotation().Yaw;
-    return EBTNodeResult::InProgress;
-}
+    FMyLookAroundMemory* Memory = CastInstanceNodeMemory<FMyLookAroundMemory>(NodeMemory);
+    Memory->ElapsedTime += DeltaSeconds;
 
-void UBTTask_LookAround::TickTask(
-    UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
-{
-    auto* Mem = CastInstanceNodeMemory<FBTLookAroundMemory>(NodeMemory);
-    Mem->ElapsedTime += DeltaSeconds;
-
-    float NewYaw = Mem->StartYaw + (Mem->ElapsedTime / LookDuration) * 360.f;
-    OwnerComp.GetAIOwner()->SetFocalPoint(
-        OwnerComp.GetAIOwner()->GetPawn()->GetActorLocation() +
-        FRotator(0.f, NewYaw, 0.f).Vector() * 500.f);
-
-    if (Mem->ElapsedTime >= LookDuration)
+    AAIController* Controller = OwnerComp.GetAIOwner();
+    APawn* Pawn = Controller ? Controller->GetPawn() : nullptr;
+    if (!Pawn)
     {
-        OwnerComp.GetAIOwner()->ClearFocus(EAIFocusPriority::Gameplay);
+        FinishLatentTask(OwnerComp, EBTNodeResult::Failed);
+        return;
+    }
+
+    const float NewYaw = Memory->StartYaw + (Memory->ElapsedTime / LookDuration) * 360.f;
+    Controller->SetFocalPoint(Pawn->GetActorLocation() + FRotator(0.f, NewYaw, 0.f).Vector() * 500.f);
+
+    if (Memory->ElapsedTime >= LookDuration)
+    {
+        Controller->ClearFocus(EAIFocusPriority::Gameplay);
         FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
     }
 }
@@ -232,161 +417,128 @@ void UBTTask_LookAround::TickTask(
 
 ---
 
-## Pattern 5: Patrol Along Spline
-
-Looping patrol along a spline, with stop duration at each point.
+## Pattern 5: Patrol along a spline
 
 ```
 Root [Sequence]
-└── [Sequence + BTDecorator_Loop(NumLoops=0)] "Patrol Loop"
+└── [Sequence + BTDecorator_Loop(bInfiniteLoop=true)] "Patrol Loop"
     ├── MyBTTask_GetNextSplinePoint (writes PatrolLocation + PatrolWaitTime)
-    ├── BTTask_MoveTo (PatrolLocation, AcceptRadius=50)
+    ├── BTTask_MoveTo (PatrolLocation, AcceptableRadius=50)
     └── BTTask_WaitBlackboardTime (BlackboardKey=PatrolWaitTime)
 ```
 
-### GetNextSplinePoint Task (C++)
-
 ```cpp
-EBTNodeResult::Type UBTTask_GetNextSplinePoint::ExecuteTask(
-    UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
+EBTNodeResult::Type UMyBTTask_GetNextSplinePoint::ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
 {
-    UBlackboardComponent* BB = OwnerComp.GetBlackboardComponent();
-    AAIController* Controller = OwnerComp.GetAIOwner();
-
-    if (!IsValid(PatrolSplineActor)) { return EBTNodeResult::Failed; }
+    UBlackboardComponent* Blackboard = OwnerComp.GetBlackboardComponent();
+    if (!Blackboard || !IsValid(PatrolSplineActor))
+    {
+        return EBTNodeResult::Failed;
+    }
 
     USplineComponent* Spline = PatrolSplineActor->FindComponentByClass<USplineComponent>();
-    if (!Spline) { return EBTNodeResult::Failed; }
+    if (!Spline || Spline->GetNumberOfSplinePoints() == 0)
+    {
+        return EBTNodeResult::Failed;
+    }
 
-    int32 NumPoints = Spline->GetNumberOfSplinePoints();
-    int32 CurrentIdx = BB->GetValueAsInt(TEXT("PatrolIndex"));
-    int32 NextIdx = (CurrentIdx + 1) % NumPoints;
-
-    BB->SetValueAsInt(TEXT("PatrolIndex"), NextIdx);
-    BB->SetValueAsVector(TEXT("PatrolLocation"),
-        Spline->GetLocationAtSplinePoint(NextIdx, ESplineCoordinateSpace::World));
-    BB->SetValueAsFloat(TEXT("PatrolWaitTime"), WaitTimeAtPoint);
-
+    const int32 NextIndex = (Blackboard->GetValueAsInt(TEXT("PatrolIndex")) + 1) % Spline->GetNumberOfSplinePoints();
+    Blackboard->SetValueAsInt(TEXT("PatrolIndex"), NextIndex);
+    Blackboard->SetValueAsVector(TEXT("PatrolLocation"),
+        Spline->GetLocationAtSplinePoint(NextIndex, ESplineCoordinateSpace::World));
+    Blackboard->SetValueAsFloat(TEXT("PatrolWaitTime"), WaitTimeAtPoint);
     return EBTNodeResult::Succeeded;
 }
 ```
 
 ---
 
-## Pattern 6: Squad AI with Shared Blackboard
+## Pattern 6: Squad AI with a shared blackboard
 
-Multiple AI agents share awareness via instance-synced blackboard keys.
-
-**Setup**: Mark `TargetActor` and `AlertLevel` as "Instance Synced" in `UBlackboardData`.
-
-When any squad member's AI controller updates these keys, `UAISystem` propagates the change to all blackboards sharing the same asset (see `UBlackboardComponent::SetValue` template for the sync loop).
-
-```cpp
-// Squad leader sets target → all squad members receive it
-void ASquadLeaderAIController::OnTargetPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus)
-{
-    if (Stimulus.WasSuccessfullySensed())
-    {
-        // Setting a synced key broadcasts to all squad members sharing this BB asset
-        GetBlackboardComponent()->SetValueAsObject(TEXT("TargetActor"), Actor);
-        GetBlackboardComponent()->SetValueAsFloat(TEXT("AlertLevel"), 1.0f);
-    }
-}
-```
-
-The BT on each squad member reacts independently to the shared `TargetActor` key via `BTDecorator_Blackboard`.
+Mark `TargetActor` and `AlertLevel` **Instance Synced** in the `UBlackboardData` asset (`FBlackboardEntry::bInstanceSynced`). Every `UBlackboardComponent` using that asset then receives the value when any one of them sets it, so a squad leader writing `TargetActor` alerts the whole squad, and each member's tree reacts independently through `UBTDecorator_Blackboard`. `UBlackboardData::HasSynchronizedKeys()` reports whether an asset has any synced key.
 
 ---
 
-## Pattern 7: Message-Driven Task (WaitForMessage)
+## Pattern 7: Message-driven task (`WaitForMessage`)
 
-Used when a task needs to wait for an external event (animation notify, ability end, timer) rather than polling.
+Use this when a task waits on an external event (animation notify, ability end, timer) instead of polling.
 
 ```cpp
-EBTNodeResult::Type UBTTask_PlayMontage::ExecuteTask(
-    UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
+EBTNodeResult::Type UMyBTTask_PlayMontage::ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
 {
-    ACharacter* Character = Cast<ACharacter>(OwnerComp.GetAIOwner()->GetPawn());
-    if (!Character || !MontageToPlay) { return EBTNodeResult::Failed; }
+    AAIController* Controller = OwnerComp.GetAIOwner();
+    ACharacter* Character = Controller ? Cast<ACharacter>(Controller->GetPawn()) : nullptr;
+    UAnimInstance* AnimInstance = Character ? Character->GetMesh()->GetAnimInstance() : nullptr;
+    if (!AnimInstance || !MontageToPlay)
+    {
+        return EBTNodeResult::Failed;
+    }
 
-    // Register to receive a specific message name
     WaitForMessage(OwnerComp, TEXT("MontageCompleted"));
     WaitForMessage(OwnerComp, TEXT("MontageFailed"));
-
-    // Start the montage
-    Character->GetMesh()->GetAnimInstance()->Montage_Play(MontageToPlay);
-
+    AnimInstance->Montage_Play(MontageToPlay);
     return EBTNodeResult::InProgress;
 }
 
-void UBTTask_PlayMontage::OnMessage(
-    UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory,
+void UMyBTTask_PlayMontage::OnMessage(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory,
     FName Message, int32 RequestID, bool bSuccess)
 {
     StopWaitingForMessages(OwnerComp);
-    FinishLatentTask(OwnerComp,
-        (Message == TEXT("MontageCompleted")) ? EBTNodeResult::Succeeded : EBTNodeResult::Failed);
+    FinishLatentTask(OwnerComp, Message == TEXT("MontageCompleted") ? EBTNodeResult::Succeeded : EBTNodeResult::Failed);
 }
-
-// Sender side (e.g., AnimNotify or ability):
-// UAIBlueprintHelperLibrary::SendAIMessage(Pawn, TEXT("MontageCompleted"), nullptr, true);
-// Or from C++:
-// UBehaviorTreeComponent* BTComp = Cast<UBehaviorTreeComponent>(Controller->GetBrainComponent());
-// if (BTComp) { BTComp->HandleMessage(FAIMessage(TEXT("MontageCompleted"), nullptr, true)); }
 ```
+
+Senders:
+
+```cpp
+// From any gameplay code that has the pawn:
+FAIMessage::Send(Pawn, FAIMessage(TEXT("MontageCompleted"), this, true));
+
+// Blueprint-facing equivalent:
+UAIBlueprintHelperLibrary::SendAIMessage(Pawn, TEXT("MontageCompleted"), nullptr, true);
+```
+
+`FAIMessage::Send` has overloads for `AController*`, `APawn*` and `UBrainComponent*`; `UBehaviorTreeComponent::HandleMessage(const FAIMessage&)` is the receiving end.
 
 ---
 
-## Node Memory Pattern
+## Decorator abort modes
 
-For tasks that store per-instance runtime data (not shared across AI using the same tree asset):
+| `EBTFlowAbortMode::Type` | Behavior |
+|---|---|
+| `None` | Never aborts a running task |
+| `Self` | Aborts tasks inside its own subtree when the condition changes |
+| `LowerPriority` | Aborts lower-priority branches when the condition becomes true |
+| `Both` | Self plus LowerPriority |
 
 ```cpp
-struct FBTMyTaskMemory
-{
-    FAIRequestID MoveRequestID;
-    float ElapsedTime = 0.f;
-    TWeakObjectPtr<UMyComponent> CachedComp;
-};
-
-UCLASS()
-class UBTTask_MyTask : public UBTTaskNode
-{
-    // ...
-    virtual uint16 GetInstanceMemorySize() const override
-    {
-        return sizeof(FBTMyTaskMemory);
-    }
-};
-
-// In ExecuteTask:
-FBTMyTaskMemory* Mem = CastInstanceNodeMemory<FBTMyTaskMemory>(NodeMemory);
-new(Mem) FBTMyTaskMemory(); // placement-new to initialize
-Mem->ElapsedTime = 0.f;
-```
-
----
-
-## Decorator Abort Modes
-
-| FlowAbortMode | Behavior |
-|---------------|----------|
-| `None` | Decorator never aborts running tasks |
-| `Self` | Aborts tasks within its own subtree if condition changes |
-| `LowerPriority` | Aborts lower-priority branches when condition becomes true |
-| `Both` | Combination of Self and LowerPriority |
-
-Most reactive decorators (Blackboard, CanSeeTarget) should use `Both` so the tree re-evaluates when the condition changes in either direction.
-
-Set via:
-```cpp
-FlowAbortMode = EBTFlowAbortMode::Both;
 bAllowAbortLowerPri = true;
 bAllowAbortChildNodes = true;
+FlowAbortMode = EBTFlowAbortMode::Both;
 ```
 
-Then call `ConditionalFlowAbort` from external event handlers to trigger re-evaluation:
+`UBTDecorator::UpdateFlowAbortMode()` clamps the mode to what the parent composite allows (`CanAbortLowerPriority()` / `CanAbortSelf()`), and `IsFlowAbortModeValid()` reports whether the current mode fits; both only do work in editor builds (`BTDecorator.cpp:147-203`). From an event handler inside the decorator, trigger a re-evaluation with:
+
 ```cpp
-// In perception callback or timer:
 ConditionalFlowAbort(OwnerComp, EBTDecoratorAbortRequest::ConditionResultChanged);
 ```
+
+From outside the tree, call `UBehaviorTreeComponent::RequestBranchEvaluation(EBTNodeResult::Type)` or the full `RequestExecution(const UBTCompositeNode*, int32, const UBTNode*, int32, EBTNodeResult::Type, bool)`.
+
+---
+
+## Composites and control flow
+
+| Composite | Succeeds when | Notes |
+|---|---|---|
+| `UBTComposite_Selector` | the first child succeeds | Fallback chain; ordering is priority |
+| `UBTComposite_Sequence` | every child succeeds | Stops at the first failure |
+| `UBTComposite_SimpleParallel` | the main task finishes | One main task plus one background subtree; `FinishMode` decides whether the background branch is allowed to complete |
+
+There is no general-purpose parallel composite in 5.8. For N concurrent branches, chain `SimpleParallel` nodes or write a `UBTCompositeNode` subclass.
+
+---
+
+## Debugging
+
+Open the Gameplay Debugger (default key `'`) with a possessed pawn and switch categories to see the behavior tree, blackboard, perception, navmesh and EQS panels. `ai.debug.DrawPaths` and `ai.debug.DrawOverheadIcons` toggle AI path and icon drawing; `ai.debug.nav.DisplaySize` and `ai.debug.nav.DrawDistance` control navmesh drawing; `ai.debug.EQS.RefreshInterval` controls the EQS panel refresh rate.

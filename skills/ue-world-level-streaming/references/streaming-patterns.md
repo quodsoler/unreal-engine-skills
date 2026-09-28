@@ -1,211 +1,340 @@
 # Level Streaming Configuration Patterns
 
-Reference patterns for common game types. Choose the pattern that matches your project's world structure and adapt the specifics to your scale and multiplayer requirements.
+Target engine: **UE 5.8**. Reference configurations for common game shapes, plus the long code examples that do not fit in the main skill file. Pick the pattern that matches the project's world structure and adapt the specifics to scale and multiplayer needs.
 
 ---
 
-## Pattern 1: Open World with World Partition (UE5)
+## Pattern 1: Open World with World Partition
 
-**Best for:** Large continuous worlds — survival games, open-world RPGs, exploration games.
+**Best for:** large continuous worlds — survival games, open-world RPGs, exploration games.
 
 ### Configuration
 
-Enable World Partition on the persistent level. Every actor is managed by the WP grid. Sub-levels are not used.
+Enable World Partition on the persistent level. Every actor is managed by the runtime grid, and the level cannot also carry sub-levels. Loading range is a property of the runtime partition (`URuntimePartition::LoadingRange`, `WorldPartition/RuntimeHashSet/RuntimePartition.h:104`), configured in the World Partition editor, not in an ini file. `UWorldPartitionRuntimeHashSet::GetLoadingRange()` reads the effective value back at runtime.
 
-Streaming radius is configured per-partition in the World Partition editor UI (`LoadingRange` on `URuntimePartition`). World Partition streaming is enabled per-world in the editor, not via ini.
+One File Per Actor stores each actor as its own package under `__ExternalActors__`, which is what makes concurrent editing of a single map practical.
 
-### Data Layers for Dynamic Content
+### Data layers for optional content
 
 ```cpp
-// Assign actors to data layers in editor (details panel: Data Layers).
-// At runtime, activate/deactivate via UDataLayerManager (UE 5.3+).
-// NOTE: UDataLayerSubsystem is deprecated since UE 5.3 — use UDataLayerManager instead.
-
-// Example: interior content (caves, buildings) only loads when player is near
+// Interiors, quest states and time-of-day sets live on runtime data layers
+// and toggle without traveling to another map.
+#include "WorldPartition/DataLayer/DataLayerAsset.h"
 #include "WorldPartition/DataLayer/DataLayerManager.h"
-UDataLayerManager* DLMgr = UDataLayerManager::GetDataLayerManager(GetWorld());
 
-// SetDataLayerRuntimeState takes UDataLayerAsset* (asset reference set up in editor)
-UDataLayerAsset* InteriorLayerAsset = /* UPROPERTY asset reference */;
+void AMyWorldDirector::SetInteriorState(const UDataLayerAsset* InteriorLayer, bool bVisible)
+{
+    UDataLayerManager* Manager = UDataLayerManager::GetDataLayerManager(this);
+    if (!Manager || !InteriorLayer)
+    {
+        return;
+    }
 
-// Activate — loads and makes visible
-DLMgr->SetDataLayerRuntimeState(InteriorLayerAsset, EDataLayerRuntimeState::Activated);
-
-// Pre-load without making visible (background warm)
-DLMgr->SetDataLayerRuntimeState(InteriorLayerAsset, EDataLayerRuntimeState::Loaded);
-
-// Unload completely
-DLMgr->SetDataLayerRuntimeState(InteriorLayerAsset, EDataLayerRuntimeState::Unloaded);
+    // Activated = loaded and visible. Loaded = in memory, invisible (pre-warm).
+    Manager->SetDataLayerRuntimeState(InteriorLayer,
+        bVisible ? EDataLayerRuntimeState::Activated : EDataLayerRuntimeState::Loaded);
+}
 ```
 
-### Streaming Radius per Player (Multiplayer)
+Call this on the server for ordinary runtime layers; the resulting state replicates to clients. `UDataLayerManager::GetDataLayerInstanceEffectiveRuntimeState` is the query that accounts for parent layers.
 
-World Partition automatically uses each player controller as a streaming source. Each controller can have a different runtime cell size. Override `IWorldPartitionStreamingSourceProvider` for non-player streaming sources (e.g., AI directors, cinematic cameras).
+### HLOD setup
 
-### HLOD Setup
+1. Create one `UHLODLayer` asset per proxy tier and assign it in the World Partition settings.
+2. Set the runtime grid properties on the partition, not on the HLOD layer.
+3. Build HLODs before cooking. Cells past the loading range have no representation otherwise.
+4. Verify at runtime with the `wp.Runtime.HLOD` CVar and `UWorldPartitionHLODRuntimeSubsystem::IsHLODEnabled()`.
 
-1. Open World Partition editor panel.
-2. Add HLOD layers: one per LOD tier (e.g., far, medium).
-3. Set cell size to match grid (e.g., 128m cells = 12800 units).
-4. Build HLODs before shipping: **Build -> Build World Partition HLODs**.
+### Anti-patterns for this setup
 
-### Anti-Patterns for This Setup
+- Streaming volumes have no effect in a partitioned world.
+- `UGameplayStatics::LoadStreamLevel` has nothing to target — there are no named sub-levels.
+- Actors marked not spatially loaded are always resident; use that sparingly.
 
-- Do not use streaming volumes — they have no effect in World Partition.
-- Do not add actors to persistent level outside of World Partition (they will always be loaded).
-- Do not use `UGameplayStatics::LoadStreamLevel` — there are no named sub-levels to target.
+---
+
+## Custom Streaming Source Provider
+
+A cinematic camera, an AI director or a spectator proxy can pull cells in without being a player. Implement `IWorldPartitionStreamingSourceProvider` and register with `UWorldPartitionSubsystem`.
+
+```cpp
+// MyDirectorCamera.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "WorldPartition/WorldPartitionStreamingSource.h"
+#include "MyDirectorCamera.generated.h"
+
+UCLASS()
+class MYGAME_API AMyDirectorCamera : public AActor, public IWorldPartitionStreamingSourceProvider
+{
+    GENERATED_BODY()
+
+public:
+    virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+    virtual bool GetStreamingSources(TArray<FWorldPartitionStreamingSource>& StreamingSources) const override;
+    virtual const UObject* GetStreamingSourceOwner() const override;
+};
+```
+
+```cpp
+// MyDirectorCamera.cpp
+#include "MyDirectorCamera.h"
+#include "Engine/World.h"
+#include "WorldPartition/WorldPartitionSubsystem.h"
+
+void AMyDirectorCamera::BeginPlay()
+{
+    Super::BeginPlay();
+
+    if (UWorldPartitionSubsystem* Subsystem = GetWorld()->GetSubsystem<UWorldPartitionSubsystem>())
+    {
+        Subsystem->RegisterStreamingSourceProvider(this);
+    }
+}
+
+void AMyDirectorCamera::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (UWorldPartitionSubsystem* Subsystem = GetWorld()->GetSubsystem<UWorldPartitionSubsystem>())
+    {
+        Subsystem->UnregisterStreamingSourceProvider(this);
+    }
+
+    Super::EndPlay(EndPlayReason);
+}
+
+bool AMyDirectorCamera::GetStreamingSources(TArray<FWorldPartitionStreamingSource>& StreamingSources) const
+{
+    FWorldPartitionStreamingSource Source;
+    Source.Name = GetFName();
+    Source.Location = GetActorLocation();
+    Source.Rotation = GetActorRotation();
+    Source.TargetState = EStreamingSourceTargetState::Activated;
+    Source.Priority = EStreamingSourcePriority::High;
+    Source.bBlockOnSlowLoading = false;
+    StreamingSources.Add(MoveTemp(Source));
+    return true;
+}
+
+const UObject* AMyDirectorCamera::GetStreamingSourceOwner() const
+{
+    return this;
+}
+```
+
+To restrict the source to specific runtime grids, fill `Source.TargetGrids` and set `Source.TargetBehavior` to `EStreamingSourceTargetBehavior::Include` or `Exclude`. To shape the query volume beyond the default sphere, push `FStreamingSourceShape` entries into `Source.Shapes`.
+
+Confirm registration with the `wp.Runtime.DumpStreamingSources` console command, or `UWorldPartitionSubsystem::GetStreamingSourceProviders()` in code.
 
 ---
 
 ## Pattern 2: Hub-and-Spoke with Manual Sub-Level Streaming
 
-**Best for:** Games with discrete zones (MMO zones, dungeon crawlers, hub worlds with portal travel).
+**Best for:** discrete zones — MMO-style areas, dungeon crawlers, hub worlds with portal travel.
 
-### Persistent Level
-
-The persistent level contains: GameMode, GameState, player spawn points, UI actors, and global managers. It never unloads during a session.
-
-### Sub-Levels Setup
-
-Each zone is a separate `.umap` added to the persistent level's streaming list in the editor. Zones are loaded on demand.
+The persistent level holds GameMode, GameState, spawn points, UI actors and global managers, and never unloads. Each zone is a separate `.umap` in the persistent level's streaming list.
 
 ```cpp
-// MyZoneManager.h — UWorldSubsystem for zone state tracking
+// MyZoneManager.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Subsystems/WorldSubsystem.h"
+#include "MyZoneManager.generated.h"
+
 UCLASS()
-class UMyZoneManager : public UWorldSubsystem
+class MYGAME_API UMyZoneManager : public UWorldSubsystem
 {
     GENERATED_BODY()
 
 public:
-    void LoadZone(FName ZoneLevelName);
-    void UnloadZone(FName ZoneLevelName);
-    bool IsZoneLoaded(FName ZoneLevelName) const;
+    void LoadZone(FName ZonePackageName);
+    void UnloadZone(FName ZonePackageName);
+    void PreloadAdjacentZone(FName ZonePackageName);
+    bool IsZoneLoaded(FName ZonePackageName) const;
+
+    // Latent continuations must be UFUNCTIONs declared in the class body.
+    UFUNCTION()
+    void OnZoneLoaded();
+
+    UFUNCTION()
+    void OnZoneUnloaded();
 
 private:
     TSet<FName> LoadedZones;
-
-    UFUNCTION()
-    void OnZoneLoaded() { /* update LoadedZones */ }
+    FName PendingZone;
 };
 ```
 
 ```cpp
 // MyZoneManager.cpp
-void UMyZoneManager::LoadZone(FName ZoneLevelName)
+#include "MyZoneManager.h"
+#include "Engine/LatentActionManager.h"
+#include "Engine/LevelStreaming.h"
+#include "Kismet/GameplayStatics.h"
+
+void UMyZoneManager::LoadZone(FName ZonePackageName)
 {
+    PendingZone = ZonePackageName;
+
     FLatentActionInfo LatentInfo;
     LatentInfo.CallbackTarget = this;
     LatentInfo.ExecutionFunction = FName("OnZoneLoaded");
     LatentInfo.Linkage = 0;
-    LatentInfo.UUID = GetTypeHash(ZoneLevelName);
+    LatentInfo.UUID = 1; // one load in flight: a second call with a pending UUID is ignored (FindExistingAction)
 
-    UGameplayStatics::LoadStreamLevel(this, ZoneLevelName, true, false, LatentInfo);
+    UGameplayStatics::LoadStreamLevel(this, ZonePackageName,
+        /*bMakeVisibleAfterLoad=*/true, /*bShouldBlockOnLoad=*/false, LatentInfo);
 }
 
-void UMyZoneManager::UnloadZone(FName ZoneLevelName)
+void UMyZoneManager::UnloadZone(FName ZonePackageName)
 {
+    PendingZone = ZonePackageName;
+
     FLatentActionInfo LatentInfo;
     LatentInfo.CallbackTarget = this;
     LatentInfo.ExecutionFunction = FName("OnZoneUnloaded");
     LatentInfo.Linkage = 0;
-    LatentInfo.UUID = GetTypeHash(ZoneLevelName) + 1;
+    LatentInfo.UUID = 2;
 
-    UGameplayStatics::UnloadStreamLevel(this, ZoneLevelName, LatentInfo, false);
-    LoadedZones.Remove(ZoneLevelName);
+    UGameplayStatics::UnloadStreamLevel(this, ZonePackageName, LatentInfo, /*bShouldBlockOnUnload=*/false);
 }
-```
 
-### Pre-Loading Adjacent Zones
-
-Load neighbor zones into `LoadedNotVisible` state so they are in memory before the player arrives:
-
-```cpp
-void UMyZoneManager::PreloadAdjacentZone(FName ZoneLevelName)
+void UMyZoneManager::PreloadAdjacentZone(FName ZonePackageName)
 {
-    const TArray<ULevelStreaming*>& Levels = GetWorld()->GetStreamingLevels();
-    for (ULevelStreaming* Level : Levels)
+    // Bring the neighbour into memory without adding it to the world.
+    if (ULevelStreaming* Streaming = UGameplayStatics::GetStreamingLevel(this, ZonePackageName))
     {
-        if (Level->GetWorldAssetPackageFName() == ZoneLevelName)
-        {
-            Level->SetShouldBeLoaded(true);
-            Level->SetShouldBeVisible(false); // Load but keep invisible
-            // Changes are picked up by the streaming system each frame automatically
-            return;
-        }
+        Streaming->SetShouldBeLoaded(true);
+        Streaming->SetShouldBeVisible(false);
     }
 }
-```
 
-### Loading Screen Handoff
-
-Before loading screen dismiss, wait for the target zone to reach `LoadedVisible`:
-
-```cpp
-void UMyHUD::WaitForZoneVisible(FName ZoneLevelName)
+void UMyZoneManager::OnZoneLoaded()
 {
-    GetWorld()->GetTimerManager().SetTimer(
-        PollTimerHandle,
-        [this, ZoneLevelName]()
-        {
-            for (ULevelStreaming* Level : GetWorld()->GetStreamingLevels())
-            {
-                if (Level->GetWorldAssetPackageFName() == ZoneLevelName &&
-                    Level->GetLevelStreamingState() == ELevelStreamingState::LoadedVisible)
-                {
-                    DismissLoadingScreen();
-                    GetWorld()->GetTimerManager().ClearTimer(PollTimerHandle);
-                    return;
-                }
-            }
-        },
-        0.1f,   // poll every 100ms
-        true    // looping
-    );
+    LoadedZones.Add(PendingZone);
+}
+
+void UMyZoneManager::OnZoneUnloaded()
+{
+    LoadedZones.Remove(PendingZone);
+}
+
+bool UMyZoneManager::IsZoneLoaded(FName ZonePackageName) const
+{
+    return LoadedZones.Contains(ZonePackageName);
 }
 ```
 
----
+### Loading screen handoff
 
-## Pattern 3: Procedural / Instanced Level Streaming
-
-**Best for:** Roguelikes, procedural dungeons, instanced arenas, modular buildings loaded at runtime.
-
-### Core Pattern: ULevelStreamingDynamic
+Hold the loading screen until the target zone reports `LoadedVisible`.
 
 ```cpp
-// ProcDungeonGenerator.h
+// MyLoadingScreenActor.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Engine/TimerHandle.h"
+#include "GameFramework/Actor.h"
+#include "MyLoadingScreenActor.generated.h"
+
 UCLASS()
-class AProcDungeonGenerator : public AActor
+class MYGAME_API AMyLoadingScreenActor : public AActor
 {
     GENERATED_BODY()
 
 public:
-    // Room template level to instance (set in editor)
-    UPROPERTY(EditDefaultsOnly)
-    TSoftObjectPtr<UWorld> RoomTemplate;
+    void WaitForZoneVisible(FName ZonePackageName);
 
-    void SpawnRoom(FTransform RoomTransform, FString InstanceName);
-    void DespawnRoom(FString InstanceName);
+protected:
+    void DismissLoadingScreen();
 
 private:
-    UPROPERTY()
-    TMap<FString, TObjectPtr<ULevelStreamingDynamic>> SpawnedRooms;
-
-    UFUNCTION()
-    void OnRoomVisible();
+    FTimerHandle PollTimerHandle;
 };
 ```
 
 ```cpp
-// ProcDungeonGenerator.cpp
-void AProcDungeonGenerator::SpawnRoom(FTransform RoomTransform, FString InstanceName)
+// MyLoadingScreenActor.cpp
+#include "MyLoadingScreenActor.h"
+#include "Engine/LevelStreaming.h"
+#include "Engine/World.h"
+#include "Kismet/GameplayStatics.h"
+#include "TimerManager.h"
+
+void AMyLoadingScreenActor::WaitForZoneVisible(FName ZonePackageName)
+{
+    GetWorld()->GetTimerManager().SetTimer(PollTimerHandle, FTimerDelegate::CreateWeakLambda(this, [this, ZonePackageName]()
+    {
+        ULevelStreaming* Streaming = UGameplayStatics::GetStreamingLevel(this, ZonePackageName);
+        if (Streaming && Streaming->GetLevelStreamingState() == ELevelStreamingState::LoadedVisible)
+        {
+            DismissLoadingScreen();
+            GetWorld()->GetTimerManager().ClearTimer(PollTimerHandle);
+        }
+    }),
+    0.1f,   // poll interval
+    true);  // looping
+}
+```
+
+Binding `ULevelStreaming::OnLevelShown` is cheaper than polling when the streaming object already exists; poll only when the level may not have been created yet.
+
+---
+
+## Pattern 3: Procedural and Instanced Level Streaming
+
+**Best for:** roguelikes, procedural dungeons, instanced arenas, modular buildings assembled at runtime.
+
+```cpp
+// MyDungeonGenerator.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "MyDungeonGenerator.generated.h"
+
+class ULevelStreamingDynamic;
+
+UCLASS()
+class MYGAME_API AMyDungeonGenerator : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    void SpawnRoom(const FTransform& RoomTransform, const FString& InstanceName);
+    void DespawnRoom(const FString& InstanceName);
+
+    UFUNCTION()
+    void HandleRoomShown();
+
+protected:
+    UPROPERTY(EditDefaultsOnly, Category = "MyGame|Streaming")
+    TSoftObjectPtr<UWorld> RoomTemplate;
+
+private:
+    UPROPERTY()
+    TMap<FString, TObjectPtr<ULevelStreamingDynamic>> SpawnedRooms;
+};
+```
+
+```cpp
+// MyDungeonGenerator.cpp
+#include "MyDungeonGenerator.h"
+#include "Engine/LevelStreamingDynamic.h"
+#include "Engine/World.h"
+
+void AMyDungeonGenerator::SpawnRoom(const FTransform& RoomTransform, const FString& InstanceName)
 {
     ULevelStreamingDynamic::FLoadLevelInstanceParams Params(
-        GetWorld(),
-        RoomTemplate.GetLongPackageName(),
-        RoomTransform
-    );
-    Params.OptionalLevelNameOverride = &InstanceName; // Deterministic name for net sync
+        GetWorld(), RoomTemplate.GetLongPackageName(), RoomTransform);
+
+    // Deterministic package name so server and clients agree.
+    Params.OptionalLevelNameOverride = &InstanceName;
     Params.bInitiallyVisible = true;
 
     bool bSuccess = false;
@@ -213,202 +342,246 @@ void AProcDungeonGenerator::SpawnRoom(FTransform RoomTransform, FString Instance
 
     if (bSuccess && Level)
     {
-        Level->OnLevelShown.AddDynamic(this, &AProcDungeonGenerator::OnRoomVisible);
+        Level->OnLevelShown.AddDynamic(this, &AMyDungeonGenerator::HandleRoomShown);
         SpawnedRooms.Add(InstanceName, Level);
     }
 }
 
-void AProcDungeonGenerator::DespawnRoom(FString InstanceName)
+void AMyDungeonGenerator::DespawnRoom(const FString& InstanceName)
 {
-    if (ULevelStreamingDynamic** Level = SpawnedRooms.Find(InstanceName))
+    if (TObjectPtr<ULevelStreamingDynamic>* Found = SpawnedRooms.Find(InstanceName))
     {
-        (*Level)->SetShouldBeLoaded(false);
-        (*Level)->SetShouldBeVisible(false);
-        (*Level)->SetIsRequestingUnloadAndRemoval(true);
+        ULevelStreamingDynamic* Level = *Found;
+        Level->SetShouldBeVisible(false);
+        Level->SetShouldBeLoaded(false);
+        Level->SetIsRequestingUnloadAndRemoval(true);
         SpawnedRooms.Remove(InstanceName);
     }
 }
-```
 
-### Multiplayer: Replicating Instance Names
-
-The server spawns room instances with deterministic names (e.g., "Room_0001", "Room_0002"). It replicates these names to clients via a replicated array on GameState. Clients call `LoadLevelInstance` with the same `OptionalLevelNameOverride`. The names must match exactly — without this, clients and server reference different package names and streaming breaks.
-
-```cpp
-// MyGameState.h
-UPROPERTY(ReplicatedUsing=OnRep_SpawnedRooms)
-TArray<FString> SpawnedRoomNames;
-
-UFUNCTION()
-void OnRep_SpawnedRooms();
-
-// MyGameState.cpp — client side
-void AMyGameState::OnRep_SpawnedRooms()
+void AMyDungeonGenerator::HandleRoomShown()
 {
-    for (const FString& RoomName : SpawnedRoomNames)
-    {
-        // Load each room with the replicated name as the override
-        // so the package name matches what the server has
-        DungeonGenerator->SpawnRoom(GetRoomTransform(RoomName), RoomName);
-    }
+    // OnLevelShown is a parameterless dynamic multicast delegate.
 }
 ```
+
+### Multiplayer instance names
+
+The server decides the instance names (`Room_0001`, `Room_0002`, …) and replicates them, typically as an array on the GameState. Clients call `LoadLevelInstance` with the same `OptionalLevelNameOverride`, so every connection ends up with identically named packages. Without that, the server and each client build different package names and actor references across the boundary never resolve. For the replication side — `GetLifetimeReplicatedProps`, `ReplicatedUsing`, conditions — see `ue-networking-replication`.
+
+Reserve `Params.bAllowReuseExitingLevelStreaming` for cases where the same instance name is intentionally re-requested, and `Params.OptionalLevelStreamingClass` when a `ULevelStreamingDynamic` subclass should own the instance.
 
 ---
 
-## Pattern 4: Linear Level Sequence (Chapter / Act Structure)
+## Pattern 4: Linear Chapter Structure
 
-**Best for:** Narrative games, linear action games with distinct chapters or missions.
+**Best for:** narrative games and linear action games with distinct chapters or missions.
 
-### Approach
-
-Each chapter is a separate `.umap`. A small persistent level holds global actors. Travel between chapters uses seamless travel (multiplayer) or `OpenLevel` (single-player).
-
-### Single-Player: OpenLevel with GameInstance State
+Each chapter is its own `.umap`. Single-player uses `OpenLevel`; multiplayer uses seamless travel so connections survive.
 
 ```cpp
-// Save chapter progress to GameInstance before traveling
+// Single player: stash progress in the GameInstance, then hard-travel.
 void AMyGameMode::TravelToChapter(FName ChapterMapName)
 {
-    UMyGameInstance* GI = GetGameInstance<UMyGameInstance>();
-    if (GI)
+    if (UMyGameInstance* GameInstance = GetGameInstance<UMyGameInstance>())
     {
-        GI->LastCompletedChapter = CurrentChapter;
-        GI->PlayerInventory = CollectPlayerInventory();
+        GameInstance->LastCompletedChapter = CurrentChapter;
     }
 
-    UGameplayStatics::OpenLevel(this, ChapterMapName, true);
+    UGameplayStatics::OpenLevel(this, ChapterMapName, /*bAbsolute=*/true);
 }
 ```
 
-### Multiplayer: Seamless Travel
-
 ```ini
-; DefaultEngine.ini
-[/Script/Engine.GameMapsSettings]
-TransitionMap=/Game/Maps/Transition_Loading
+; DefaultEngine.ini — optional; without it the engine transitions through an empty dummy world
+[/Script/EngineSettings.GameMapsSettings]
+TransitionMap=/Game/Maps/L_Transition.L_Transition
 ```
 
 ```cpp
-// MyGameMode.h
-uint32 bUseSeamlessTravel : 1; // set to 1 in constructor
+// Multiplayer: bUseSeamlessTravel is already a UPROPERTY on AGameModeBase.
+// Set it in the constructor; never redeclare it.
+AMyGameMode::AMyGameMode()
+{
+    bUseSeamlessTravel = true;
+}
 
-// MyGameMode.cpp
 void AMyGameMode::TravelToChapter(const FString& ChapterURL)
 {
-    // Server initiates; clients follow automatically
-    GetWorld()->ServerTravel(ChapterURL);
+    GetWorld()->ServerTravel(ChapterURL); // clients follow automatically
 }
 
 void AMyGameMode::GetSeamlessTravelActorList(bool bToTransition, TArray<AActor*>& ActorList)
 {
     Super::GetSeamlessTravelActorList(bToTransition, ActorList);
 
-    if (!bToTransition)
+    // Super keeps PlayerStates both ways; GameMode, GameState and GameSession only reach the transition map.
+    // Called for both legs: an actor left out when bToTransition is true is destroyed with the old world.
+    // Carry only actors you own (PersistentManager is a member of AMyGameMode).
+    if (PersistentManager)
     {
-        // Carry GameState into the destination
-        ActorList.Add(GameState);
+        ActorList.Add(PersistentManager);
     }
 }
 
 void AMyGameMode::HandleSeamlessTravelPlayer(AController*& C)
 {
     Super::HandleSeamlessTravelPlayer(C);
-    // Restore character state from GameInstance or GameState
     RestorePlayerState(C);
 }
 ```
 
+Anything not in the actor list is destroyed with the old world. Put data that must outlive every map in `UGameInstance` or a `UGameInstanceSubsystem`.
+
 ---
 
-## Pattern 5: Streaming Volume–Driven Interior Loading
+## Pattern 5: Streaming Volume-Driven Interiors
 
-**Best for:** Open world games with buildings or interiors that stream in as the player approaches.
+**Best for:** non-partitioned maps with buildings or interiors that appear as the player approaches.
 
-### Setup
-
-1. Create a sub-level per interior (e.g., `L_Building_Interior_01`).
-2. Place an `ALevelStreamingVolume` in the persistent level surrounding the building exterior.
+1. One sub-level per interior, for example `L_Building_Interior_01`.
+2. Place an `ALevelStreamingVolume` covering the approach.
 3. Set `StreamingUsage = SVB_LoadingAndVisibility` on the volume.
-4. Assign the sub-level to the volume via the streaming level's `EditorStreamingVolumes` array (set in editor Details panel or via Levels panel).
-5. Set `MinTimeBetweenVolumeUnloadRequests = 5.0` seconds on the sub-level to prevent unload flicker when the player stands near the volume boundary.
+4. Link the sub-level through the streaming level's `EditorStreamingVolumes` array.
+5. Set `MinTimeBetweenVolumeUnloadRequests` on the sub-level (a few seconds) so standing on the boundary does not thrash.
 
-### Disabling Volume Control at Runtime (Cutscene or Boss Arena)
+### Taking a level off volume control
 
 ```cpp
+// MyBossRoomTrigger.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "MyBossRoomTrigger.generated.h"
+
+UCLASS()
+class MYGAME_API AMyBossRoomTrigger : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    virtual void BeginPlay() override;
+    virtual void NotifyActorBeginOverlap(AActor* OtherActor) override;
+
+protected:
+    UPROPERTY(EditAnywhere, Category = "MyGame|Streaming")
+    FName BossArenaPackageName;
+};
+```
+
+```cpp
+// MyBossRoomTrigger.cpp
+#include "MyBossRoomTrigger.h"
+#include "Engine/LevelStreaming.h"
+#include "GameFramework/Pawn.h"
+#include "Kismet/GameplayStatics.h"
+
 void AMyBossRoomTrigger::BeginPlay()
 {
     Super::BeginPlay();
-    // Find the streaming level and disable volume-based streaming
-    for (ULevelStreaming* Level : GetWorld()->GetStreamingLevels())
+
+    if (ULevelStreaming* Streaming = UGameplayStatics::GetStreamingLevel(this, BossArenaPackageName))
     {
-        if (Level->GetWorldAssetPackageFName() == FName("/Game/Levels/L_BossArena"))
-        {
-            // Disable volume control — we'll manage load state from code
-            Level->bDisableDistanceStreaming = true;
-            return;
-        }
+        Streaming->bDisableDistanceStreaming = true; // code owns this level from now on
     }
 }
 
 void AMyBossRoomTrigger::NotifyActorBeginOverlap(AActor* OtherActor)
 {
-    if (OtherActor->IsA<APlayerCharacter>())
+    Super::NotifyActorBeginOverlap(OtherActor);
+
+    if (!OtherActor || !OtherActor->IsA<APawn>())
     {
-        // Manually load and show
-        for (ULevelStreaming* Level : GetWorld()->GetStreamingLevels())
-        {
-            if (Level->GetWorldAssetPackageFName() == FName("/Game/Levels/L_BossArena"))
-            {
-                Level->SetShouldBeLoaded(true);
-                Level->SetShouldBeVisible(true);
-                // Changes are picked up by the streaming system each frame automatically
-            }
-        }
+        return;
+    }
+
+    if (ULevelStreaming* Streaming = UGameplayStatics::GetStreamingLevel(this, BossArenaPackageName))
+    {
+        Streaming->SetShouldBeLoaded(true);
+        Streaming->SetShouldBeVisible(true);
     }
 }
 ```
 
+`EStreamingVolumeUsage` in full: `SVB_Loading` (load, stay invisible), `SVB_LoadingAndVisibility` (the common case), `SVB_VisibilityBlockingOnLoad`, `SVB_BlockingOnLoad`, `SVB_LoadingNotVisible`.
+
 ---
 
-## Dedicated Server Streaming Considerations
+## Dedicated Server Streaming
 
-On a dedicated server, there is no rendering pipeline. Streaming must be entirely logic-driven.
+A dedicated server has no rendering, so nothing about streaming is camera-driven there.
 
-- **World Partition**: streaming sources on the server must be explicit. Player controller positions are used by default if `APlayerController` is registered as a source.
-- **Sub-levels**: call `SetShouldBeLoaded` and `SetShouldBeVisible` explicitly. Volume-based streaming is disabled (no camera player controller overlap in server-only mode without clients).
-- **Avoid `bShouldBlockOnLoad`** on the server unless behind a map-change sequence — blocking the server stalls all clients.
+- **World Partition:** server cell streaming is controlled by `wp.Runtime.EnableServerStreaming`, and streaming out by `wp.Runtime.EnableServerStreamingOut`. Query the effective setting with `UWorldPartition::IsServerStreamingEnabled()`. Sources on the server are the ones you register. `AServerStreamingLevelsVisibility` (`Streaming/ServerStreamingLevelsVisibility.h`) is the engine actor that tracks per-level server visibility, reachable through `UWorld::GetServerStreamingLevelsVisibility()`.
+- **Sub-levels:** call `SetShouldBeLoaded` and `SetShouldBeVisible` explicitly. Volume streaming does not apply.
+- **Blocking:** never set `bShouldBlockOnLoad` or `wp.Runtime.BlockOnSlowStreaming` on a server outside a map change — a stalled server stalls every client.
 
 ```cpp
-// Server-side: manually drive zone loading based on player positions
-// Inherits UTickableWorldSubsystem (UWorldSubsystem has no Tick)
-void UServerZoneSubsystem::Tick(float DeltaTime)
-{
-    if (GetWorld()->GetNetMode() != NM_DedicatedServer) return;
+// MyServerZoneSubsystem.h
+#pragma once
 
-    for (APlayerController* PC : TActorRange<APlayerController>(GetWorld()))
+#include "CoreMinimal.h"
+#include "Subsystems/WorldSubsystem.h"
+#include "MyServerZoneSubsystem.generated.h"
+
+UCLASS()
+class MYGAME_API UMyServerZoneSubsystem : public UTickableWorldSubsystem
+{
+    GENERATED_BODY()
+
+public:
+    virtual void Tick(float DeltaTime) override;
+    virtual TStatId GetStatId() const override;
+
+protected:
+    void UpdateZonesForLocation(const FVector& Location);
+};
+```
+
+```cpp
+// MyServerZoneSubsystem.cpp
+#include "MyServerZoneSubsystem.h"
+#include "Engine/World.h"
+#include "EngineUtils.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
+
+TStatId UMyServerZoneSubsystem::GetStatId() const
+{
+    RETURN_QUICK_DECLARE_CYCLE_STAT(UMyServerZoneSubsystem, STATGROUP_Tickables);
+}
+
+void UMyServerZoneSubsystem::Tick(float DeltaTime)
+{
+    Super::Tick(DeltaTime);
+
+    UWorld* World = GetWorld();
+    if (World->GetNetMode() != NM_DedicatedServer)
     {
-        FVector PlayerPos = PC->GetPawn() ? PC->GetPawn()->GetActorLocation() : FVector::ZeroVector;
-        FName TargetZone = DetermineZoneForPosition(PlayerPos);
-        if (!LoadedZones.Contains(TargetZone))
+        return;
+    }
+
+    for (APlayerController* PlayerController : TActorRange<APlayerController>(World))
+    {
+        if (const APawn* Pawn = PlayerController->GetPawn())
         {
-            LoadZone(TargetZone);
+            UpdateZonesForLocation(Pawn->GetActorLocation());
         }
     }
 }
 ```
 
+`UTickableWorldSubsystem::Initialize` and `Deinitialize` are what enable and disable ticking, so any override of them must call `Super::`.
+
 ---
 
-## Performance Benchmarks and Budget Guidelines
+## Budget Guidelines
 
-| Scenario | Recommended Cell/Zone Size | Max Simultaneous Loaded Levels |
+| Scenario | Cell or zone sizing | Simultaneously resident |
 |---|---|---|
-| Open world (WP) | 128m–256m cells | N/A (grid-based) |
-| Hub-and-spoke zones | Per zone (no fixed size) | 2–3 (current + neighbors) |
-| Procedural rooms | Per room (10m–50m) | 10–30 depending on actor counts |
-| Interior streaming | Per building | 3–5 around player |
+| Open world (World Partition) | Loading range tuned per runtime partition | Grid-driven; cap with `wp.Runtime.MaxLoadingStreamingCells` |
+| Hub-and-spoke zones | One level per zone | Current zone plus immediate neighbours |
+| Procedural rooms | One level per room | Tens, depending on actor counts per room |
+| Interior streaming | One level per building | A handful around the player |
 
-**Actor counts per cell (World Partition):** Keep under 1000 dynamic actors per cell. Static meshes are merged by HLOD and do not count against this limit in distant cells.
-
-**Loading budget per frame:** Level streaming operations are spread across frames. `bShouldBlockOnLoad` forces all operations into a single frame — only acceptable during loading screens. Async loading typically completes in 0.5–5 seconds depending on level size and disk speed.
+Level streaming work is spread across frames by design. `bShouldBlockOnLoad`, `UGameplayStatics::FlushLevelStreaming` and `UWorld::FlushLevelStreaming(EFlushLevelStreamingType::Full)` collapse it into one frame — acceptable only behind a loading screen. Keep dynamic actor counts per cell low; static geometry in distant cells is represented by HLOD proxies instead.

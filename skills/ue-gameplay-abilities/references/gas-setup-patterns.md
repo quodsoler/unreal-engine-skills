@@ -1,20 +1,21 @@
 # GAS Setup Patterns
 
-Initialization sequences and ownership patterns for `UAbilitySystemComponent`.
+Ownership, initialization order and the boilerplate around `UAbilitySystemComponent`.
+Target engine: UE 5.8.
 
 ---
 
-## Pattern 1: ASC on PlayerState (Multiplayer Recommended)
+## Pattern 1: ASC on PlayerState (networked players)
 
-The ASC lives on `APlayerState`. The PlayerState persists across respawns (Pawn does not), so
-ability grants, active effects, and cooldowns survive death and respawn. The Pawn/Character acts
-as the avatar (the physical representation).
+`APlayerState` outlives the pawn, so ability grants, active effects and cooldowns survive death and
+respawn. The character is the *avatar*; the PlayerState is the *owner*.
 
 ### PlayerState
 
 ```cpp
 // MyPlayerState.h
 #pragma once
+
 #include "GameFramework/PlayerState.h"
 #include "AbilitySystemInterface.h"
 #include "MyPlayerState.generated.h"
@@ -23,9 +24,10 @@ class UAbilitySystemComponent;
 class UMyHealthSet;
 
 UCLASS()
-class AMyPlayerState : public APlayerState, public IAbilitySystemInterface
+class MYGAME_API AMyPlayerState : public APlayerState, public IAbilitySystemInterface
 {
     GENERATED_BODY()
+
 public:
     AMyPlayerState();
 
@@ -34,11 +36,9 @@ public:
     UMyHealthSet* GetHealthSet() const { return HealthSet; }
 
 protected:
-    // ASC lives here; created as default subobject
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GAS")
     TObjectPtr<UAbilitySystemComponent> AbilitySystemComponent;
 
-    // AttributeSet created as subobject of ASC's outer (PlayerState)
     UPROPERTY()
     TObjectPtr<UMyHealthSet> HealthSet;
 };
@@ -47,22 +47,20 @@ protected:
 ```cpp
 // MyPlayerState.cpp
 #include "MyPlayerState.h"
+#include "MyHealthSet.h"
 #include "AbilitySystemComponent.h"
-#include "Attributes/MyHealthSet.h"
 
 AMyPlayerState::AMyPlayerState()
 {
-    AbilitySystemComponent = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("ASC"));
-
-    // Mixed: owner/autonomous proxy gets full GE info; simulated proxies get minimal
+    AbilitySystemComponent = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("AbilitySystemComponent"));
     AbilitySystemComponent->SetIsReplicated(true);
     AbilitySystemComponent->SetReplicationMode(EGameplayEffectReplicationMode::Mixed);
 
-    // AttributeSet is a subobject of the PlayerState; ASC auto-discovers it
+    // Subobject attribute sets are discovered by the ASC automatically.
     HealthSet = CreateDefaultSubobject<UMyHealthSet>(TEXT("HealthSet"));
 
-    // PlayerState replication required
-    NetUpdateFrequency = 100.f;
+    // PlayerState replicates slowly by default; GAS wants it responsive.
+    SetNetUpdateFrequency(100.f);
 }
 
 UAbilitySystemComponent* AMyPlayerState::GetAbilitySystemComponent() const
@@ -71,126 +69,128 @@ UAbilitySystemComponent* AMyPlayerState::GetAbilitySystemComponent() const
 }
 ```
 
-### Character (Avatar)
+### Character (avatar)
 
 ```cpp
-// MyCharacter.h
+// MyPlayerCharacter.h
 #pragma once
+
 #include "GameFramework/Character.h"
 #include "AbilitySystemInterface.h"
-#include "MyCharacter.generated.h"
+#include "MyPlayerCharacter.generated.h"
+
+class UAbilitySystemComponent;
+class UGameplayAbility;
 
 UCLASS()
-class AMyCharacter : public ACharacter, public IAbilitySystemInterface
+class MYGAME_API AMyPlayerCharacter : public ACharacter, public IAbilitySystemInterface
 {
     GENERATED_BODY()
+
 public:
-    // Delegates to PlayerState's ASC
     virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
 
-    // Server: Called when controller possesses this pawn
     virtual void PossessedBy(AController* NewController) override;
-
-    // Client: Called when PlayerState replicates
     virtual void OnRep_PlayerState() override;
+
+protected:
+    UPROPERTY(EditDefaultsOnly, Category = "GAS")
+    TArray<TSubclassOf<UGameplayAbility>> DefaultAbilities;
 
 private:
     void InitGAS();
-    void GiveDefaultAbilities(); // Server only
+    void GiveDefaultAbilities();
 };
 ```
 
 ```cpp
-// MyCharacter.cpp
-#include "MyCharacter.h"
+// MyPlayerCharacter.cpp
+#include "MyPlayerCharacter.h"
 #include "MyPlayerState.h"
 #include "AbilitySystemComponent.h"
+#include "Abilities/GameplayAbility.h"
 
-UAbilitySystemComponent* AMyCharacter::GetAbilitySystemComponent() const
+UAbilitySystemComponent* AMyPlayerCharacter::GetAbilitySystemComponent() const
 {
     const AMyPlayerState* PS = GetPlayerState<AMyPlayerState>();
     return PS ? PS->GetAbilitySystemComponent() : nullptr;
 }
 
-void AMyCharacter::PossessedBy(AController* NewController)
+void AMyPlayerCharacter::PossessedBy(AController* NewController)
 {
     Super::PossessedBy(NewController);
     InitGAS();
-    GiveDefaultAbilities(); // Authority only, safe here
+    GiveDefaultAbilities();
 }
 
-void AMyCharacter::OnRep_PlayerState()
+void AMyPlayerCharacter::OnRep_PlayerState()
 {
     Super::OnRep_PlayerState();
-    InitGAS(); // Client side initialization
+    InitGAS();
 }
 
-void AMyCharacter::InitGAS()
+void AMyPlayerCharacter::InitGAS()
 {
     AMyPlayerState* PS = GetPlayerState<AMyPlayerState>();
-    if (!PS) return;
+    if (!PS)
+    {
+        return;
+    }
 
-    UAbilitySystemComponent* ASC = PS->GetAbilitySystemComponent();
-    if (!ASC) return;
-
-    // OwnerActor = who logically owns the ASC (PlayerState)
-    // AvatarActor = the physical actor in the world (Character)
-    ASC->InitAbilityActorInfo(PS, this);
+    if (UAbilitySystemComponent* ASC = PS->GetAbilitySystemComponent())
+    {
+        // OwnerActor = logical owner (PlayerState), AvatarActor = physical actor (Character).
+        ASC->InitAbilityActorInfo(PS, this);
+    }
 }
 
-void AMyCharacter::GiveDefaultAbilities()
+void AMyPlayerCharacter::GiveDefaultAbilities()
 {
-    if (!HasAuthority()) return;
+    if (!HasAuthority())
+    {
+        return;
+    }
 
     UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
-    if (!ASC) return;
+    if (!ASC)
+    {
+        return;
+    }
 
-    // Grant abilities from a data-driven list
     for (const TSubclassOf<UGameplayAbility>& AbilityClass : DefaultAbilities)
     {
-        FGameplayAbilitySpec Spec(AbilityClass, 1 /*Level*/);
-        ASC->GiveAbility(Spec);
+        ASC->GiveAbility(FGameplayAbilitySpec(AbilityClass, 1));
     }
 }
 ```
 
-### Respawn Handling
+### Respawn
 
-When the Pawn is destroyed and respawned, the new Pawn must re-init its actor info:
-
-```cpp
-void AMyGameMode::RespawnPlayer(AController* Controller)
-{
-    // Destroy old pawn, spawn new one at respawn location
-    APawn* OldPawn = Controller->GetPawn();
-    if (OldPawn) OldPawn->Destroy();
-
-    AMyCharacter* NewPawn = GetWorld()->SpawnActor<AMyCharacter>(
-        CharacterClass, RespawnTransform);
-    Controller->Possess(NewPawn);
-    // PossessedBy fires → InitGAS → InitAbilityActorInfo with old PlayerState ASC
-    // Active effects and cooldowns on the ASC survive the respawn
-}
-```
+The PlayerState-owned ASC is untouched by pawn destruction. The new pawn only has to re-run
+`InitAbilityActorInfo`, which `PossessedBy` already does. Do **not** re-grant startup abilities on
+respawn unless you also cleared them, or the character ends up with duplicate specs.
 
 ---
 
-## Pattern 2: ASC on Character (Single-Player / AI)
-
-Simpler setup. The ASC and AttributeSet both live on the Pawn. Use for AI actors or
-single-player games where persistence across respawns is not needed.
+## Pattern 2: ASC on the Pawn (AI, single-player)
 
 ```cpp
 // MyAICharacter.h
 #pragma once
+
 #include "GameFramework/Character.h"
 #include "AbilitySystemInterface.h"
 #include "MyAICharacter.generated.h"
 
+class UAbilitySystemComponent;
+class UGameplayAbility;
+class UMyHealthSet;
+
 UCLASS()
-class AMyAICharacter : public ACharacter, public IAbilitySystemInterface
+class MYGAME_API AMyAICharacter : public ACharacter, public IAbilitySystemInterface
 {
     GENERATED_BODY()
+
 public:
     AMyAICharacter();
 
@@ -203,20 +203,23 @@ protected:
 
     UPROPERTY()
     TObjectPtr<UMyHealthSet> HealthSet;
+
+    UPROPERTY(EditDefaultsOnly, Category = "GAS")
+    TArray<TSubclassOf<UGameplayAbility>> DefaultAbilities;
 };
 ```
 
 ```cpp
 // MyAICharacter.cpp
 #include "MyAICharacter.h"
+#include "MyHealthSet.h"
 #include "AbilitySystemComponent.h"
-#include "Attributes/MyHealthSet.h"
+#include "Abilities/GameplayAbility.h"
 
 AMyAICharacter::AMyAICharacter()
 {
-    AbilitySystemComponent = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("ASC"));
+    AbilitySystemComponent = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("AbilitySystemComponent"));
     AbilitySystemComponent->SetIsReplicated(true);
-    // Minimal: AI does not need full GE replication on simulated proxies
     AbilitySystemComponent->SetReplicationMode(EGameplayEffectReplicationMode::Minimal);
 
     HealthSet = CreateDefaultSubobject<UMyHealthSet>(TEXT("HealthSet"));
@@ -230,12 +233,12 @@ UAbilitySystemComponent* AMyAICharacter::GetAbilitySystemComponent() const
 void AMyAICharacter::BeginPlay()
 {
     Super::BeginPlay();
-    // For ASC on Pawn, OwnerActor == AvatarActor == this
+
+    // Owner and avatar are the same actor when the ASC lives on the pawn.
     AbilitySystemComponent->InitAbilityActorInfo(this, this);
 
     if (HasAuthority())
     {
-        // Grant AI abilities
         for (const TSubclassOf<UGameplayAbility>& AbilityClass : DefaultAbilities)
         {
             AbilitySystemComponent->GiveAbility(FGameplayAbilitySpec(AbilityClass, 1));
@@ -246,47 +249,109 @@ void AMyAICharacter::BeginPlay()
 
 ---
 
-## Attribute Initialization from CurveTable
+## AttributeSet implementation
 
-GAS supports initializing attributes from a `UCurveTable` for data-driven level scaling.
-Row format: `[GroupName].[AttributeSetName].[AttributeName]`
-
-Example rows:
-```
-Default.MyHealthSet.Health    | 100 | 150 | 200 | ...  (per level)
-Default.MyHealthSet.MaxHealth | 100 | 150 | 200 | ...
-Hero1.MyHealthSet.Health      |  80 | 120 | 160 | ...
-```
+The header form is in the skill's Attribute Sets section. This is the matching `.cpp`.
 
 ```cpp
-// Call after InitAbilityActorInfo, on server only:
-UAbilitySystemGlobals::Get().GetAttributeSetInitter()->InitAttributeSetDefaults(
-    AbilitySystemComponent,
-    FName("Default"), // GroupName matches CurveTable row prefix
-    PlayerLevel,
-    true /*bInitialInit*/);
+// MyHealthSet.cpp
+#include "MyHealthSet.h"
+#include "GameplayEffectExtension.h" // FGameplayEffectModCallbackData
+#include "Net/UnrealNetwork.h"
+
+UMyHealthSet::UMyHealthSet()
+{
+    InitMaxHealth(100.f);
+    InitHealth(100.f);
+}
+
+void UMyHealthSet::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+    DOREPLIFETIME_CONDITION_NOTIFY(UMyHealthSet, Health, COND_None, REPNOTIFY_Always);
+    DOREPLIFETIME_CONDITION_NOTIFY(UMyHealthSet, MaxHealth, COND_None, REPNOTIFY_Always);
+}
+
+void UMyHealthSet::OnRep_Health(const FGameplayAttributeData& OldHealth)
+{
+    GAMEPLAYATTRIBUTE_REPNOTIFY(UMyHealthSet, Health, OldHealth);
+}
+
+void UMyHealthSet::OnRep_MaxHealth(const FGameplayAttributeData& OldMaxHealth)
+{
+    GAMEPLAYATTRIBUTE_REPNOTIFY(UMyHealthSet, MaxHealth, OldMaxHealth);
+}
+
+// Clamp the CURRENT value. This runs on every aggregator recompute, so do nothing else here.
+void UMyHealthSet::PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue)
+{
+    Super::PreAttributeChange(Attribute, NewValue);
+
+    if (Attribute == GetMaxHealthAttribute())
+    {
+        NewValue = FMath::Max(NewValue, 1.f);
+    }
+}
+
+// React AFTER an instant or periodic GE wrote the base value: this is where death belongs.
+void UMyHealthSet::PostGameplayEffectExecute(const FGameplayEffectModCallbackData& Data)
+{
+    Super::PostGameplayEffectExecute(Data);
+
+    if (Data.EvaluatedData.Attribute == GetHealthAttribute())
+    {
+        SetHealth(FMath::Clamp(GetHealth(), 0.f, GetMaxHealth()));
+    }
+}
 ```
+
+`Data.EvaluatedData` is an `FGameplayModifierEvaluatedData` (attribute, `ModifierOp`, `Magnitude`);
+`Data.Target` is the target ASC and `Data.EffectSpec` the spec that caused the change.
 
 ---
 
-## Ability Spec Handle Tracking
+## Attribute initialization from a CurveTable
 
-Store handles to remove or modify abilities later:
+`FAttributeSetInitter::InitAttributeSetDefaults` fills every attribute from a `UCurveTable` whose
+row names follow `GroupName.AttributeSetName.AttributeName`, one column per level:
+
+```
+Default.MyHealthSet.Health
+Default.MyHealthSet.MaxHealth
+Hero1.MyHealthSet.Health
+```
 
 ```cpp
-// In a component or character header:
+#include "AbilitySystemGlobals.h"
+#include "AttributeSet.h"
+
+// Server only, after InitAbilityActorInfo:
+UAbilitySystemGlobals::Get().GetAttributeSetInitter()->InitAttributeSetDefaults(
+    AbilitySystemComponent, FName("Default"), PlayerLevel, true);
+```
+
+The table asset itself is registered in Project Settings (see `UGameplayAbilitiesDeveloperSettings`).
+Authoring the `UCurveTable` is covered by `ue-data-assets-tables`.
+
+---
+
+## Tracking granted ability handles
+
+```cpp
+// In the granting class:
 UPROPERTY()
 TArray<FGameplayAbilitySpecHandle> GrantedAbilityHandles;
+```
 
-// Granting:
-FGameplayAbilitySpecHandle Handle = AbilitySystemComponent->GiveAbility(
-    FGameplayAbilitySpec(UMyAbility::StaticClass(), 1));
+```cpp
+const FGameplayAbilitySpecHandle Handle =
+    AbilitySystemComponent->GiveAbility(FGameplayAbilitySpec(UMyFireballAbility::StaticClass(), 1));
 GrantedAbilityHandles.Add(Handle);
 
-// Removing a specific ability:
-AbilitySystemComponent->ClearAbility(GrantedAbilityHandles[0]);
+// Remove one, or all:
+AbilitySystemComponent->ClearAbility(Handle);
 
-// Removing all granted abilities:
 for (const FGameplayAbilitySpecHandle& H : GrantedAbilityHandles)
 {
     AbilitySystemComponent->ClearAbility(H);
@@ -294,76 +359,69 @@ for (const FGameplayAbilitySpecHandle& H : GrantedAbilityHandles)
 GrantedAbilityHandles.Empty();
 ```
 
+`GiveAbility` and `ClearAbility` are authority-only. `FGameplayAbilitySpec(Class, Level, InputID, SourceObject)`
+lets you stamp an input id and a source object onto the spec at grant time.
+
 ---
 
-## Tag Event Registration
+## Listening to tags and attributes
 
-Listen for gameplay tag additions/removals on the ASC:
+Tag events and attribute-change delegates are the two hooks a HUD or a controller normally needs.
 
 ```cpp
-void AMyCharacter::InitGAS()
+// MyCharacter.cpp — bind after InitAbilityActorInfo has run.
+void AMyCharacter::BindGASDelegates(UAbilitySystemComponent* ASC)
 {
-    // ... init actor info ...
-
-    // Register delegate for stunned state:
-    AbilitySystemComponent->RegisterGameplayTagEvent(
-        FGameplayTag::RequestGameplayTag("State.Stunned"),
+    StunnedTagDelegateHandle = ASC->RegisterGameplayTagEvent(
+        FGameplayTag::RequestGameplayTag(TEXT("State.Stunned")),
         EGameplayTagEventType::NewOrRemoved)
-        .AddUObject(this, &AMyCharacter::OnStunnedTagChanged);
-}
-
-void AMyCharacter::OnStunnedTagChanged(const FGameplayTag Tag, int32 NewCount)
-{
-    if (NewCount > 0)
-    {
-        // Stunned: disable movement, play stun animation
-    }
-    else
-    {
-        // No longer stunned: re-enable movement
-    }
-}
-```
-
----
-
-## Attribute Value Delegates
-
-React to attribute changes (e.g., update UI health bar):
-
-```cpp
-void UMyHealthWidget::BindToASC(UAbilitySystemComponent* ASC)
-{
-    if (!ASC) return;
+        .AddUObject(this, &AMyCharacter::HandleStunnedTagChanged);
 
     HealthChangedDelegateHandle = ASC->GetGameplayAttributeValueChangeDelegate(
         UMyHealthSet::GetHealthAttribute())
-        .AddUObject(this, &UMyHealthWidget::OnHealthChanged);
+        .AddUObject(this, &AMyCharacter::HandleHealthChanged);
 }
 
-void UMyHealthWidget::OnHealthChanged(const FOnAttributeChangeData& Data)
+void AMyCharacter::HandleStunnedTagChanged(const FGameplayTag Tag, int32 NewCount)
 {
-    UpdateHealthBar(Data.NewValue);
+    // NewCount > 0 means the tag is present.
 }
 
-void UMyHealthWidget::UnbindFromASC(UAbilitySystemComponent* ASC)
+void AMyCharacter::HandleHealthChanged(const FOnAttributeChangeData& Data)
 {
-    if (!ASC) return;
-    ASC->GetGameplayAttributeValueChangeDelegate(UMyHealthSet::GetHealthAttribute())
-        .Remove(HealthChangedDelegateHandle);
+    // Data.NewValue, Data.OldValue, Data.Attribute, Data.GEModData
 }
+```
+
+Both delegates are plain multicast delegates, so store the `FDelegateHandle` and call
+`.Remove(Handle)` on the same delegate when the listener goes away:
+
+```cpp
+ASC->GetGameplayAttributeValueChangeDelegate(UMyHealthSet::GetHealthAttribute())
+    .Remove(HealthChangedDelegateHandle);
+```
+
+Declare the handles and the callbacks in the owning class:
+
+```cpp
+FDelegateHandle StunnedTagDelegateHandle;
+FDelegateHandle HealthChangedDelegateHandle;
+
+void BindGASDelegates(UAbilitySystemComponent* ASC);
+void HandleStunnedTagChanged(const FGameplayTag Tag, int32 NewCount);
+void HandleHealthChanged(const FOnAttributeChangeData& Data);
 ```
 
 ---
 
-## Replication Mode Summary
+## Replication mode summary
 
-| Mode | GE Replication | Tag Replication | Use Case |
-|------|----------------|-----------------|----------|
-| `Minimal` | None to simulated | Minimal tags only | AI, non-player actors |
-| `Mixed` | Full to owner/autonomous, minimal to simulated | Full | Player-controlled characters |
-| `Full` | Full to everyone | Full | Single-player or small games |
+| Mode | GEs to simulated proxies | Typical owner |
+|---|---|---|
+| `Minimal` | None; minimal tag and cue data only | AI, non-player actors |
+| `Mixed` | Full to the owning connection, minimal to the rest | Player character with a PlayerState-owned ASC |
+| `Full` | Full to everyone | Single-player, or small sessions where fidelity beats bandwidth |
 
-**Critical:** `Mixed` mode requires the ASC owner to be the PlayerState (or any actor
-not the Pawn). If the ASC is on the Pawn with `Mixed` mode, tag replication to simulated
-proxies will not work correctly. Use `Full` if ASC must be on the Pawn in multiplayer.
+`Mixed` finds the owning connection through the ASC's owner actor (`GameplayEffect.cpp:5240`).
+A possessed pawn is owned by its PlayerController, so a pawn-owned player ASC works with `Mixed` too;
+use `Full` only when simulated proxies need full GE data. AI ASCs use `Minimal`.

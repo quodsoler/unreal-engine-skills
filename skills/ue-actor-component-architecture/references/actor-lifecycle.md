@@ -1,179 +1,97 @@
-# Actor Lifecycle Reference
+# Actor Lifecycle Reference (UE 5.8)
 
-Full event ordering for `AActor` from spawn through destruction, with component events interleaved, network notes, and what is safe to do at each stage.
+Event order for `AActor` and `UActorComponent` from spawn or level load through destruction, with the header line that backs each claim. Source of truth: the `AActor` class comment at `Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h:243-278` plus the declarations cited below (`Actor.h`, `Components/ActorComponent.h`, `Engine/EngineTypes.h`, `Engine/EngineBaseTypes.h`, `Engine/World.h`).
 
-Source of truth: `Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h` — the class-level Doxygen block starting at line 222 documents the authoritative order of initialization virtual functions.
+## Initialization order
 
----
+| # | Hook (verbatim declaration) | Declared at | Fires |
+|---|---|---|---|
+| 1 | `AActor()` | `Actor.h:288` | On the Class Default Object and on every instance. No world, no other actors. `CreateDefaultSubobject`, `SetRootComponent`, `PrimaryActorTick` config, default values. |
+| 2 | `virtual void PostLoad() override` | `Actor.h:2348` | Actors statically placed in a level, in editor and gameplay. Not called for newly spawned actors. |
+| 3 | `virtual void OnComponentCreated()` (component) | `ActorComponent.h:1331` | Native components when the actor is spawned in editor or gameplay; Blueprint-created components during construction. Not for components loaded from a level. |
+| 4 | `virtual void PreRegisterAllComponents()` | `Actor.h:3232` | Level-placed actors and spawned actors with a native root component; Blueprint actors without a native root get registration later, during construction. |
+| 5 | `void RegisterComponent()` → `virtual void OnRegister()` (component) | `ActorComponent.h:1322`, `:830` | Every component, editor and runtime. Creates render and physics state. May be spread over several frames, always after `PreRegisterAllComponents`. Fires again after `UnregisterComponent()` + re-register. |
+| 6 | `virtual void PostRegisterAllComponents()` | `Actor.h:3238` | All actors, editor and gameplay. |
+| 7 | `virtual void PostActorCreated()` | `Actor.h:2937` | Spawned actors only (editor or gameplay), before construction scripts and after native components exist. Location and rotation are already set when there is a root component. |
+| 8 | `void UserConstructionScript()` | `Actor.h:2318` | Blueprint construction script. |
+| 9 | `virtual void OnConstruction(const FTransform& Transform)` | `Actor.h:3445` | End of `ExecuteConstruction`, after all Blueprint-created components are created and registered. Gameplay: spawned actors only. Editor: re-runs when the Blueprint changes. |
+| 10 | `virtual void PreInitializeComponents()` | `Actor.h:3124` | Gameplay (and some editor previews) only, before `InitializeComponent` on any component. |
+| 11 | `virtual void Activate(bool bReset = false)` (component) | `ActorComponent.h:580` | Components with `bAutoActivate` (`:317`) set; also on any later manual activation. |
+| 12 | `virtual void InitializeComponent()` (component) | `ActorComponent.h:919` | Components with `bWantsInitializeComponent` (`:340`) set; once per gameplay session. |
+| 13 | `virtual void PostInitializeComponents()` | `Actor.h:3127` | Gameplay and some editor previews. All components initialized; world available. |
+| 14 | `virtual void BeginPlay()`; components: `virtual void BeginPlay()` | `Actor.h:2125`; `ActorComponent.h:936` | When the level starts ticking, gameplay only. Normally right after `PostInitializeComponents`, "but can be delayed for networked or child actors" (`Actor.h:275`). |
 
-## Complete Lifecycle Diagram
+`PostInitProperties()` (`Actor.h:2343`) is the `UObject` hook that runs after the constructor and property initialization, on the CDO as well; keep it for property fix-ups that do not need the world.
 
-```
-  SPAWN / LEVEL LOAD
-  ──────────────────────────────────────────────────────────────────────────
-  AActor::AActor()
-    Called on the Class Default Object (CDO) and on every instance.
-    World = nullptr. No other actors are accessible.
-    ┌─ CreateDefaultSubobject<T>()           OK: creates owned components
-    ├─ SetRootComponent()                    OK: sets hierarchy root
-    ├─ PrimaryActorTick.*                    OK: configure tick
-    └─ Default UPROPERTY values              OK
+## Play
 
-  [Statically placed actors only — loaded from level file]
-  UObject::PostLoad()
-    Normal UObject serialization. Called in editor and during gameplay for
-    map-placed actors. NOT called for freshly spawned actors.
+| Hook | Declared at | Notes |
+|---|---|---|
+| `virtual void Tick(float DeltaSeconds)` | `Actor.h:3060` | Only when `PrimaryActorTick.bCanEverTick` (`Actor.h:3056` comment). Enabled state via `SetActorTickEnabled(bool)` / `IsActorTickEnabled()` (`:2898, :2902`); rate via `SetActorTickInterval(float)` (`:2909`). |
+| `virtual void TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)` | `ActorComponent.h:976` | Requires registration and `PrimaryComponentTick.bCanEverTick` (`:970` comment). `SetComponentTickEnabled(bool)` (`:1002`). |
+| `virtual void AsyncPhysicsTickActor(float DeltaTime, float SimTime)` | `Actor.h:2930` | Fixed-step physics callback when `bAsyncPhysicsTickEnabled` (`Actor.h:699`). Owned by `ue-physics-collision`. |
+| `bool HasActorBegunPlay() const`, `bool IsActorInitialized() const` | `Actor.h:2145, :2139` | State queries. |
 
-  UActorComponent::OnComponentCreated()
-    Called for native (C++) components when the actor is spawned in editor
-    or gameplay. Not called for components loaded from a saved level.
+## Termination
 
-  AActor::PreRegisterAllComponents()
-    For actors that have a native root component. Components are about to
-    be registered with the world scene.
+Explicit destruction: `bool Destroy(bool bNetForce = false, bool bShouldModifyLevel = true)` (`Actor.h:2327`) leads to `virtual void Destroyed()` (`Actor.h:3569`, "called when this actor is explicitly being destroyed during gameplay or in the editor, not called during level streaming or gameplay ending"). `AActor::Destroyed()` runs `RouteEndPlay(EEndPlayReason::Destroyed)`, then the Blueprint `ReceiveDestroyed()` event and the `OnDestroyed` delegate (`Actor.cpp:3311-3316`).
 
-  UActorComponent::RegisterComponent()       [once per component]
-    Creates the physical and visual representation of each component
-    in the world (render proxy, physics body). May be spread across frames
-    for large levels.
+`virtual void EndPlay(const EEndPlayReason::Type EndPlayReason)` (`Actor.h:2132`) runs for every reason below. The base implementation calls `EndPlay(EndPlayReason)` on each component that has begun play (`Actor.cpp:3277-3281`), so a missing `Super::EndPlay` skips component cleanup; `RouteEndPlay` ensures against exactly that (`Actor.cpp:3229-3230`). Component teardown continues with `virtual void UninitializeComponent()` (`ActorComponent.h:955`), `virtual void OnUnregister()` (`:835`) and `virtual void OnComponentDestroyed(bool bDestroyingHierarchy)` (`:1338`).
 
-  AActor::PostRegisterAllComponents()
-    All components are now registered. Called in editor and gameplay.
-    Last function called in all initialization paths.
+Delegates: `OnEndPlay` (`FActorEndPlaySignature`, `Actor.h:208, :2339`) and `OnDestroyed` (`FActorDestroyedSignature`, `Actor.h:207, :2335`).
 
-  [Spawned actors only — NOT level-placed]
-  AActor::PostActorCreated()
-    Called right before construction (UserConstructionScript / OnConstruction).
-    Not called for level-placed actors.
-
-  AActor::UserConstructionScript()
-    Blueprint construction script executes here.
-
-  AActor::OnConstruction()
-    C++ hook called at end of ExecuteConstruction (after Blueprint CS).
-    All Blueprint-created components are fully created and registered at
-    this point. In gameplay, only called for spawned actors.
-    Can be re-run in editor when Blueprint is recompiled.
-
-  ──────────────────────────────────────────────────────────────────────────
-  GAMEPLAY INITIALIZATION  (not in editor CDO pass)
-  ──────────────────────────────────────────────────────────────────────────
-  AActor::PreInitializeComponents()
-    Called before InitializeComponent on any component. Override to do
-    pre-init setup that doesn't belong in the constructor.
-
-  UActorComponent::Activate()                [if bAutoActivate == true]
-    Component self-activates during the init sequence.
-
-  UActorComponent::InitializeComponent()     [if bWantsInitializeComponent == true]
-    Called once per gameplay session per component. Override to do
-    one-time setup that requires the world to exist.
-
-  AActor::PostInitializeComponents()
-    All components have been initialized. World exists. Other actors that
-    were in the level at load time are accessible.
-    ┌─ Safe: bind delegates to own components
-    ├─ Safe: read/write component state
-    ├─ Safe: access GetWorld()
-    └─ NOT safe: assume BeginPlay-dependent state in other actors
-
-  ──────────────────────────────────────────────────────────────────────────
-  PLAY  (level has started ticking)
-  ──────────────────────────────────────────────────────────────────────────
-  AActor::BeginPlay()
-    ├─ UActorComponent::BeginPlay()          [each component, in order]
-    │    Begins play for each registered, initialized component.
-    │    Component BeginPlay runs BEFORE Actor BeginPlay completes
-    │    if called from within AActor::BeginPlay via Super chain.
-    └─ Full game state is accessible here
-
-  AActor::Tick(float DeltaTime)              [every frame, if bCanEverTick]
-    ├─ UActorComponent::TickComponent()      [each ticking component]
-    └─ Tick groups control ordering (see tick group table below)
-
-  ──────────────────────────────────────────────────────────────────────────
-  TERMINATION
-  ──────────────────────────────────────────────────────────────────────────
-  AActor::EndPlay(EEndPlayReason::Type)
-    ├─ UActorComponent::EndPlay()            [each component]
-    └─ UActorComponent::UninitializeComponent()
-
-  AActor::Destroyed()
-    Called when the actor is being deleted. Avoid complex logic here.
-    The actor is about to be handed to the garbage collector.
-
-  [GC pass — memory freed]
-```
-
----
-
-## EEndPlayReason Values
-
-Declared in `Engine/EngineTypes.h`:
+### `EEndPlayReason` (`Engine/EngineTypes.h:3670-3685`)
 
 ```cpp
 namespace EEndPlayReason
 {
     enum Type : int
     {
-        Destroyed,          // Actor::Destroy() was called explicitly
-        LevelTransition,    // A level transition (map change) is occurring
-        EndPlayInEditor,    // PIE session ended in the editor
-        RemovedFromWorld,   // Level streaming unloaded the actor's sublevel
-        Quit,               // The game application is shutting down
+        Destroyed,          // the Actor or Component is explicitly destroyed
+        LevelTransition,    // the world is being unloaded for a level transition
+        EndPlayInEditor,    // the world is being unloaded because PIE is ending
+        RemovedFromWorld,   // the level it is a member of is streamed out
+        Quit,               // the application is being exited
     };
 }
 ```
 
-### Decision matrix for EndPlay cleanup
-
-| EndPlayReason | Play effects? | Save state? | Release resources? |
+| Reason | Play effects? | Persist state? | Release resources, clear timers, unbind delegates? |
 |---|---|---|---|
-| `Destroyed` | Yes (optional) | If persistent | Yes |
+| `Destroyed` | Optional | If the object is persistent | Yes |
 | `LevelTransition` | No | If needed | Yes |
 | `EndPlayInEditor` | No | No | Yes |
 | `RemovedFromWorld` | No | If needed | Yes |
 | `Quit` | No | If needed | Yes |
 
-Always clear timers in EndPlay regardless of reason:
-
 ```cpp
 void AMyActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-    GetWorld()->GetTimerManager().ClearAllTimersForObject(this);
-    Super::EndPlay(EndPlayReason); // Required
+    GetWorldTimerManager().ClearAllTimersForObject(this);   // Actor.h:3769, TimerManager.h
+    Super::EndPlay(EndPlayReason);                          // forwards EndPlay to components
 }
 ```
 
----
+## Tick functions and groups
 
-## Tick Group Ordering
+`FTickFunction` (`Engine/EngineBaseTypes.h:183`): `TickGroup` (`:196`), `EndTickGroup` (`:204`), `bTickEvenWhenPaused` (`:209`), `bCanEverTick` (`:213`), `bStartWithTickEnabled` (`:217`), `bAllowTickOnDedicatedServer` (`:221`), `bHighPriority` (`:227`), `bRunOnAnyThread` (`:230`), `TickInterval` (`:258`); `SetTickFunctionEnable(bool bInEnabled)` (`:364`), `AddPrerequisite(UObject* TargetObject, struct FTickFunction& TargetTickFunction)` (`:426`). Subtypes `FActorTickFunction` (`:566`) and `FActorComponentTickFunction` (`:612`).
 
-Tick groups are defined in `Engine/Source/Runtime/Engine/Classes/Engine/EngineBaseTypes.h`:
+`ETickingGroup` (`Engine/EngineBaseTypes.h:83-109`):
 
 ```
 Frame start
-  │
-  ├─ TG_PrePhysics       (default for actors and components)
-  │    Input processing, movement requests, AI decisions
-  │
-  ├─ TG_StartPhysics     (internal — physics simulation begins)
-  │
-  ├─ TG_DuringPhysics    (async; runs while physics is simulating)
-  │    Read-only queries on physics state from previous frame
-  │
-  ├─ TG_EndPhysics       (physics simulation completes)
-  │    First point where this frame's physics results are readable
-  │
-  ├─ TG_PostPhysics      (after physics settles)
-  │    Spring arm, camera follow, IK solvers, cloth, ragdoll read
-  │
-  └─ TG_PostUpdateWork   (last tick group)
-       Final state queries, rendering preparation
+  ├─ TG_PrePhysics       default; input, movement requests, AI decisions
+  ├─ TG_StartPhysics     UMETA(Hidden): engine starts the physics step
+  ├─ TG_DuringPhysics    runs while physics simulates; do not read this frame's physics results
+  ├─ TG_EndPhysics       UMETA(Hidden): engine finishes the physics step
+  ├─ TG_PostPhysics      camera, IK, cloth, anything reading final physics transforms
+  ├─ TG_PostUpdateWork   last gameplay group
+  ├─ TG_LastDemotable    UMETA(Hidden): engine-internal
+  └─ TG_NewlySpawned     UMETA(Hidden): engine-internal (actors spawned mid-frame)
 Frame end
 ```
 
-Setting the tick group:
+`ELevelTick` (`EngineBaseTypes.h:69-78`): `LEVELTICK_TimeOnly`, `LEVELTICK_ViewportsOnly`, `LEVELTICK_All`, `LEVELTICK_PauseTick`; passed to `TickComponent` as `TickType`.
 
 ```cpp
 AMyActor::AMyActor()
@@ -185,117 +103,102 @@ AMyActor::AMyActor()
 UMyComponent::UMyComponent()
 {
     PrimaryComponentTick.bCanEverTick = true;
-    PrimaryComponentTick.TickGroup = TG_PostPhysics;
+    PrimaryComponentTick.TickGroup = TG_PostPhysics;     // or SetTickGroup(TG_PostPhysics) at runtime (ActorComponent.h:1351)
 }
 ```
 
----
+Cross-object ordering: `AddTickPrerequisiteActor(AActor* PrerequisiteActor)` / `AddTickPrerequisiteComponent(UActorComponent* PrerequisiteComponent)` (`Actor.h:2093, :2097`; `ActorComponent.h:1355, :1359`) and the matching `RemoveTickPrerequisite*` (`Actor.h:2101`; `ActorComponent.h:1363, :1367`).
 
-## Network Lifecycle Differences
+## Network timing
 
-For replicated actors, the lifecycle deviates from the single-player sequence.
+The single-player order holds on the server. On clients:
 
-### Server (authority)
+| Hook | Declared at | Header comment |
+|---|---|---|
+| `virtual void PreNetReceive() override` | `Actor.h:2943` | "Always called immediately before properties are received from the remote." |
+| `virtual void PostNetReceive() override` | `Actor.h:2946` | "Always called immediately after properties are received from the remote." Fires on every property batch, not only the first. |
+| `virtual void PostNetReceiveRole()` | `Actor.h:2949` | "Always called immediately after a new Role is received from the remote." |
+| `virtual void PostNetInit()` | `Actor.h:2958` | "Always called immediately after spawning and reading in replicated properties." One-time client-side init hook. |
+| `virtual void OnRep_ReplicatedMovement()`, `OnRep_Owner()`, `OnRep_Instigator()`, `OnRep_AttachmentReplication()` | `Actor.h:2962, :600, :1015, :859` | Engine `OnRep_` notifies you may override (call `Super`). |
+| `BeginPlay()` | `Actor.h:275` comment | "Can be delayed for networked or child actors." |
 
-The server runs the complete lifecycle described above. `BeginPlay` is called normally.
+Do not assume client `BeginPlay` sees the same initial property values as the server did; initialize from `OnRep_` functions or `PostNetInit` when the logic depends on replicated state. Actor replication is enabled with `SetReplicates(bool bInReplicates)` (`Actor.h:759`; `bReplicates` is protected at `:587-593`), component replication with `SetIsReplicated(bool ShouldReplicate)` (`ActorComponent.h:634`; `bReplicates` is private at `:264-267`) or `SetIsReplicatedByDefault(const bool bNewReplicates)` in the constructor (`:1471`). Property rules, `DOREPLIFETIME`, RPCs and Iris are owned by `ue-networking-replication`.
 
-### Client (simulated proxy)
+## Deferred spawn sequence
 
-1. Actor data is received from the server over the network.
-2. The actor is created locally by the net driver.
-3. **`PostNetReceive`** is called after properties are received.
-4. **`OnRep_*` functions** are called for `UPROPERTY(ReplicatedUsing=...)` fields.
-5. **`BeginPlay` is called**, but timing is determined by the network — it may be delayed compared to the server, and happens after the actor's initial replicated state is applied.
-
-Key consequence: never assume that `BeginPlay` on the client sees the same initial property values as the server's `BeginPlay`. The server may have changed properties after initial spawn before the client even received the actor.
-
-### Replicated actor spawn sequence (client side)
-
-```
-Net driver receives actor channel data
-  → UActorComponent::OnComponentCreated() [native components]
-  → AActor::PostActorCreated()
-  → AActor::PostInitializeComponents()
-  → PostNetReceive() / OnRep_* calls for initial property batch
-  → AActor::BeginPlay()
-```
-
-### Child actors in multiplayer
-
-`UChildActorComponent` actors have their `BeginPlay` delayed until after their parent actor's `BeginPlay` in some cases. Do not assume a child actor is BegunPlay when the parent is in `PostInitializeComponents`.
-
----
-
-## Deferred Spawn Sequence
-
-`SpawnActorDeferred` pauses the lifecycle between construction and initialization, giving you a window to configure the actor before `BeginPlay` fires.
+`UWorld::SpawnActorDeferred<T>(UClass* Class, FTransform const& Transform, AActor* Owner = nullptr, APawn* Instigator = nullptr, ESpawnActorCollisionHandlingMethod CollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::Undefined, ESpawnActorScaleMethod TransformScaleMethod = ESpawnActorScaleMethod::MultiplyWithRoot)` (`World.h:3851-3870`) fills an `FActorSpawnParameters` with `bDeferConstruction = true` and calls `SpawnActor(Class, &Transform, SpawnInfo)`.
 
 ```
-SpawnActorDeferred<T>() called
-  → AActor::AActor()                  Constructor runs
-  → CreateDefaultSubobject calls      Components created
-  → AActor::PostActorCreated()        Normal post-construction hook
+SpawnActorDeferred<T>()
+  → AActor::AActor()                         constructor, CreateDefaultSubobject calls
+  → AActor::PostActorCreated()               Actor.h:2937
+  [construction deferred: OnConstruction has NOT run, BeginPlay has NOT run]
+  [set properties on the actor here]
 
-  [Actor exists but is NOT initialized — BeginPlay has NOT fired]
-  [Window: set properties on the actor here]
-
-Actor->FinishSpawning(Transform)
-  → AActor::OnConstruction()
-  → AActor::PreInitializeComponents()
-  → UActorComponent::InitializeComponent()
-  → AActor::PostInitializeComponents()
-  → AActor::BeginPlay()               Now fires
+Actor->FinishSpawning(Transform)             Actor.h:3117
+  → UserConstructionScript / OnConstruction(const FTransform&)
+  → PreInitializeComponents → InitializeComponent (per component) → PostInitializeComponents
+  → BeginPlay                                if the world has begun play
 ```
 
-This pattern is essential when:
-- The actor's `BeginPlay` reads configuration data that must be set before it runs
-- You are spawning from a DataAsset or configuration object
-- You need to prevent BeginPlay side effects (spawning sub-actors, playing audio) until fully configured
+`FinishSpawning(const FTransform& Transform, bool bIsDefaultTransform = false, const FComponentInstanceDataCache* InstanceDataCache = nullptr, ESpawnActorScaleMethod TransformScaleMethod = ESpawnActorScaleMethod::OverrideRootScale)` (`Actor.h:3117`). `bHasFinishedSpawning` (`Actor.h:632-633`): "If it has not, the Actor is in a malformed state." The Blueprint-callable twin is `UGameplayStatics::FinishSpawningActor(AActor* Actor, const FTransform& SpawnTransform, ESpawnActorScaleMethod TransformScaleMethod = ESpawnActorScaleMethod::MultiplyWithRoot)` (`Kismet/GameplayStatics.h:71`). Note the three different scale defaults (`MultiplyWithRoot` for the spawn templates and the Kismet helper, `OverrideRootScale` for `AActor::FinishSpawning`); pass the method explicitly when the root has a non-unit default scale.
 
----
+`ESpawnActorScaleMethod` (`Actor.h:87-94`): `OverrideRootScale`, `MultiplyWithRoot`, `SelectDefaultAtRuntime` (hidden).
 
-## Component Lifecycle Within an Actor
+## Child actors
 
-Each `UActorComponent` has its own parallel lifecycle that mirrors the actor's:
+`UChildActorComponent` (`Components/ChildActorComponent.h:84`, derives `USceneComponent`) spawns and owns a nested actor at the component transform.
+
+| Member | Line |
+|---|---|
+| `void SetChildActorClass(TSubclassOf<AActor> InClass)` / `void SetChildActorClass(TSubclassOf<AActor> InClass, AActor* NewChildActorTemplate)` | `:95, :110` |
+| `TSubclassOf<AActor> GetChildActorClass() const` | `:112` |
+| `AActor* GetChildActor() const`, `AActor* GetChildActorTemplate() const` | `:216, :217` |
+| `virtual void CreateChildActor(TFunction<void(AActor*)> CustomizerFunc = nullptr)`, `void DestroyChildActor()` | `:211, :227` |
+| `FOnChildActorCreated& OnChildActorCreated()` | `:214` |
+| Overrides: `OnRegister`, `OnUnregister`, `BeginPlay`, `OnComponentDestroyed(bool)` | `:196-200` |
+
+From the child's side: `bool IsChildActor() const` (`Actor.h:3185`), `UChildActorComponent* GetParentComponent() const` (`:3222`), `AActor* GetParentActor() const` (`:3226`). Child-actor `BeginPlay` "can be delayed" (`Actor.h:275`); read `GetChildActor()` from the parent's `BeginPlay` or later, not from `PostInitializeComponents`.
+
+## Component lifecycle inside an actor
 
 ```
-UActorComponent constructed (via CreateDefaultSubobject or NewObject)
-  → OnComponentCreated()          [first time, not on level-placed actors]
-  → RegisterComponent()           [gets world presence]
-  → OnRegister()                  [scene is set; before render/physics state]
-  → CreateRenderState_Concurrent() [render proxy created]
-  → OnCreatePhysicsState()        [physics body created]
-  → InitializeComponent()         [if bWantsInitializeComponent]
-  → Activate()                    [if bAutoActivate]
-  → BeginPlay()
+CreateDefaultSubobject<T>(FName) / NewObject<T>(Owner, FName)     Object.h:151, UObjectGlobals.h:1973
+  → OnComponentCreated()                 ActorComponent.h:1331   native components on spawn
+  → RegisterComponent()                  :1322                   (or automatic for default subobjects)
+  → OnRegister()                         :830
+  → CreateRenderState_Concurrent(FRegisterComponentContext* Context)   :850   if ShouldCreateRenderState()
+  → OnCreatePhysicsState()               :871                    if ShouldCreatePhysicsState()
+  → Activate(bool bReset = false)        :580                    if bAutoActivate
+  → InitializeComponent()                :919                    if bWantsInitializeComponent
+  → BeginPlay()                          :936
+  → TickComponent(...)                   :976                    every frame while ticking
 
-  → TickComponent()               [every frame if ticking]
-
-  → EndPlay()
-  → UninitializeComponent()
-  → OnUnregister()
-  → DestroyRenderState_Concurrent()
-  → OnDestroyPhysicsState()
-  → DestroyComponent()            [marks for GC]
+  → EndPlay(const EEndPlayReason::Type)  :949
+  → UninitializeComponent()              :955
+  → OnUnregister()                       :835
+  → DestroyRenderState_Concurrent()      :868
+  → OnDestroyPhysicsState()              :874
+  → DestroyComponent(bool bPromoteChildren = false)   :1328
+  → OnComponentDestroyed(bool bDestroyingHierarchy)   :1338
 ```
 
-`bHasBegunPlay`, `bHasBeenInitialized`, `bHasBeenCreated` are the runtime flags you can check on a `UActorComponent` instance to know where it is in this sequence.
+State queries (the bit fields behind them are private, `ActorComponent.h:357-371`): `HasBeenCreated()` (`:505`), `HasBeenInitialized()` (`:508`), `HasBegunPlay()` (`:514`), `IsBeingDestroyed()` (`:520`), `IsRegistered()` (`:1316`), `IsActive()` (`:607`), `IsRenderStateCreated()` (`:1172`), `IsPhysicsStateCreated()` (`:1184`).
 
----
+Re-creating state without destroying the component: `ReregisterComponent()` (`:1347`), `RecreateRenderState_Concurrent()` (`:1166`), `RecreatePhysicsState()` (`:1169`), `MarkRenderStateDirty()` (`:1128`).
 
-## What Is Safe At Each Stage
+How a component came to exist: `EComponentCreationMethod CreationMethod` (`ActorComponent.h:431`) with values `Native`, `SimpleConstructionScript`, `UserConstructionScript`, `Instance` (`Engine/Public/ComponentInstanceDataCache.h:28-34`); helper `bool IsCreatedByConstructionScript() const` (`:526`). Components you add with `NewObject` + `RegisterComponent` + `AActor::AddInstanceComponent(UActorComponent* Component)` (`Actor.h:4348`) land in `InstanceComponents` (`Actor.h:4340`).
 
-| Stage | GetWorld() | Other Actors | Own Components | Game State |
+## What is safe at each stage
+
+| Stage | `GetWorld()` | Other actors | Own components | Typical work |
 |---|---|---|---|---|
-| Constructor | No (nullptr on CDO) | No | Create only | No |
-| PostLoad | Yes (editor/runtime) | No | Read only | No |
-| OnComponentCreated | No | No | Yes | No |
-| RegisterComponent | No | No | Yes | No |
-| PostActorCreated | Yes | Limited | Yes | No |
-| OnConstruction | Yes | Limited | Yes | No |
-| PreInitializeComponents | Yes | Yes | Yes | Partial |
-| PostInitializeComponents | Yes | Yes | Yes | Partial |
-| BeginPlay | Yes | Yes | Yes | Yes |
-| Tick | Yes | Yes | Yes | Yes |
-| EndPlay | Yes | Carefully | Yes | Shutting down |
-| Destroyed | Yes | No | Partial | No |
+| Constructor | `nullptr` on the CDO | No | Create only (`CreateDefaultSubobject`, `SetupAttachment`) | Defaults, tick config |
+| `PostLoad` | Yes | No | Read | Data fix-ups for level-placed actors |
+| `PostActorCreated` / `OnConstruction` | Yes | Not guaranteed initialized | Yes, including Blueprint-created ones in `OnConstruction` | Procedural component setup that must re-run in the editor |
+| `PreInitializeComponents` | Yes | Not guaranteed initialized | Created, not yet initialized | Pre-init setup that cannot live in the constructor |
+| `PostInitializeComponents` | Yes | Level-load actors exist; do not assume their `BeginPlay` ran | Initialized | Bind to own components |
+| `BeginPlay` | Yes | Yes | Yes | Gameplay logic, spawning, timers |
+| `Tick` | Yes | Yes | Yes | Per-frame only |
+| `EndPlay` | Yes | May already be ending | Yes | Clear timers, unbind, save |
+| `Destroyed` | Yes | Avoid | Partially torn down | Minimal |

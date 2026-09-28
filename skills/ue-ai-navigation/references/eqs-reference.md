@@ -1,423 +1,360 @@
 # EQS Reference
 
-Environment Query System (EQS) generator and test configurations for common AI spatial reasoning tasks.
+Environment Query System generators, tests and query recipes for UE 5.8. Property names are taken from `Engine/Source/Runtime/AIModule/Classes/EnvironmentQuery`; the editor shows the same names.
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-UEnvQuery (Data Asset)
-  └── Options (array of UEnvQueryOption)
-        ├── Generator — produces candidate items (locations or actors)
-        └── Tests (array) — filter and score items
-              ├── Filter: Discard items that fail the condition
-              └── Score: Weight items by test result
+UEnvQuery (data asset)
+  └── Options (UEnvQueryOption)
+        ├── Generator (UEnvQueryGenerator) — produces candidate items (locations or actors)
+        └── Tests (UEnvQueryTest array) — filter and/or score the items
 ```
 
-Key classes:
-- `UEnvQuery` — the query asset (inherits `UDataAsset`)
-- `UEnvQueryManager` — subsystem that executes queries
-- `FEnvQueryResult` — results: `GetItemAsLocation(0)`, `GetItemAsActor(0)`, `GetRawStatusDesc()`
-- `UEnvQueryContext_Querier` — built-in context: the AI pawn running the query
-- `UEnvQueryContext_Item` — built-in context: each candidate item (used in item-relative tests)
+| Type | Role |
+|---|---|
+| `UEnvQuery` | the query asset |
+| `UEnvQueryManager` | AI subsystem (`UAISubsystem`, `EnvQueryManager.h:207`) that runs queries (`GetCurrent`, `RunQuery`, `RunInstantQuery`, `RunEQSQuery`) |
+| `FEnvQueryRequest` | one request: template + owner + named params |
+| `FEnvQueryResult` | `Items`, `GetItemAsLocation(int32)`, `GetItemAsActor(int32)`, `GetItemScore(int32)`, `IsSuccessful()`, `IsAborted()` |
+| `UEnvQueryContext_Querier` | built-in context: the querier |
+| `UEnvQueryContext_Item` | built-in context: the item under test |
+| `UEnvQueryContext_NavigationData` | built-in context: the nav data to use |
+| `UEnvQueryItemType_Point` / `UEnvQueryItemType_Actor` | item payload types, each with `SetContextHelper` |
+
+Most numeric generator and test properties are `FAIDataProviderFloatValue` / `FAIDataProviderIntValue` / `FAIDataProviderBoolValue`, so each can be a constant or driven by a named query parameter set through `FEnvQueryRequest::SetFloatParam` / `SetIntParam` / `SetBoolParam`.
 
 ---
 
 ## Generators
 
-### SimpleGrid (Point Grid)
+### `UEnvQueryGenerator_SimpleGrid`
 
-Generates a uniform grid of points on the NavMesh around a center context.
+Uniform grid of points projected onto the navmesh.
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `GridHalfSize` | Float | Half extent of the grid (cm). 500 = 10x10 at 100cm spacing |
-| `SpaceBetween` | Float | Spacing between points (cm) |
-| `GenerateAroundActor` | Context | Usually `EnvQueryContext_Querier` |
-| `ProjectDown` | Float | How far down to project onto NavMesh |
+| Property | Type | Notes |
+|---|---|---|
+| `GridSize` | Float provider | Full extent of the grid in cm |
+| `SpaceBetween` | Float provider | Spacing between points in cm |
+| `GenerateAround` | Context class | Usually `UEnvQueryContext_Querier` |
 
-Practical settings for cover search (nearby): `GridHalfSize=800, SpaceBetween=150`
-Practical settings for patrol (wide area): `GridHalfSize=2000, SpaceBetween=300`
+Cover search: `GridSize=1600, SpaceBetween=150`. Wide patrol search: `GridSize=4000, SpaceBetween=300`. Item count grows with the square of `GridSize / SpaceBetween` — this is the single biggest EQS cost lever.
 
-### Ring (DonutAroundActor)
+### `UEnvQueryGenerator_Donut`
 
-Generates points on a ring/annulus around a context at a specified radius range.
+Concentric rings (an annulus), optionally restricted to an arc.
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `Center` | Context | Center of ring (e.g., `EnvQueryContext_Querier`) |
-| `Radius` | Float | Ring radius (cm) |
-| `ItemSpacing` | Float | Angular spacing between ring points |
-| `ArcDirection` | Direction | Optional: restrict to a forward arc |
+| Property | Type | Notes |
+|---|---|---|
+| `Center` | Context class | Ring centre |
+| `InnerRadius` / `OuterRadius` | Float providers | Annulus bounds |
+| `NumberOfRings` | Int provider | Rings between inner and outer |
+| `PointsPerRing` | Int provider | Points on each ring when `PointOnRingSpacingMethod` is `ByNumberOfPoints` (the default); `BySpaceBetween` uses `SpaceBetweenPoints` instead (`EnvQueryGenerator_Donut.h:32-40`) |
+| `bDefineArc` | bool | Restrict to an arc |
+| `ArcDirection` | `FEnvDirection` | Arc forward direction (`LineFrom`/`LineTo` or `Rotation` + `DirMode`) |
+| `ArcAngle` | Float provider | Arc width in degrees |
 
-Use for: **flanking positions** (ring around enemy), **retreat points** (ring around self, facing away from enemy).
+Use for flanking positions (centred on the enemy) and retreat points (centred on self).
 
-### PathingGrid (Points on NavMesh reachable from context)
+### `UEnvQueryGenerator_OnCircle`
 
-Extends SimpleGrid by only keeping points reachable via NavMesh from the querier. More expensive but guarantees navigability.
+Points on a single circle.
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `GenerateAroundActor` | Context | Usually `EnvQueryContext_Querier` |
-| `MaxDistance` | Float | NavMesh distance budget |
-| `SpaceBetween` | Float | Grid spacing |
-| `ScanRangeMultiplier` | Float | Multiplies scan range for path exploration |
+| Property | Type | Notes |
+|---|---|---|
+| `CircleRadius` | Float provider | Circle radius |
+| `PointOnCircleSpacingMethod` | `EEnvQueryPointSpacingMethod` | `BySpaceBetween` or `ByNumberOfPoints` |
+| `SpaceBetween` | Float provider | Used when the method is `BySpaceBetween` |
+| `NumberOfPoints` | Int provider | Used when the method is `ByNumberOfPoints` |
 
-### ActorsOfClass
+`EEnvQueryPointSpacingMethod` lives in `Generators/EnvQueryGenerator_ProjectedPoints.h`.
 
-Generates candidate actors of a given class (e.g., `APatrolPoint`, `APickup`).
+### `UEnvQueryGenerator_PathingGrid`
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `SearchedActorClass` | Class | Actor class to find |
-| `SearchCenter` | Context | Center of search radius |
-| `SearchRadius` | Float | Radius to find actors in |
+`SimpleGrid` that also runs a path query, so results are navigable. Adds:
 
-Use for: **patrol waypoints**, **interact targets**, **pickup locations**.
+| Property | Type | Notes |
+|---|---|---|
+| `PathToItem` | Bool provider | Path direction: to the item, or from it |
+| `NavigationFilter` | `TSubclassOf<UNavigationQueryFilter>` | Filter used for the path queries |
+| `ScanRangeMultiplier` | Float provider | Widens the scan range used for exploration |
 
-### Composite Generator
+Much more expensive than `SimpleGrid`; prefer a cheap grid plus a `Pathfinding` filter test unless you need true reachability from the generator.
 
-Combines results from multiple generators into one candidate set. Each sub-generator runs independently; results are merged.
+### `UEnvQueryGenerator_ActorsOfClass`
+
+| Property | Type | Notes |
+|---|---|---|
+| `SearchedActorClass` | `TSubclassOf<AActor>` | Class to gather |
+| `GenerateOnlyActorsInRadius` | Bool provider | False returns every actor of the class in the world |
+| `SearchRadius` | Float provider | Radius when the bool above is true |
+| `SearchCenter` | Context class | Centre of the radius |
+
+Use for patrol waypoints, interaction targets and pickups.
+
+### Other generators
+
+| Class | Produces |
+|---|---|
+| `UEnvQueryGenerator_Cone` | Points in a cone (`CenterActor`, `ConeDegrees`, `AngleStep`, `Range`, `AlignedPointsDistance`) |
+| `UEnvQueryGenerator_CurrentLocation` | A single point at a context |
+| `UEnvQueryGenerator_PerceivedActors` | Actors this AI currently perceives (`AllowedActorClass`, `SearchRadius`, `ListenerContext`, `SenseToUse`) |
+| `UEnvQueryGenerator_Composite` | Merges the output of its `Generators` array |
+| `UEnvQueryGenerator_BlueprintBase` | Blueprint-authored generator |
+
+---
+
+## Test properties shared by every test
+
+| Property | Type | Notes |
+|---|---|---|
+| `TestPurpose` | `EEnvTestPurpose::{Filter, Score, FilterAndScore}` | What the test does |
+| `FilterType` | `EEnvTestFilterType::{Minimum, Maximum, Range, Match}` | `Match` is for boolean tests, the rest are numeric |
+| `FloatValueMin` / `FloatValueMax` | Float providers | Numeric filter bounds |
+| `BoolValue` | Bool provider | Expected value for `Match` filters |
+| `ScoringEquation` | `EEnvTestScoreEquation::{Linear, Square, InverseLinear, SquareRoot, Constant}` | Curve applied to the normalized test value |
+| `ScoringFactor` | Float provider | Weight; negative inverts the contribution |
+| `ClampMinType` / `ClampMaxType`, `ScoreClampMin` / `ScoreClampMax` | `EEnvQueryTestClamping` + float providers | Clamp the normalization range |
+| `ReferenceValue` / `bDefineReferenceValue` | Float provider + bool | Score relative to a target value instead of the min/max of the set |
+| `MultipleContextFilterOp` / `MultipleContextScoreOp` | `EEnvTestFilterOperator` / `EEnvTestScoreOperator` | How to combine results when a context resolves to several items |
+
+"Find the nearest" is `ScoringEquation=InverseLinear`; "find the farthest" is `Linear`.
 
 ---
 
 ## Tests
 
-Each test has a **Test Purpose**: `Filter` (discard), `Score` (weight), or `FilterAndScore`.
+### `UEnvQueryTest_Distance`
 
-### Distance Test
+| Property | Type | Notes |
+|---|---|---|
+| `TestMode` | `EEnvTestDistance::{Distance3D, Distance2D, DistanceZ, DistanceAbsoluteZ}` | |
+| `DistanceTo` | Context class | The other end of the measurement |
 
-Scores/filters by distance between item and a context.
+### `UEnvQueryTest_Trace`
 
-| Property | Type | Use |
-|----------|------|-----|
-| `DistanceTo` | Context | Usually `EnvQueryContext_Querier` or enemy context |
-| `TestMode` | Enum | PathLength (NavMesh), Straight3D, Straight2D, Z |
-| `ScoringEquation` | Enum | Constant, Linear, Square, InverseLinear |
-| `ScoringFactor` | Float | Multiplier on the score |
+| Property | Type | Notes |
+|---|---|---|
+| `TraceData` | `FEnvTraceData` | `TraceChannel` (`ETraceTypeQuery`), `TraceShape` (`EEnvTraceShape`), `TraceMode` (`EEnvQueryTrace`), `ExtentX/Y/Z`, `bTraceComplex`, `bOnlyBlockingHits`, `ProjectDown`/`ProjectUp`, `NavigationFilter` |
+| `Context` | Context class | The other end of the trace |
+| `TraceFromContext` | Bool provider | Trace from the context to the item, or the reverse |
+| `ItemHeightOffset` / `ContextHeightOffset` | Float providers | Raise the endpoints to eye height |
 
-**Find nearest actor**: Score=InverseLinear, ScoringFactor=1.0
-**Find farthest (flee)**: Score=Linear, ScoringFactor=1.0
-**Filter within range**: Purpose=Filter, FloatValueMin=100, FloatValueMax=2000
+Cover: `TestPurpose=Filter`, `FilterType=Match`, `BoolValue=false` (the item must **not** be visible from the enemy context). Firing position: `BoolValue=true`.
 
-### Trace Test
+### `UEnvQueryTest_Dot`
 
-Checks line-of-sight between item and a context. Can be used to find covered positions (no LoS to enemy) or exposed positions (has LoS to enemy).
+| Property | Type | Notes |
+|---|---|---|
+| `LineA` / `LineB` | `FEnvDirection` | Each is either two contexts (`LineFrom`, `LineTo`) or a `Rotation` context, selected by `DirMode` |
+| `TestMode` | `EEnvTestDot::{Dot3D, Dot2D}` | `Dot2D` is the heading comparison |
+| `bAbsoluteValue` | bool | Treat -1 and 1 alike |
 
-| Property | Type | Use |
-|----------|------|-----|
-| `TraceFrom` | Context | Usually enemy actor context |
-| `TraceChannel` | Enum | Visibility, Camera, or custom |
-| `BoolMatch` | Bool | `true` = requires LoS; `false` = requires NO LoS (cover) |
-| `TraceMode` | Enum | Navigation, Geometry, ByChannel |
+Flanking: score `InverseLinear` on the absolute dot between the enemy's facing and the enemy→item direction, so perpendicular positions win.
 
-**Cover query**: `BoolMatch=false` (item must NOT be visible from enemy)
-**Sniper position query**: `BoolMatch=true` (item must have LoS to enemy)
+### `UEnvQueryTest_Pathfinding` and `UEnvQueryTest_PathfindingBatch`
 
-### Dot Product Test
+| Property | Type | Notes |
+|---|---|---|
+| `TestMode` | `EEnvTestPathfinding::{PathExist, PathCost, PathLength}` | |
+| `Context` | Context class | Path endpoint |
+| `PathFromContext` | Bool provider | Path direction |
+| `SkipUnreachable` | Bool provider | Discard items with no path |
+| `FilterClass` | `TSubclassOf<UNavigationQueryFilter>` | Filter for the path query |
+| `NavDataOverrideContext` | Context class | Use a specific nav data |
 
-Scores items by the dot product of two directions. Useful for angular relationship checks.
+`PathExist` is far cheaper than `PathLength`. Use the batch variant when many items share a start point.
 
-| Property | Type | Use |
-|----------|------|-----|
-| `LineFrom` | Context | Origin of direction line |
-| `LineTo` | Context | End of direction line |
-| `TestAgainst` | Direction | Direction to test against |
-| `bAbsoluteValue` | Bool | Use absolute dot product |
+### `UEnvQueryTest_Overlap`
 
-**Prefer items behind the querier**: `LineFrom=Enemy, LineTo=Querier, TestAgainst=ItemToLine`
-**Flanking (perpendicular)**: Set scoring to penalize high dot products
+`OverlapData` is an `FEnvOverlapData`: `ExtentX/Y/Z`, `OverlapShape` (`EEnvOverlapShape`), `OverlapChannel` (`ECollisionChannel`), `bOnlyBlockingHits`, `bOverlapComplex`, `bSkipOverlapQuerier`. Use it to check that an agent actually fits at a candidate point.
 
-### Overlap Test
+### `UEnvQueryTest_GameplayTags`
 
-Filters items that have overlapping geometry of a given class or channel.
+`TagQueryToMatch` is an `FGameplayTagQuery`; items are cast to `IGameplayTagAssetInterface` and tested against it. Author it in the query asset: `SetTagQueryToMatch(FGameplayTagQuery&)` exists but is not exported (`MinimalAPI` class, no `AIMODULE_API`, `EnvQueryTest_GameplayTags.h:29`), so calling it from a game module fails to link, and it has no effect once the query has been cached.
 
-| Property | Type | Use |
-|----------|------|-----|
-| `OverlapData` | Shape | Box, Sphere, or Capsule |
-| `OverlapChannel` | Channel | Collision channel to check |
-| `bOnlyBlockingHits` | Bool | Filter based on blocking overlaps |
+### `UEnvQueryTest_Volume`, `UEnvQueryTest_Project`, `UEnvQueryTest_Random`
 
-Use for: checking clearance at candidate positions (e.g., "is there room to stand here?").
-
-### Pathfinding Length Test
-
-Scores items by how long the NavMesh path from the querier is. Different from straight-line distance.
-
-| Property | Type | Use |
-|----------|------|-----|
-| `Context` | Context | Path destination context |
-| `ScoringEquation` | Enum | Linear (prefer shorter paths) or InverseLinear |
-| `PathFromContext` | Bool | If true, path goes from context to item |
-
-Use for: **patrol point selection** (prefer reachable points without huge path detours), **cover with fast exit route**.
-
-### GameplayTagsTest
-
-Filters/scores items based on GameplayTags on the item actor.
-
-| Property | Type | Use |
-|----------|------|-----|
-| `TagsToMatch` | FGameplayTagContainer | Required tags |
-| `TagMatchType` | Enum | HasAll, HasAny |
-| `bMustPass` | Bool | True = filter out non-matching |
+`Volume` filters by containment in a `VolumeClass` (`bDoComplexVolumeTest`, `bSkipTestIfNoVolumes`). `Project` re-projects items onto the navmesh or geometry. `Random` adds jitter so equally-scored items are not always resolved identically.
 
 ---
 
-## Common Query Configurations
+## Query recipes
 
-### 1. Find Nearest Cover
-
-Goal: AI hides from enemy, selecting the closest covered position.
+### Nearest cover
 
 ```
-Generator: SimpleGrid
-  GridHalfSize = 800
-  SpaceBetween = 150
-  GenerateAround = EnvQueryContext_Querier
-
-Test 1: Trace (Filter)
-  TraceFrom = EnemyContext
-  BoolMatch = false          ← item must NOT be visible from enemy
-  TraceChannel = Visibility
-
-Test 2: Distance (Score)
-  DistanceTo = EnvQueryContext_Querier
-  TestMode = Straight2D
-  ScoringEquation = InverseLinear   ← prefer closer cover
-  ScoringFactor = 1.0
-
-Test 3: Pathfinding Length (Filter + Score)
-  Purpose = FilterAndScore
-  FloatValueMax = 3000       ← discard unreachable points
-  ScoringEquation = InverseLinear
+Generator: SimpleGrid            GridSize = 1600, SpaceBetween = 150, GenerateAround = Querier
+Test 1: Distance (Filter)        DistanceTo = Querier, TestMode = Distance2D,
+                                 FilterType = Maximum, FloatValueMax = 1500
+Test 2: Trace (Filter)           Context = MyEQSContext_Enemy, TraceFromContext = true,
+                                 FilterType = Match, BoolValue = false
+Test 3: Distance (Score)         DistanceTo = Querier, ScoringEquation = InverseLinear, ScoringFactor = 1.0
+Test 4: Pathfinding (Filter)     TestMode = PathExist, Context = Querier, SkipUnreachable = true
 ```
 
-### 2. Find Flee Point (Retreat from Enemy)
+Order matters: cheap distance filters first, traces next, path tests last.
 
-Goal: AI moves far from enemy while staying navigable.
-
-```
-Generator: PathingGrid
-  MaxDistance = 2000
-  SpaceBetween = 300
-  GenerateAround = EnvQueryContext_Querier
-
-Test 1: Distance from Enemy (Score)
-  DistanceTo = EnemyContext
-  ScoringEquation = Linear      ← higher score = farther from enemy
-  ScoringFactor = 1.0
-
-Test 2: Trace from Enemy (Score — optional soft preference)
-  TraceFrom = EnemyContext
-  BoolMatch = false
-  Purpose = Score               ← bonus score for hidden positions
-  ScoringFactor = 0.5
-
-Test 3: Distance from Self (Filter)
-  DistanceTo = EnvQueryContext_Querier
-  Purpose = Filter
-  FloatValueMin = 400           ← don't pick a spot right next to self
-```
-
-### 3. Find Flanking Position
-
-Goal: AI reaches a position perpendicular to the enemy, neither directly behind nor in front.
+### Flee point
 
 ```
-Generator: Ring
-  Center = EnemyContext
-  Radius = 600
-  ItemSpacing = 45              ← 8 points around enemy
-
-Test 1: Dot Product (Score — penalize direct front/back)
-  LineFrom = EnemyContext (enemy forward)
-  LineTo = Item position
-  bAbsoluteValue = true
-  ScoringEquation = InverseLinear   ← low dot = perpendicular = high score
-
-Test 2: Trace to Enemy from Item (Filter)
-  TraceFrom = EnemyContext
-  BoolMatch = true              ← flanking position must have LoS to attack from
-  TraceChannel = Visibility
-
-Test 3: Pathfinding Length (Filter)
-  FloatValueMax = 2500          ← must be reachable
+Generator: Donut                 Center = Querier, InnerRadius = 500, OuterRadius = 2000,
+                                 NumberOfRings = 3, PointsPerRing = 12
+Test 1: Distance (Score)         DistanceTo = MyEQSContext_Enemy, ScoringEquation = Linear
+Test 2: Trace (Score)            Context = MyEQSContext_Enemy, FilterType = Match,
+                                 BoolValue = false, TestPurpose = Score, ScoringFactor = 0.5
+Test 3: Pathfinding (Filter)     TestMode = PathExist, Context = Querier, SkipUnreachable = true
 ```
 
-### 4. Find Patrol Waypoint
-
-Goal: Select a patrol destination that is not the current location, ideally exploring unvisited areas.
+### Flanking position
 
 ```
-Generator: ActorsOfClass
-  SearchedActorClass = APatrolPoint
-  SearchCenter = EnvQueryContext_Querier
-  SearchRadius = 5000
-
-Test 1: Distance (Filter + Score)
-  DistanceTo = EnvQueryContext_Querier
-  Purpose = FilterAndScore
-  FloatValueMin = 100           ← not current location
-  FloatValueMax = 4000
-  ScoringEquation = Linear      ← prefer farther points for exploration
-
-Test 2: GameplayTags (Filter — optional)
-  TagsToMatch = PatrolPoint.Active
-  bMustPass = true
+Generator: Donut                 Center = MyEQSContext_Enemy, InnerRadius = 500, OuterRadius = 700,
+                                 NumberOfRings = 1, PointsPerRing = 12
+Test 1: Dot (Score)              LineA = { LineFrom: MyEQSContext_Enemy, LineTo: Item },
+                                 LineB = { Rotation: MyEQSContext_Enemy }, TestMode = Dot2D,
+                                 bAbsoluteValue = true, ScoringEquation = InverseLinear
+Test 2: Trace (Filter)           Context = MyEQSContext_Enemy, FilterType = Match, BoolValue = true
+Test 3: Pathfinding (Filter)     TestMode = PathExist, Context = Querier
 ```
 
-### 5. Find Attack Position (Ranged AI)
-
-Goal: AI positions itself at ideal attack range, with LoS, not too close.
+### Patrol waypoint
 
 ```
-Generator: Ring
-  Center = EnvQueryContext_Querier
-  Radius = [AttackRangeMin..AttackRangeMax]   ← can use two rings merged with Composite
-  ItemSpacing = 30
+Generator: ActorsOfClass         SearchedActorClass = AMyPatrolPoint,
+                                 GenerateOnlyActorsInRadius = true, SearchRadius = 5000,
+                                 SearchCenter = Querier
+Test 1: Distance (FilterAndScore) DistanceTo = Querier, FilterType = Range,
+                                 FloatValueMin = 100, FloatValueMax = 4000, ScoringEquation = Linear
+Test 2: GameplayTags (Filter)    TagQueryToMatch = "PatrolPoint.Active"
+```
 
-Test 1: Distance from Enemy (Filter)
-  DistanceTo = EnemyContext
-  Purpose = Filter
-  FloatValueMin = AttackRangeMin
-  FloatValueMax = AttackRangeMax
+### Ranged attack position
 
-Test 2: Trace to Enemy (Filter — must have LoS)
-  TraceFrom = EnemyContext
-  BoolMatch = true
-  TraceChannel = Visibility
-
-Test 3: Distance from Self (Score — minimize movement)
-  DistanceTo = EnvQueryContext_Querier
-  ScoringEquation = InverseLinear
-  ScoringFactor = 0.3           ← lower weight: prefer standing still if already in range
+```
+Generator: Donut                 Center = Querier, InnerRadius = 400, OuterRadius = 1200,
+                                 NumberOfRings = 3, PointsPerRing = 12
+Test 1: Distance (Filter)        DistanceTo = MyEQSContext_Enemy, FilterType = Range,
+                                 FloatValueMin = 600, FloatValueMax = 1400
+Test 2: Trace (Filter)           Context = MyEQSContext_Enemy, FilterType = Match, BoolValue = true
+Test 3: Distance (Score)         DistanceTo = Querier, ScoringEquation = InverseLinear, ScoringFactor = 0.3
 ```
 
 ---
 
-## Custom EQS Context (C++)
-
-A custom context resolves to a specific actor or location, used in tests:
+## Custom context (C++)
 
 ```cpp
+// MyEQSContext_Enemy.h
+#pragma once
+
+#include "CoreMinimal.h"
 #include "EnvironmentQuery/EnvQueryContext.h"
-#include "EnvironmentQuery/Items/EnvQueryItemType_Actor.h"
+#include "MyEQSContext_Enemy.generated.h"
 
 UCLASS()
-class UEnvQueryContext_Enemy : public UEnvQueryContext
+class MYGAME_API UMyEQSContext_Enemy : public UEnvQueryContext
 {
     GENERATED_BODY()
+
 public:
-    virtual void ProvideContext(
-        FEnvQueryInstance& QueryInstance,
-        FEnvQueryContextData& ContextData) const override
-    {
-        AAIController* Controller = Cast<AAIController>(
-            Cast<APawn>(QueryInstance.Owner.Get())->GetController());
-        if (!Controller) { return; }
-
-        UBlackboardComponent* BB = Controller->GetBlackboardComponent();
-        if (!BB) { return; }
-
-        AActor* Enemy = Cast<AActor>(BB->GetValueAsObject(TEXT("TargetActor")));
-        if (IsValid(Enemy))
-        {
-            UEnvQueryItemType_Actor::SetContextHelper(ContextData, Enemy);
-        }
-    }
+    virtual void ProvideContext(FEnvQueryInstance& QueryInstance, FEnvQueryContextData& ContextData) const override;
 };
+
+// MyEQSContext_Enemy.cpp
+#include "MyEQSContext_Enemy.h"
+
+#include "AIController.h"
+#include "BehaviorTree/BlackboardComponent.h"
+#include "EnvironmentQuery/EnvQueryTypes.h"
+#include "EnvironmentQuery/Items/EnvQueryItemType_Actor.h"
+#include "GameFramework/Pawn.h"
+
+void UMyEQSContext_Enemy::ProvideContext(FEnvQueryInstance& QueryInstance, FEnvQueryContextData& ContextData) const
+{
+    UObject* Owner = QueryInstance.Owner.Get();
+    const APawn* QuerierPawn = Cast<APawn>(Owner);
+    const AAIController* Controller = QuerierPawn ? Cast<AAIController>(QuerierPawn->GetController()) : Cast<AAIController>(Owner);
+    const UBlackboardComponent* Blackboard = Controller ? Controller->GetBlackboardComponent() : nullptr;
+    if (!Blackboard)
+    {
+        return;
+    }
+
+    if (AActor* Enemy = Cast<AActor>(Blackboard->GetValueAsObject(TEXT("TargetActor"))))
+    {
+        UEnvQueryItemType_Actor::SetContextHelper(ContextData, Enemy);
+    }
+}
 ```
 
-Blueprint context (simpler): Subclass `UEnvQueryContext_BlueprintBase` and implement `ProvideActorsSet` or `ProvideSingleLocation`.
+`QueryInstance.Owner` is a `TWeakObjectPtr<UObject>` — the querier passed to `FEnvQueryRequest`. `UBTTask_RunEQSQuery` and `UBTService_RunEQS` swap the controller for its pawn (`BTTask_RunEQSQuery.cpp:43-47`), but a query you run with a controller as querier passes the controller, so handle both. Prefer the pawn as querier: `UEnvQueryContext_Querier` uses the owner actor's location and warns when it is a controller (`EnvQueryContext_Querier.cpp:19-21`). For point contexts use `UEnvQueryItemType_Point::SetContextHelper(ContextData, Location)`.
+
+Blueprint contexts derive from `UEnvQueryContext_BlueprintBase` and implement `ProvideSingleActor`, `ProvideSingleLocation`, `ProvideActorsSet` or `ProvideLocationsSet`.
 
 ---
 
-## Running EQS Queries from C++
-
-### Direct call (one-shot)
+## Running queries from C++
 
 ```cpp
 #include "EnvironmentQuery/EnvQueryManager.h"
-
-UPROPERTY(EditDefaultsOnly)
-TObjectPtr<UEnvQuery> CoverQuery;
+#include "EnvironmentQuery/EnvQueryTypes.h"
 
 void AMyAIController::FindCover()
 {
-    FEnvQueryRequest Request(CoverQuery, this);
-    // Optional named float params (set via DataProvider in the asset):
-    // Request.SetFloatParam(TEXT("SearchRadius"), 1200.f);
+    if (!CoverQuery) { return; }
 
-    Request.Execute(EEnvQueryRunMode::SingleResult,
-        FQueryFinishedSignature::CreateUObject(
-            this, &AMyAIController::OnCoverQueryDone));
+    FEnvQueryRequest Request(CoverQuery, GetPawn()); // pawn as querier; the delegate still binds to this controller
+    Request.SetFloatParam(TEXT("SearchRadius"), 1200.f);
+    Request.Execute(EEnvQueryRunMode::SingleResult, this, &AMyAIController::HandleCoverQueryFinished);
 }
 
-void AMyAIController::OnCoverQueryDone(TSharedPtr<FEnvQueryResult> Result)
+void AMyAIController::HandleCoverQueryFinished(TSharedPtr<FEnvQueryResult> Result)
 {
-    if (!Result.IsValid() || !Result->IsSuccessful()) { return; }
+    if (!Result.IsValid() || !Result->IsSuccessful())
+    {
+        return;
+    }
 
-    // Location result
-    FVector Location = Result->GetItemAsLocation(0);
-    GetBlackboardComponent()->SetValueAsVector(TEXT("CoverLocation"), Location);
+    GetBlackboardComponent()->SetValueAsVector(TEXT("CoverLocation"), Result->GetItemAsLocation(0));
 
-    // Actor result (if generator produces actors)
-    // AActor* Actor = Result->GetItemAsActor(0);
-
-    // Multiple results (when RunMode = AllMatching)
-    // for (int32 i = 0; i < Result->Items.Num(); ++i)
-    // {
-    //     FVector Loc = Result->GetItemAsLocation(i);
-    //     float Score = Result->Items[i].Score;
-    // }
+    // Ranked list, when RunMode is AllMatching:
+    for (int32 Index = 0; Index < Result->Items.Num(); ++Index)
+    {
+        const FVector ItemLocation = Result->GetItemAsLocation(Index);
+        const float ItemScore = Result->GetItemScore(Index);
+        UE_LOG(LogMyGame, VeryVerbose, TEXT("Item %d at %s scored %f"), Index, *ItemLocation.ToString(), ItemScore);
+    }
 }
 ```
 
-### Via BT Task (BTTask_RunEQSQuery)
+`FEnvQueryRequest::Execute` has a `(EEnvQueryRunMode::Type, UserClass*, TMethodPtr)` overload as used above and a `(EEnvQueryRunMode::Type, const FQueryFinishedSignature&)` overload; both return an `int32` query id. Cancel with `UEnvQueryManager::GetCurrent(this)->AbortQuery(QueryID)`. `RunInstantQuery(Request, RunMode)` runs synchronously and returns a `TSharedPtr<FEnvQueryResult>` — it bypasses the frame-time budget, so keep it out of per-frame code.
 
-Configure in-editor:
-1. Add `BTTask_RunEQSQuery` node to Behavior Tree
-2. Set `EQSRequest.QueryTemplate` = your `UEnvQuery` asset
-3. Set `BlackboardKey` = target BB key (Vector for locations, Object for actors)
-4. `EQSRequest.RunMode` = `SingleResult` for most cases
-5. `bUpdateBBOnFail = false` to avoid clearing BB on failure
+Name the parameters you pass with `SetFloatParam` / `SetIntParam` / `SetBoolParam` exactly as the asset's data providers name them, otherwise the constant in the asset is used silently.
 
-The task stores `FBTEnvQueryTaskMemory` (containing `RequestID`) in NodeMemory to manage the async query lifecycle and abort correctly.
+### From a Behavior Tree
 
-### Via BT Service (periodic queries)
-
-```cpp
-// BTService_RunEQS — built-in service that runs an EQS query on interval
-// Found in: BehaviorTree/Services/BTService_RunEQS.h
-// Configure: QueryTemplate, BlackboardKey, RunMode, Interval
-// This is equivalent to using a service that calls Request.Execute() in TickNode
-```
+`UBTTask_RunEQSQuery` holds an `FEQSParametrizedQueryExecutionRequest EQSRequest` (its `QueryTemplate`, `RunMode`, `QueryConfig` and `EQSQueryBlackboardKey` live there) plus `BlackboardKey` for the output and `bUpdateBBOnFail`. The task keeps an `FBTEnvQueryTaskMemory` in node memory so it can abort the in-flight query. `UBTService_RunEQS` is the periodic equivalent.
 
 ---
 
-## EQS Debugging
+## Debugging
 
-Enable EQS debug visualization:
+Open the Gameplay Debugger (default key `'`) with an AI selected and switch to the EQS category to see per-item scores and which test rejected each item. `ai.debug.EQS.RefreshInterval` sets how often that panel refreshes.
 
-```
-Console: ai.debug.eqs 1
-Console: DisplayAll EQS
-Gameplay Debugger: ' key → select AI → press 4 (EQS panel)
-```
-
-In C++, `UEQSTestingPawn` (`EnvironmentQuery/EQSTestingPawn.h`) can be placed in the level to preview query results in-editor without running the game.
+Place an `AEQSTestingPawn` (`EnvironmentQuery/EQSTestingPawn.h`) in the level, set `QueryTemplate` and optionally `QueryConfig`, and the editor previews the scored item cloud without entering PIE. `TimeLimitPerStep` > 0 runs one step per execution instead of the whole query, and `StepToDebugDraw` picks which recorded step is drawn (`EQSTestingPawn.cpp:244-248`). `AEQSTestingPawn::RunEQSQuery()` re-runs it on demand.
 
 ---
 
-## Performance Notes
+## Performance
 
 | Concern | Mitigation |
-|---------|-----------|
-| Large grid (many candidates) | Reduce `GridHalfSize` or increase `SpaceBetween`. Use `SingleResult` mode. |
-| Frequent queries | Use BT Service with `Interval >= 0.5s`. Cache result in BB rather than re-running each tick. |
-| Expensive Trace tests | Limit trace count via early filter tests before trace (e.g., distance filter first). |
-| PathfindingLength test | Avoid on every frame; path queries are CPU-intensive. Run at 1-2s intervals max. |
-| Many concurrent AI | Use `UEnvQueryManager`'s built-in query throttling (max parallel queries per frame set in Project Settings > AI > EQS). |
-| AllMatching mode | Only use when you need a ranked list; `SingleResult` is significantly cheaper. |
+|---|---|
+| Too many candidate items | Lower `GridSize` or raise `SpaceBetween`; a donut with explicit `PointsPerRing` gives a fixed, predictable count |
+| Frequent queries | Run from `UBTService_RunEQS` with a 0.5 s or longer interval and cache the result in a blackboard key |
+| Expensive trace tests | Put a distance filter before every trace so fewer items reach it |
+| Pathfinding tests | Prefer `PathExist` over `PathLength`, use `PathfindingBatch`, and keep them last in the test list |
+| Many concurrent AI | `UEnvQueryManager` time-slices queries across frames; its `UPROPERTY(config)` members (`config=Game`, `EnvQueryManager.h:340-367`) are `MaxAllowedTestingTime`, `bTestQueriesUsingBreadth`, `QueryCountWarningThreshold` and the `*TimeWarningSeconds` thresholds; at runtime pass an `FEnvQueryManagerConfig` to `Configure()` |
+| `AllMatching` mode | Only when you need the ranked list; `SingleResult` stops as soon as a winner is known |

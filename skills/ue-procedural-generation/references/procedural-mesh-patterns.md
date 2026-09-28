@@ -1,38 +1,56 @@
 # Procedural Mesh Patterns
 
-Common algorithmic patterns for runtime mesh and content generation in Unreal Engine using `UProceduralMeshComponent`, `UInstancedStaticMeshComponent`, and supporting math utilities.
+Target engine: **UE 5.8**. Algorithmic patterns for runtime mesh and content generation using `UProceduralMeshComponent`, `UInstancedStaticMeshComponent`/`UHierarchicalInstancedStaticMeshComponent`, `USplineComponent` and the `Core` math utilities. Build.cs modules: `Core`, `CoreUObject`, `Engine`, `ProceduralMeshComponent`.
+
+The `CreateMeshSection` overload used below is the eight-argument `FColor` form (`ProceduralMeshComponent.h:169`; its `DeprecatedFunction` meta applies to Blueprint only, the C++ overload is not `UE_DEPRECATED`); the `FLinearColor` equivalent is `CreateMeshSection_LinearColor` (`ProceduralMeshComponent.h:193`).
 
 ---
 
-## Component Setup Boilerplate
+## Component setup boilerplate
 
 ```cpp
-// Header — MyProceduralActor.h
+// MyProceduralActor.h
 #pragma once
+
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Components/SplineComponent.h"
 #include "GameFramework/Actor.h"
 #include "ProceduralMeshComponent.h"
-#include "Components/InstancedStaticMeshComponent.h"
-#include "Components/SplineComponent.h"
 #include "MyProceduralActor.generated.h"
 
 UCLASS()
-class AMyProceduralActor : public AActor
+class MYGAME_API AMyProceduralActor : public AActor
 {
     GENERATED_BODY()
+
 public:
     AMyProceduralActor();
 
-    UPROPERTY(VisibleAnywhere)
-    UProceduralMeshComponent* ProceduralMesh;
+    // Implemented by the patterns below
+    void GenerateFlatGrid(int32 GridSize, float CellSize, bool bCreateCollision);
+    void BuildMeshFromTiles(const struct FDungeonLevel& Level, float TileSize);
+    void GenerateAsync(int32 GridSize, float CellSize, int32 Seed);
+    void BuildRoad(float RoadWidth, float SegmentLength);
+    void ScatterVegetation(UStaticMesh* TreeMesh, int32 Count, int32 Seed,
+                           const FVector& ExtentMin, const FVector& ExtentMax);
+    void ScatterWithPoisson(int32 Seed, float MinDistance);
 
-    UPROPERTY(VisibleAnywhere)
-    UHierarchicalInstancedStaticMeshComponent* HISM;
+    UPROPERTY(VisibleAnywhere, Category = "My Procedural")
+    TObjectPtr<UProceduralMeshComponent> ProceduralMesh;
 
-    UPROPERTY(VisibleAnywhere)
-    USplineComponent* Spline;
+    UPROPERTY(VisibleAnywhere, Category = "My Procedural")
+    TObjectPtr<UHierarchicalInstancedStaticMeshComponent> Hism;
+
+    UPROPERTY(VisibleAnywhere, Category = "My Procedural")
+    TObjectPtr<USplineComponent> Spline;
+
+    UPROPERTY(EditAnywhere, Category = "My Procedural")
+    TObjectPtr<UMaterialInterface> RoadMaterial;
 };
+```
 
-// Source — MyProceduralActor.cpp
+```cpp
+// MyProceduralActor.cpp
 #include "MyProceduralActor.h"
 
 AMyProceduralActor::AMyProceduralActor()
@@ -41,11 +59,11 @@ AMyProceduralActor::AMyProceduralActor()
 
     ProceduralMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("ProceduralMesh"));
     SetRootComponent(ProceduralMesh);
-    ProceduralMesh->bUseComplexAsSimpleCollision = false; // Use dedicated collision shapes
+    ProceduralMesh->bUseComplexAsSimpleCollision = false; // Dedicated collision shapes instead
 
-    HISM = CreateDefaultSubobject<UHierarchicalInstancedStaticMeshComponent>(TEXT("HISM"));
-    HISM->SetupAttachment(RootComponent);
-    HISM->SetNumCustomDataFloats(2); // Reserve per-instance float channels
+    Hism = CreateDefaultSubobject<UHierarchicalInstancedStaticMeshComponent>(TEXT("Hism"));
+    Hism->SetupAttachment(RootComponent);
+    Hism->SetNumCustomDataFloats(2); // Per-instance float channels read by materials
 
     Spline = CreateDefaultSubobject<USplineComponent>(TEXT("Spline"));
     Spline->SetupAttachment(RootComponent);
@@ -54,14 +72,42 @@ AMyProceduralActor::AMyProceduralActor()
 
 ---
 
-## 1. Flat Quad Grid (Terrain Base)
+## Fractal noise helper
+
+Every height sample below goes through this helper. `FMath::PerlinNoise2D` returns a continuous value in `[-1, 1]`, so the octave sum is normalised by the accumulated amplitude.
+
+```cpp
+// Octaves of Perlin noise, normalised back into [-1, 1]
+float SampleOctaveNoise(float X, float Y, int32 Octaves, float Persistence,
+                        float Lacunarity, float Scale)
+{
+    float Total = 0.f;
+    float Amplitude = 1.f;
+    float Frequency = 1.f / FMath::Max(Scale, UE_SMALL_NUMBER);
+    float MaxAmplitude = 0.f;
+
+    for (int32 Octave = 0; Octave < Octaves; ++Octave)
+    {
+        Total += FMath::PerlinNoise2D(FVector2D(X, Y) * Frequency) * Amplitude;
+        MaxAmplitude += Amplitude;
+        Amplitude *= Persistence;
+        Frequency *= Lacunarity;
+    }
+
+    return MaxAmplitude > 0.f ? Total / MaxAmplitude : 0.f;
+}
+```
+
+---
+
+## Flat quad grid (terrain base)
 
 Generates a simple flat or height-mapped mesh from a 2D grid of vertices.
 
 ```cpp
 // GridSize = number of cells per side. Vertex count = (GridSize+1)^2.
 // Preallocate for performance.
-void ATerrainActor::GenerateFlatGrid(int32 GridSize, float CellSize,
+void AMyProceduralActor::GenerateFlatGrid(int32 GridSize, float CellSize,
                                       bool bCreateCollision)
 {
     const int32 VertexStride = GridSize + 1;
@@ -109,7 +155,7 @@ void ATerrainActor::GenerateFlatGrid(int32 GridSize, float CellSize,
 }
 ```
 
-### Height-Mapped Terrain with Normal Recalculation
+### Height-mapped terrain with normal recalculation
 
 ```cpp
 float SampleHeight(float X, float Y, float Scale, int32 Seed)
@@ -130,7 +176,9 @@ void RecalculateNormals(const TArray<FVector>& Vertices, const TArray<int32>& Tr
         const FVector& A = Vertices[Triangles[i]];
         const FVector& B = Vertices[Triangles[i + 1]];
         const FVector& C = Vertices[Triangles[i + 2]];
-        FVector Normal = FVector::CrossProduct(B - A, C - A).GetSafeNormal();
+        // UE front faces need (C - A) x (B - A); (B - A) x (C - A) points inward
+        // (same result as KismetProceduralMeshLibrary.cpp:320-322)
+        FVector Normal = FVector::CrossProduct(C - A, B - A).GetSafeNormal();
 
         OutNormals[Triangles[i]]     += Normal;
         OutNormals[Triangles[i + 1]] += Normal;
@@ -146,11 +194,11 @@ void RecalculateNormals(const TArray<FVector>& Vertices, const TArray<int32>& Tr
 
 ---
 
-## 2. Marching Cubes (Voxel Isosurface)
+## Marching cubes (voxel isosurface)
 
 Extracts a triangulated isosurface from a 3D scalar field. Used for caves, asteroids, destructible terrain.
 
-### Scalar Field Setup
+### Scalar field setup
 
 ```cpp
 // Density grid: negative = solid, positive = air, zero = surface
@@ -175,18 +223,18 @@ struct FDensityGrid
 };
 ```
 
-### Edge Interpolation
+### Edge interpolation
 
 ```cpp
 FVector InterpolateEdge(FVector P0, float V0, FVector P1, float V1)
 {
     // Linear interpolation to find zero crossing
-    float t = FMath::Clamp(-V0 / (V1 - V0 + SMALL_NUMBER), 0.f, 1.f);
+    float t = FMath::Clamp(-V0 / (V1 - V0 + UE_SMALL_NUMBER), 0.f, 1.f);
     return FMath::Lerp(P0, P1, t);
 }
 ```
 
-### Cube Processing
+### Cube processing
 
 ```cpp
 // EdgeTable and TriTable are standard 256-entry lookup tables from the original
@@ -254,7 +302,7 @@ void ProcessCube(const FDensityGrid& Grid, int32 X, int32 Y, int32 Z,
 }
 ```
 
-### Full Grid March
+### Full grid march
 
 ```cpp
 void MarchCubes(const FDensityGrid& Grid, UProceduralMeshComponent* Mesh)
@@ -287,11 +335,11 @@ void MarchCubes(const FDensityGrid& Grid, UProceduralMeshComponent* Mesh)
 
 ---
 
-## 3. Dungeon Room-and-Corridor Generation
+## Dungeon room-and-corridor generation
 
 BSP-based dungeon layout that partitions a rect into rooms and connects them.
 
-### Data Structures
+### Data structures
 
 ```cpp
 struct FRoom
@@ -312,7 +360,7 @@ struct FDungeonLevel
 };
 ```
 
-### BSP Split
+### BSP split
 
 ```cpp
 void SplitRect(const FIntRect& Rect, FRandomStream& Rand,
@@ -347,7 +395,7 @@ void SplitRect(const FIntRect& Rect, FRandomStream& Rand,
 }
 ```
 
-### Room Placement and Corridor Carving
+### Room placement and corridor carving
 
 ```cpp
 FDungeonLevel GenerateDungeon(int32 MapW, int32 MapH, int32 Seed,
@@ -415,10 +463,10 @@ FDungeonLevel GenerateDungeon(int32 MapW, int32 MapH, int32 Seed,
 }
 ```
 
-### Tile-to-Mesh Conversion
+### Tile-to-mesh conversion
 
 ```cpp
-void ADungeonActor::BuildMeshFromTiles(const FDungeonLevel& Level, float TileSize)
+void AMyProceduralActor::BuildMeshFromTiles(const FDungeonLevel& Level, float TileSize)
 {
     TArray<FVector>       Vertices;
     TArray<int32>         Triangles;
@@ -465,11 +513,11 @@ void ADungeonActor::BuildMeshFromTiles(const FDungeonLevel& Level, float TileSiz
 
 ---
 
-## 4. L-System Vegetation
+## L-system vegetation
 
 L-systems expand a string through production rules and interpret characters as 3D drawing commands (turtle graphics) to produce branching structures.
 
-### Axiom and Rules
+### Axiom and rules
 
 ```cpp
 struct FLSystemRules
@@ -505,7 +553,7 @@ FString ExpandLSystem(const FLSystemRules& Rules)
 }
 ```
 
-### Turtle Interpreter to HISM
+### Turtle interpreter to HISM
 
 ```cpp
 struct FTurtleState
@@ -538,8 +586,9 @@ void InterpretLSystem(const FString& LString, const FLSystemRules& Rules,
             FTransform T;
             T.SetLocation((State.Position + End) * 0.5f);
             T.SetRotation(State.Rotation.Quaternion());
-            T.SetScale3D(FVector(State.Width * 0.01f, State.Width * 0.01f,
-                                  State.Length * 0.01f));
+            // Rotation.Vector() is local +X, so stretch X (assumes a 100-unit branch mesh along +X)
+            T.SetScale3D(FVector(State.Length * 0.01f, State.Width * 0.01f,
+                                  State.Width * 0.01f));
             BranchHISM->AddInstance(T, /*bWorldSpace=*/false);
 
             State.Position = End;
@@ -574,11 +623,11 @@ void InterpretLSystem(const FString& LString, const FLSystemRules& Rules,
 
 ---
 
-## 5. Wave Function Collapse (Grid Layout)
+## Wave function collapse (grid layout)
 
 WFC fills a grid by choosing tiles that satisfy adjacency constraints. Suitable for dungeon rooms, city blocks, terrain biome transitions.
 
-### Tile and Constraint Definition
+### Tile and constraint definition
 
 ```cpp
 // Each tile has a set of valid neighbor tile IDs per direction
@@ -604,7 +653,7 @@ struct FWFCCell
 };
 ```
 
-### WFC Iteration
+### WFC iteration
 
 ```cpp
 bool WFCStep(TArray<TArray<FWFCCell>>& Grid,
@@ -613,7 +662,7 @@ bool WFCStep(TArray<TArray<FWFCCell>>& Grid,
              int32 Width, int32 Height)
 {
     // 1. Find uncollapsed cell with lowest entropy
-    float MinEntropy = FLT_MAX;
+    float MinEntropy = TNumericLimits<float>::Max();
     FIntPoint CollapsePos(-1, -1);
 
     for (int32 Y = 0; Y < Height; Y++)
@@ -694,7 +743,7 @@ bool WFCStep(TArray<TArray<FWFCCell>>& Grid,
 }
 ```
 
-### Grid Initialization and Run
+### Grid initialization and run
 
 ```cpp
 void RunWFC(int32 Width, int32 Height, const TArray<FWFCTile>& Tiles,
@@ -729,57 +778,63 @@ void RunWFC(int32 Width, int32 Height, const TArray<FWFCTile>& Tiles,
 
 ---
 
-## 6. Async Mesh Generation Pattern
+## Async mesh generation pattern
 
 For large meshes, compute vertex data on a background thread then apply on the game thread.
 
 ```cpp
-void AProceduralTerrain::GenerateAsync(int32 GridSize, float CellSize)
-{
-    // Capture data needed on background thread
-    int32 Seed = SeedValue;
+// Pure computation: no UObject access, so it is safe on any thread
+void BuildHeightGrid(int32 GridSize, float CellSize, int32 Seed, TArray<FVector>& OutVertices,
+                     TArray<int32>& OutTriangles, TArray<FVector>& OutNormals, TArray<FVector2D>& OutUVs);
 
-    // Lambda runs on a background worker thread
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [this, GridSize, CellSize, Seed]()
+void AMyProceduralActor::GenerateAsync(int32 GridSize, float CellSize, int32 Seed)
+{
+    TWeakObjectPtr<AMyProceduralActor> WeakThis(this);
+
+    // Runs on a background worker thread
+    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [WeakThis, GridSize, CellSize, Seed]()
     {
         TArray<FVector>   Vertices;
         TArray<int32>     Triangles;
         TArray<FVector>   Normals;
         TArray<FVector2D> UVs;
 
-        // -- heavy computation here --
-        // GenerateTerrainData(GridSize, CellSize, Seed, Vertices, Triangles, Normals, UVs);
+        BuildHeightGrid(GridSize, CellSize, Seed, Vertices, Triangles, Normals, UVs);
 
-        // Schedule the mesh section creation back on the game thread
-        AsyncTask(ENamedThreads::GameThread, [this,
-                                               V = MoveTemp(Vertices),
-                                               T = MoveTemp(Triangles),
-                                               N = MoveTemp(Normals),
-                                               UV = MoveTemp(UVs)]() mutable
+        // Hand the finished arrays back to the game thread
+        AsyncTask(ENamedThreads::GameThread, [WeakThis,
+                                              MovedVertices  = MoveTemp(Vertices),
+                                              MovedTriangles = MoveTemp(Triangles),
+                                              MovedNormals   = MoveTemp(Normals),
+                                              MovedUVs       = MoveTemp(UVs)]() mutable
         {
-            if (!IsValid(this) || !IsValid(ProceduralMesh)) return;
+            AMyProceduralActor* Actor = WeakThis.Get();
+            if (!Actor || !Actor->ProceduralMesh)
+            {
+                return;
+            }
 
-            TArray<FColor> Colors;
-            TArray<FProcMeshTangent> Tangents;
-
-            ProceduralMesh->CreateMeshSection(0, V, T, N,
-                                               UV, Colors, Tangents,
-                                               /*bCreateCollision=*/true);
+            const TArray<FColor> Colors;
+            const TArray<FProcMeshTangent> Tangents;
+            Actor->ProceduralMesh->CreateMeshSection(0, MovedVertices, MovedTriangles, MovedNormals,
+                MovedUVs, Colors, Tangents, /*bCreateCollision=*/true);
         });
     });
 }
 ```
 
-Note: `UProceduralMeshComponent::CreateMeshSection` must be called on the **game thread**. Only the data computation can be parallelized.
+`BuildHeightGrid` fills the arrays from `SampleOctaveNoise` using the grid layout above.
+
+Only the data computation can be parallelised: `CreateMeshSection` allocates render resources and must run on the game thread. Capture a `TWeakObjectPtr`, never a raw `this`, because the actor can be destroyed while the worker runs. For the wider task-graph rules, see `ue-async-threading`.
 
 ---
 
-## 7. Spline-Driven Road Mesh
+## Spline-driven road mesh
 
 Generates a road mesh by extruding a cross-section profile along a `USplineComponent`.
 
 ```cpp
-void ARoadMeshActor::BuildRoad(float RoadWidth, float SegmentLength)
+void AMyProceduralActor::BuildRoad(float RoadWidth, float SegmentLength)
 {
     TArray<FVector>       Vertices;
     TArray<int32>         Triangles;
@@ -818,10 +873,9 @@ void ARoadMeshActor::BuildRoad(float RoadWidth, float SegmentLength)
         {
             int32 B = (Seg - 1) * 2;
             int32 T2 = Seg * 2;
-            // Left triangle
-            Triangles.Add(B);     Triangles.Add(T2);     Triangles.Add(B + 1);
-            // Right triangle
-            Triangles.Add(B + 1); Triangles.Add(T2);     Triangles.Add(T2 + 1);
+            // Counter-clockwise seen from above (Left_V is -Right, Right_V is +Right)
+            Triangles.Add(B);     Triangles.Add(B + 1);  Triangles.Add(T2);
+            Triangles.Add(B + 1); Triangles.Add(T2 + 1); Triangles.Add(T2);
         }
 
         UVProgress += ActualSeg / RoadWidth; // Scale UV to aspect ratio
@@ -835,7 +889,121 @@ void ARoadMeshActor::BuildRoad(float RoadWidth, float SegmentLength)
 
 ---
 
-## Performance Reference
+## Vegetation scatter (HISM)
+
+Seeded scatter that projects onto whatever geometry is below, fills a per-instance float channel, and uploads the whole batch in one call.
+
+```cpp
+void AMyProceduralActor::ScatterVegetation(UStaticMesh* TreeMesh, int32 Count, int32 Seed,
+                                           const FVector& ExtentMin, const FVector& ExtentMax)
+{
+    Hism->SetStaticMesh(TreeMesh);
+    Hism->SetNumCustomDataFloats(1);
+    Hism->SetCullDistances(6000, 20000);
+    Hism->PreAllocateInstancesMemory(Count);
+
+    FRandomStream Stream(Seed);
+    TArray<FTransform> Transforms;
+    Transforms.Reserve(Count);
+
+    for (int32 Index = 0; Index < Count; ++Index)
+    {
+        FVector Location(Stream.FRandRange(ExtentMin.X, ExtentMax.X),
+                         Stream.FRandRange(ExtentMin.Y, ExtentMax.Y),
+                         ExtentMax.Z);
+
+        FHitResult Hit;
+        FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(ScatterVegetation), /*bInTraceComplex=*/true, this);
+        if (GetWorld()->LineTraceSingleByChannel(Hit, Location,
+                FVector(Location.X, Location.Y, ExtentMin.Z), ECC_WorldStatic, QueryParams))
+        {
+            Location.Z = Hit.ImpactPoint.Z;
+        }
+        else
+        {
+            continue; // Nothing to stand on
+        }
+
+        Transforms.Emplace(FRotator(0.0, Stream.FRandRange(0.0, 360.0), 0.0), Location,
+            FVector(Stream.FRandRange(0.8, 1.3)));
+    }
+
+    const TArray<int32> Indices = Hism->AddInstances(Transforms, /*bShouldReturnIndices=*/true,
+        /*bWorldSpace=*/true);
+
+    for (int32 Index = 0; Index < Indices.Num(); ++Index)
+    {
+        // Channel 0 feeds a per-instance colour or wind-phase offset in the material
+        Hism->SetCustomDataValue(Indices[Index], 0, Stream.FRand(), /*bMarkRenderStateDirty=*/false);
+    }
+
+    Hism->MarkRenderStateDirty();
+}
+```
+
+Points worth keeping:
+
+- Build the whole `TArray<FTransform>` first; one `AddInstances` beats N `AddInstance` calls.
+- `PreAllocateInstancesMemory` avoids repeated reallocation of the per-instance arrays.
+- Leave `bMarkRenderStateDirty` false inside the loop and call `MarkRenderStateDirty()` once.
+- Everything derives from a single `FRandomStream`, so the same seed reproduces the same forest.
+
+---
+
+## Dynamic mesh with Geometry Script
+
+`ADynamicMeshActor` already owns a `UDynamicMeshComponent`, so a generator actor only needs to fill its `UDynamicMesh`.
+
+```cpp
+// MyPillarActor.h
+#pragma once
+
+#include "DynamicMeshActor.h"
+#include "MyPillarActor.generated.h"
+
+UCLASS()
+class MYGAME_API AMyPillarActor : public ADynamicMeshActor
+{
+    GENERATED_BODY()
+
+public:
+    UFUNCTION(BlueprintCallable, Category = "My Pillar")
+    void BuildPillar(float Height);
+};
+```
+
+```cpp
+// MyPillarActor.cpp
+#include "MyPillarActor.h"
+
+#include "Components/DynamicMeshComponent.h"
+#include "GeometryScript/MeshNormalsFunctions.h"
+#include "GeometryScript/MeshPrimitiveFunctions.h"
+
+void AMyPillarActor::BuildPillar(float Height)
+{
+    UDynamicMeshComponent* Component = GetDynamicMeshComponent();
+    UDynamicMesh* Mesh = Component->GetDynamicMesh();
+
+    FGeometryScriptPrimitiveOptions PrimitiveOptions;
+    UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(Mesh, PrimitiveOptions, FTransform::Identity,
+        100.0f, 100.0f, Height, 0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+
+    FGeometryScriptCalculateNormalsOptions NormalsOptions;
+    UGeometryScriptLibrary_MeshNormalsFunctions::RecomputeNormals(Mesh, NormalsOptions);
+
+    Component->NotifyMeshUpdated();
+    Component->UpdateCollision(/*bOnlyIfPending=*/false);
+}
+```
+
+Every Geometry Script call takes the `UDynamicMesh` and returns it, so operations chain: append primitives, `ApplyMeshBoolean` to carve openings, `ApplyPerlinNoiseToMesh2` to roughen the surface, then `RecomputeNormals`. Call `NotifyMeshUpdated()` once at the end, and `UpdateCollision(false)` only if the mesh needs physics.
+
+Modules: `GeometryFramework` for the component and actor, `GeometryScriptingCore` for the function libraries.
+
+---
+
+## Performance reference
 
 | Scenario | Recommended Approach | Notes |
 |---|---|---|
@@ -851,7 +1019,7 @@ void ARoadMeshActor::BuildRoad(float RoadWidth, float SegmentLength)
 
 ---
 
-## 9. Poisson Disc Sampling
+## Poisson disc sampling
 
 Generates uniformly distributed points with minimum separation distance (Bridson 2007). Use for natural-looking placement (trees, rocks, enemies) without clumping.
 
@@ -883,7 +1051,7 @@ TArray<FVector2D> PoissonDiscSample(FVector2D Min, FVector2D Max,
 
         for (int32 k = 0; k < MaxAttempts; k++)
         {
-            float Angle = Rand.FRandRange(0.f, 2.f * PI);
+            const float Angle = Rand.FRandRange(0.f, 2.f * UE_PI);
             float R = Rand.FRandRange(MinDist, 2.f * MinDist);
             FVector2D Candidate = Base + FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) * R;
 
@@ -922,19 +1090,27 @@ TArray<FVector2D> PoissonDiscSample(FVector2D Min, FVector2D Max,
 }
 ```
 
-**Usage with ISM placement:**
+**Usage with instanced placement:**
 
 ```cpp
-FRandomStream Stream(MySeed);
-TArray<FVector2D> Placements = PoissonDiscSample(
-    FVector2D(0, 0), FVector2D(10000, 10000), 200.f, 30, Stream);
-
-for (const FVector2D& Pos : Placements)
+void AMyProceduralActor::ScatterWithPoisson(int32 Seed, float MinDistance)
 {
-    FTransform T(FRotator(0, Stream.FRandRange(0, 360), 0),
-        FVector(Pos.X, Pos.Y, GetGroundHeight(Pos)));
-    TreeISM->AddInstance(T);
+    FRandomStream Stream(Seed);
+    const TArray<FVector2D> Placements = PoissonDiscSample(
+        FVector2D(0.0, 0.0), FVector2D(10000.0, 10000.0), MinDistance, 30, Stream);
+
+    TArray<FTransform> Transforms;
+    Transforms.Reserve(Placements.Num());
+
+    for (const FVector2D& Position : Placements)
+    {
+        const FVector Location(Position.X, Position.Y, 0.0);
+        Transforms.Emplace(FRotator(0.0, Stream.FRandRange(0.0, 360.0), 0.0), Location,
+            FVector::OneVector);
+    }
+
+    Hism->AddInstances(Transforms, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/false);
 }
 ```
 
-Key properties: O(n) time complexity, guaranteed minimum separation, deterministic with `FRandomStream` seed. Increase `MaxAttempts` (default 30) for denser packing; decrease for faster generation.
+Guaranteed minimum separation, and deterministic for a given `FRandomStream` seed. Raise `MaxAttempts` for denser packing, lower it for speed.

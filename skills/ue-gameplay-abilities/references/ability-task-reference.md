@@ -1,26 +1,35 @@
 # Ability Task Reference
 
-Common built-in `UAbilityTask` subclasses and how to create custom tasks.
-Ability tasks extend ability execution across multiple frames using internal latent logic.
-
-All tasks must be called from within `ActivateAbility` (or from within other tasks).
-Tasks broadcast results via dynamic delegates. When the task completes, call `EndAbility`
-if the ability is meant to end at that point.
+Built-in `UAbilityTask` subclasses with their 5.8 factory signatures, plus the custom-task template.
+Target engine: UE 5.8. Headers: `Abilities/Tasks/*.h`.
 
 ---
 
-## How Ability Tasks Work
+## The task pattern
 
-1. Create the task via a static factory function (never call `new` directly).
-2. Bind delegates for each outcome (OnCompleted, OnInterrupted, etc.).
-3. Call `ReadyForActivation()` to start the task.
-4. The task runs asynchronously; the ability remains active but yields.
-5. In delegate callbacks, perform follow-up logic and call `EndAbility` when done.
+1. Call the static factory (never `NewObject` and never `new`).
+2. Bind every delegate you care about.
+3. Call `ReadyForActivation()` — inherited from `UGameplayTask`, not declared on `UAbilityTask`.
+4. The ability stays active; the task calls back when its event fires.
+5. In the callback, run the follow-up logic and call `EndAbility` when the ability is finished.
 
 ```cpp
-// Typical task usage in ActivateAbility:
-void UMyAbility::ActivateAbility(...)
+// Declarations inside the ability class:
+UFUNCTION()
+void HandleMontageCompleted();
+
+UFUNCTION()
+void HandleMontageInterrupted();
+```
+
+```cpp
+void UMyAbility::ActivateAbility(const FGameplayAbilitySpecHandle Handle,
+    const FGameplayAbilityActorInfo* ActorInfo,
+    const FGameplayAbilityActivationInfo ActivationInfo,
+    const FGameplayEventData* TriggerEventData)
 {
+    Super::ActivateAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
+
     if (!CommitAbility(Handle, ActorInfo, ActivationInfo))
     {
         EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
@@ -31,116 +40,126 @@ void UMyAbility::ActivateAbility(...)
         UAbilityTask_PlayMontageAndWait::CreatePlayMontageAndWaitProxy(
             this, NAME_None, AttackMontage, 1.f);
 
-    Task->OnCompleted.AddDynamic(this, &UMyAbility::OnMontageCompleted);
-    Task->OnInterrupted.AddDynamic(this, &UMyAbility::OnMontageInterrupted);
-    Task->OnCancelled.AddDynamic(this, &UMyAbility::OnMontageCancelled);
+    Task->OnCompleted.AddDynamic(this, &UMyAbility::HandleMontageCompleted);
+    Task->OnInterrupted.AddDynamic(this, &UMyAbility::HandleMontageInterrupted);
     Task->ReadyForActivation();
 }
 
-void UMyAbility::OnMontageCompleted()
+void UMyAbility::HandleMontageCompleted()
 {
     EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, false);
 }
 
-void UMyAbility::OnMontageInterrupted()
+void UMyAbility::HandleMontageInterrupted()
 {
     EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, true);
 }
+```
+
+Delegate bindings use `AddDynamic` because ability-task delegates are `DECLARE_DYNAMIC_MULTICAST_DELEGATE`
+types, so every bound function needs `UFUNCTION()`. The handlers used by the snippets below are
+declared in the ability's header like this:
+
+```cpp
+UFUNCTION()
+void HandleAttackHitEvent(FGameplayEventData Payload);
+
+UFUNCTION()
+void HandleDelayFinished();
+
+UFUNCTION()
+void HandleValidTargetData(const FGameplayAbilityTargetDataHandle& Data);
+
+UFUNCTION()
+void HandleTargetingCancelled(const FGameplayAbilityTargetDataHandle& Data);
+
+UFUNCTION()
+void HandleHealthChanged();
+
+UFUNCTION()
+void HandleHealthBelowThreshold(bool bMatchesComparison, float CurrentValue);
+
+UFUNCTION()
+void HandleEffectApplied(AActor* Source, FGameplayEffectSpecHandle SpecHandle,
+    FActiveGameplayEffectHandle ActiveHandle);
 ```
 
 ---
 
 ## UAbilityTask_PlayMontageAndWait
 
-Plays an `AnimMontage` on the avatar actor's skeletal mesh and waits for it to finish.
-
 ```cpp
 #include "Abilities/Tasks/AbilityTask_PlayMontageAndWait.h"
 
 UAbilityTask_PlayMontageAndWait* Task =
     UAbilityTask_PlayMontageAndWait::CreatePlayMontageAndWaitProxy(
-        this,              // OwningAbility
-        NAME_None,         // Task instance name (NAME_None = auto)
-        AttackMontage,     // UAnimMontage* to play
-        1.f,               // Rate
-        NAME_None,         // StartSection (NAME_None = start from beginning)
-        false,             // bStopWhenAbilityEnds
-        1.f);              // AnimRootMotionTranslationScale
-
-Task->OnCompleted.AddDynamic(this, &UMyAbility::OnMontageCompleted);
-Task->OnBlendOut.AddDynamic(this, &UMyAbility::OnMontageBlendOut);
-Task->OnInterrupted.AddDynamic(this, &UMyAbility::OnMontageInterrupted);
-Task->OnCancelled.AddDynamic(this, &UMyAbility::OnMontageCancelled);
+        this,          // OwningAbility
+        NAME_None,     // TaskInstanceName
+        AttackMontage, // UAnimMontage*
+        1.f,           // Rate
+        NAME_None,     // StartSection
+        true,          // bStopWhenAbilityEnds
+        1.f,           // AnimRootMotionTranslationScale
+        0.f,           // StartTimeSeconds
+        false);        // bAllowInterruptAfterBlendOut
 Task->ReadyForActivation();
 ```
 
-Delegates:
-- `OnCompleted`: Montage finished playing
-- `OnBlendOut`: Montage started blending out
-- `OnInterrupted`: Montage was interrupted by another montage
-- `OnCancelled`: Task was cancelled (EndAbility called while running)
+Delegates: `OnCompleted`, `OnBlendedIn`, `OnBlendOut`, `OnInterrupted`, `OnCancelled`, all
+`FMontageWaitSimpleDelegate` (no parameters).
+
+`UAbilityTask_PlayAnimAndWait` is the equivalent for a raw `UAnimSequence` played into a slot:
+`CreatePlayAnimAndWaitProxy(OwningAbility, TaskInstanceName, AnimSequence, SlotName, BlendInTime, BlendOutTime, InPlayRate, StartTimeSeconds, bStopWhenAbilityEnds, AnimRootMotionTranslationScale, InPlayCount)`,
+with the same delegate set plus `OnBlendIn`. Montage authoring itself is `ue-animation-system`.
 
 ---
 
 ## UAbilityTask_WaitGameplayEvent
 
-Waits for a `FGameplayEventData` to be sent via `HandleGameplayEvent` on the ASC.
-Common use: waiting for an animation notify to trigger (e.g., `Event.Montage.Attack.Hit`).
-
 ```cpp
 #include "Abilities/Tasks/AbilityTask_WaitGameplayEvent.h"
 
-FGameplayTag EventTag = FGameplayTag::RequestGameplayTag("Event.Montage.Attack.Hit");
-
 UAbilityTask_WaitGameplayEvent* Task =
     UAbilityTask_WaitGameplayEvent::WaitGameplayEvent(
-        this,
-        EventTag,
-        nullptr,  // OptionalExternalTarget (null = use self ASC)
-        true,     // TriggerOnce (false = keep listening)
-        true);    // OnlyMatchExact
-
-Task->EventReceived.AddDynamic(this, &UMyAbility::OnAttackHitEvent);
+        this,      // OwningAbility
+        EventTag,  // FGameplayTag
+        nullptr,   // OptionalExternalTarget
+        true,      // OnlyTriggerOnce
+        true);     // OnlyMatchExact
+Task->EventReceived.AddDynamic(this, &UMyAbility::HandleAttackHitEvent);
 Task->ReadyForActivation();
 ```
 
-Sending the event (e.g., from an `AnimNotify`):
+Delegate: `EventReceived(FGameplayEventData Payload)`. Send the event from an anim notify or from
+gameplay code:
+
 ```cpp
-// In AnimNotify or character code:
+#include "AbilitySystemBlueprintLibrary.h"
+
 FGameplayEventData EventData;
 EventData.Instigator = GetOwner();
-UAbilitySystemBlueprintLibrary::SendGameplayEventToActor(
-    GetOwner(),
-    FGameplayTag::RequestGameplayTag("Event.Montage.Attack.Hit"),
-    EventData);
+UAbilitySystemBlueprintLibrary::SendGameplayEventToActor(GetOwner(), EventTag, EventData);
 ```
-
-Delegate: `EventReceived(FGameplayEventData Payload)`
 
 ---
 
 ## UAbilityTask_WaitDelay
 
-Waits for a fixed duration and then fires a callback. Equivalent to a GAS-aware timer.
-
 ```cpp
 #include "Abilities/Tasks/AbilityTask_WaitDelay.h"
 
-UAbilityTask_WaitDelay* Task =
-    UAbilityTask_WaitDelay::WaitDelay(this, 2.f); // 2 second delay
-
-Task->OnFinish.AddDynamic(this, &UMyAbility::OnDelayFinished);
+UAbilityTask_WaitDelay* Task = UAbilityTask_WaitDelay::WaitDelay(this, 2.f);
+Task->OnFinish.AddDynamic(this, &UMyAbility::HandleDelayFinished);
 Task->ReadyForActivation();
 ```
 
-Delegate: `OnFinish()`
+Delegate: `OnFinish()`.
 
 ---
 
 ## UAbilityTask_WaitTargetData
 
-Spawns a `AGameplayAbilityTargetActor` to gather targeting information (line trace,
-sphere trace, actor selection, etc.) and returns `FGameplayAbilityTargetDataHandle`.
+Spawns an `AGameplayAbilityTargetActor` and returns an `FGameplayAbilityTargetDataHandle`.
 
 ```cpp
 #include "Abilities/Tasks/AbilityTask_WaitTargetData.h"
@@ -150,58 +169,56 @@ UAbilityTask_WaitTargetData* Task =
     UAbilityTask_WaitTargetData::WaitTargetData(
         this,
         NAME_None,
-        EGameplayTargetingConfirmation::Instant, // Instant, UserConfirmed, Custom, etc.
+        EGameplayTargetingConfirmation::Instant,
         AGameplayAbilityTargetActor_SingleLineTrace::StaticClass());
-
-Task->ValidData.AddDynamic(this, &UMyAbility::OnValidTargetData);
-Task->Cancelled.AddDynamic(this, &UMyAbility::OnTargetCancelled);
+Task->ValidData.AddDynamic(this, &UMyAbility::HandleValidTargetData);
+Task->Cancelled.AddDynamic(this, &UMyAbility::HandleTargetingCancelled);
 Task->ReadyForActivation();
 ```
 
-Targeting confirmation modes:
-| Mode | Behavior |
-|------|----------|
-| `Instant` | Confirms immediately upon spawn |
-| `UserConfirmed` | Waits for `SendGameplayEvent` with confirm tag |
-| `Custom` | Custom confirmation logic in the TargetActor |
-| `CustomMulti` | Confirms multiple targets over time |
+| `EGameplayTargetingConfirmation` | Behaviour |
+|---|---|
+| `Instant` | Confirms as soon as the target actor produces data |
+| `UserConfirmed` | Waits for the player's confirm input |
+| `Custom` | The ability decides when data is ready |
+| `CustomMulti` | As `Custom`, but the target actor is not destroyed after producing data |
 
-Delegate `ValidData(FGameplayAbilityTargetDataHandle Data)`:
 ```cpp
-void UMyAbility::OnValidTargetData(const FGameplayAbilityTargetDataHandle& Data)
+void UMyAbility::HandleValidTargetData(const FGameplayAbilityTargetDataHandle& Data)
 {
-    // Apply effect to targets
-    FGameplayEffectSpecHandle SpecHandle = MakeOutgoingGameplayEffectSpec(DamageEffect, Level);
+    const FGameplayEffectSpecHandle SpecHandle =
+        MakeOutgoingGameplayEffectSpec(DamageEffect, GetAbilityLevel());
     ApplyGameplayEffectSpecToTarget(CurrentSpecHandle, CurrentActorInfo,
         CurrentActivationInfo, SpecHandle, Data);
     EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, false);
 }
 ```
 
+Other target actors: `AGameplayAbilityTargetActor_GroundTrace`, `..._Radius`,
+`..._ActorPlacement`, `..._Trace`.
+
 ---
 
-## UAbilityTask_WaitAttributeChange
-
-Waits for an attribute to cross a threshold or change at all.
+## Attribute tasks
 
 ```cpp
 #include "Abilities/Tasks/AbilityTask_WaitAttributeChange.h"
 
+// Engine parameter names are WithSrcTag / WithoutSrcTag.
 UAbilityTask_WaitAttributeChange* Task =
     UAbilityTask_WaitAttributeChange::WaitForAttributeChange(
         this,
         UMyHealthSet::GetHealthAttribute(),
-        FGameplayTag(),    // WithTag: optional, only trigger if ASC has this tag
-        FGameplayTag(),    // WithoutTag: only trigger if ASC lacks this tag
-        true);             // TriggerOnce
-
-Task->OnChange.AddDynamic(this, &UMyAbility::OnHealthChanged);
+        FGameplayTag(),
+        FGameplayTag(),
+        true);
+Task->OnChange.AddDynamic(this, &UMyAbility::HandleHealthChanged);
 Task->ReadyForActivation();
 ```
 
-Delegate: `OnChange()`
+`WaitForAttributeChangeWithComparison(OwningAbility, InAttribute, InWithTag, InWithoutTag, InComparisonType, InComparisonValue, TriggerOnce, OptionalExternalOwner)`
+adds a comparison to the same task.
 
-For threshold-based (separate class — `UAbilityTask_WaitAttributeChangeThreshold`):
 ```cpp
 #include "Abilities/Tasks/AbilityTask_WaitAttributeChangeThreshold.h"
 
@@ -210,81 +227,111 @@ UAbilityTask_WaitAttributeChangeThreshold* Task =
         this,
         UMyHealthSet::GetHealthAttribute(),
         EWaitAttributeChangeComparison::LessThan,
-        0.3f,    // Compare against: below 30%
-        false,   // bTriggerOnce
+        30.f,
+        false,
         nullptr);
-
-Task->OnChange.AddDynamic(this, &UMyAbility::OnHealthBelowThreshold);
+Task->OnChange.AddDynamic(this, &UMyAbility::HandleHealthBelowThreshold);
 Task->ReadyForActivation();
 ```
 
-Delegate: `OnChange(bool bMatchesComparison, float CurrentValue)`
+`EWaitAttributeChangeComparison`: `None`, `GreaterThan`, `LessThan`, `GreaterThanOrEqualTo`,
+`LessThanOrEqualTo`, `NotEqualTo`, `ExactlyEqualTo`. The threshold delegate is
+`OnChange(bool bMatchesComparison, float CurrentValue)`.
+`UAbilityTask_WaitAttributeChangeRatioThreshold` does the same for the ratio of two attributes.
 
 ---
 
-## UAbilityTask_WaitGameplayEffectApplied
-
-Fires when a GameplayEffect matching specified tag requirements is applied to a target.
+## Effect and tag tasks
 
 ```cpp
-#include "Abilities/Tasks/AbilityTask_WaitGameplayEffectApplied.h"
+#include "Abilities/Tasks/AbilityTask_WaitGameplayEffectApplied_Self.h"
 
-FGameplayTargetDataFilterHandle FilterHandle;
-FGameplayTagRequirements SourceTagReqs;
-FGameplayTagRequirements TargetTagReqs;
-FGameplayTagRequirements AssetTagReqs;    // Tags the GE asset itself must have
-FGameplayTagRequirements GrantedTagReqs; // Tags the GE grants to the target
+FGameplayTargetDataFilterHandle SourceFilter;
+FGameplayTagRequirements SourceTagRequirements;
+FGameplayTagRequirements TargetTagRequirements;
+FGameplayTagRequirements AssetTagRequirements;
+FGameplayTagRequirements GrantedTagRequirements;
 
 UAbilityTask_WaitGameplayEffectApplied_Self* Task =
     UAbilityTask_WaitGameplayEffectApplied_Self::WaitGameplayEffectAppliedToSelf(
         this,
-        FilterHandle,
-        SourceTagReqs,
-        TargetTagReqs,
-        AssetTagReqs,
-        GrantedTagReqs,
-        false /*TriggerOnce*/,
-        nullptr /*OptionalExternalOwner*/,
-        false /*ListenForPeriodicEffect*/);
-
-Task->OnApplied.AddDynamic(this, &UMyAbility::OnEffectApplied);
+        SourceFilter,
+        SourceTagRequirements,
+        TargetTagRequirements,
+        AssetTagRequirements,
+        GrantedTagRequirements,
+        false,    // TriggerOnce
+        nullptr,  // OptionalExternalOwner
+        false);   // ListenForPeriodicEffect
+Task->OnApplied.AddDynamic(this, &UMyAbility::HandleEffectApplied);
 Task->ReadyForActivation();
 ```
 
+`WaitGameplayEffectAppliedToSelf_Query` takes four `FGameplayTagQuery` values instead of the
+`FGameplayTagRequirements` — more expressive, slightly slower. `UAbilityTask_WaitGameplayEffectApplied_Target`
+mirrors both factories for effects this ASC applies to others.
+
+```cpp
+#include "Abilities/Tasks/AbilityTask_WaitGameplayTagQuery.h"
+
+UAbilityTask_WaitGameplayTagQuery* Task =
+    UAbilityTask_WaitGameplayTagQuery::WaitGameplayTagQuery(
+        this,
+        TagQuery,     // const FGameplayTagQuery
+        nullptr,      // InOptionalExternalTarget
+        EWaitGameplayTagQueryTriggerCondition::WhenTrue,
+        false);       // bOnlyTriggerOnce
+Task->ReadyForActivation();
+```
+
+`EWaitGameplayTagQueryTriggerCondition` is `WhenTrue` or `WhenFalse`. If the query already matches
+when the task activates, it broadcasts immediately. Its `Triggered` delegate is a **protected**
+member, as is `TagCountChanged` on `UAbilityTask_WaitGameplayTagCountChanged`
+(`WaitGameplayTagCountChange(OwningAbility, Tag, InOptionalExternalTarget)`): bind them from
+Blueprint, or from a subclass of the task. Pure C++ that only needs the callback is usually better
+served by `ASC->RegisterGameplayTagEvent(Tag, EGameplayTagEventType::NewOrRemoved)`.
+
+`UAbilityTask_WaitGameplayTagAdded` and `UAbilityTask_WaitGameplayTagRemoved`, in
+`AbilityTask_WaitGameplayTag.h`, cover the simple add/remove cases.
+
+Other useful tasks: `UAbilityTask_WaitGameplayEffectRemoved`, `UAbilityTask_WaitGameplayEffectStackChange`,
+`UAbilityTask_WaitGameplayEffectBlockedImmunity`, `UAbilityTask_WaitInputPress`,
+`UAbilityTask_WaitInputRelease`, `UAbilityTask_WaitConfirmCancel`, `UAbilityTask_WaitMovementModeChange`,
+`UAbilityTask_WaitOverlap`, `UAbilityTask_NetworkSyncPoint`, `UAbilityTask_Repeat`,
+`UAbilityTask_SpawnActor`, and the root-motion family (`UAbilityTask_ApplyRootMotionConstantForce`,
+`UAbilityTask_ApplyRootMotionJumpForce`, `UAbilityTask_ApplyRootMotionMoveToForce`,
+`UAbilityTask_ApplyRootMotionMoveToActorForce`, `UAbilityTask_ApplyRootMotionRadialForce`).
+
 ---
 
-## Creating a Custom Ability Task
+## Custom ability task
 
 ```cpp
 // MyAbilityTask_WaitInputRelease.h
 #pragma once
+
 #include "Abilities/Tasks/AbilityTask.h"
 #include "MyAbilityTask_WaitInputRelease.generated.h"
 
-DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnInputReleased);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FMyInputReleasedDelegate);
 
 UCLASS()
-class UMyAbilityTask_WaitInputRelease : public UAbilityTask
+class MYGAME_API UMyAbilityTask_WaitInputRelease : public UAbilityTask
 {
     GENERATED_BODY()
+
 public:
-    // Factory function: always use a static factory, never construct directly
     UFUNCTION(BlueprintCallable, Category = "Ability|Tasks",
         meta = (HidePin = "OwningAbility", DefaultToSelf = "OwningAbility",
-                BlueprintInternalUseOnly = "true"))
-    static UMyAbilityTask_WaitInputRelease* WaitInputRelease(
-        UGameplayAbility* OwningAbility,
-        bool bTestAlreadyReleased = false);
+                BlueprintInternalUseOnly = "TRUE"))
+    static UMyAbilityTask_WaitInputRelease* WaitInputRelease(UGameplayAbility* OwningAbility);
 
     UPROPERTY(BlueprintAssignable)
-    FOnInputReleased OnReleased;
+    FMyInputReleasedDelegate OnReleased;
 
     virtual void Activate() override;
     virtual void TickTask(float DeltaTime) override;
     virtual void OnDestroy(bool bInOwnerFinished) override;
-
-private:
-    bool bStartedAlreadyReleased = false;
 };
 ```
 
@@ -294,36 +341,35 @@ private:
 #include "AbilitySystemComponent.h"
 
 UMyAbilityTask_WaitInputRelease* UMyAbilityTask_WaitInputRelease::WaitInputRelease(
-    UGameplayAbility* OwningAbility,
-    bool bTestAlreadyReleased)
+    UGameplayAbility* OwningAbility)
 {
-    UMyAbilityTask_WaitInputRelease* Task =
-        NewAbilityTask<UMyAbilityTask_WaitInputRelease>(OwningAbility);
-    Task->bStartedAlreadyReleased = bTestAlreadyReleased;
-    return Task;
+    return NewAbilityTask<UMyAbilityTask_WaitInputRelease>(OwningAbility);
 }
 
 void UMyAbilityTask_WaitInputRelease::Activate()
 {
-    // Enable ticking so we can poll input state
+    Super::Activate();
     bTickingTask = true;
 }
 
 void UMyAbilityTask_WaitInputRelease::TickTask(float DeltaTime)
 {
-    // GetAbilitySpecHandle and AbilitySystemComponent come from UAbilityTask base
-    if (AbilitySystemComponent.IsValid())
+    Super::TickTask(DeltaTime);
+
+    if (!AbilitySystemComponent.IsValid())
     {
-        const FGameplayAbilitySpec* Spec =
-            AbilitySystemComponent->FindAbilitySpecFromHandle(GetAbilitySpecHandle());
-        if (Spec && !Spec->InputPressed)
+        return;
+    }
+
+    const FGameplayAbilitySpec* Spec =
+        AbilitySystemComponent->FindAbilitySpecFromHandle(GetAbilitySpecHandle());
+    if (Spec && !Spec->InputPressed)
+    {
+        if (ShouldBroadcastAbilityTaskDelegates())
         {
-            if (ShouldBroadcastAbilityTaskDelegates())
-            {
-                OnReleased.Broadcast();
-            }
-            EndTask();
+            OnReleased.Broadcast();
         }
+        EndTask();
     }
 }
 
@@ -333,59 +379,45 @@ void UMyAbilityTask_WaitInputRelease::OnDestroy(bool bInOwnerFinished)
 }
 ```
 
-Usage in an ability:
-```cpp
-UMyAbilityTask_WaitInputRelease* Task =
-    UMyAbilityTask_WaitInputRelease::WaitInputRelease(this);
-Task->OnReleased.AddDynamic(this, &UMyChargeAbility::OnInputReleased);
-Task->ReadyForActivation();
-```
+`AbilitySystemComponent` on `UAbilityTask` is a `TWeakObjectPtr<UAbilitySystemComponent>`, so always
+check `IsValid()` before dereferencing. `UAbilityTask::NewTask` is blocked by a `static_assert`;
+`NewAbilityTask<T>(OwningAbility, InstanceName)` is the only correct factory.
 
 ---
 
-## Task Lifecycle Notes
-
-- Tasks are automatically cleaned up when `EndAbility` or `CancelAbility` is called.
-- Call `EndTask()` inside the task when done; do not call `delete`.
-- `ShouldBroadcastAbilityTaskDelegates()` guards against broadcasting after the ability ends.
-- `bTickingTask = true` must be set in `Activate()` to enable `TickTask`. Default is false.
-- `NewAbilityTask<T>()` is the correct factory; never use `NewObject<T>()` for tasks.
-
----
-
-## Task Execution Flow
+## Task lifecycle
 
 ```
 ActivateAbility()
-    └── Task::WaitXxx() (static factory)
-    └── Bind delegates
-    └── Task::ReadyForActivation()
-            └── Task::Activate() [task starts its internal logic]
-                    └── (async frames pass)
-                    └── Event fires → delegate broadcast
-                            └── Ability callback runs gameplay logic
-                            └── EndAbility() called
-                                    └── Task::OnDestroy() cleanup
+  └─ static factory              → task object created, not running
+  └─ bind delegates
+  └─ ReadyForActivation()        → UGameplayTask starts the task
+        └─ Activate()            → task registers its listeners
+              └─ event fires     → delegate broadcast
+                    └─ EndAbility() or EndTask()
+                          └─ OnDestroy() cleanup
 ```
 
 ---
 
-## Common Task Mistakes
+## Common task mistakes
 
-**Not calling ReadyForActivation:** The task is created but never starts. Always call this after
-binding delegates.
+**No `ReadyForActivation()`:** the task exists but never runs, and the ability hangs until something
+else ends it.
 
-**Binding delegates after ReadyForActivation:** Some tasks fire synchronously in `Activate()`
-(e.g., `WaitDelay` with 0 duration). Bind delegates before calling `ReadyForActivation`.
+**Binding after `ReadyForActivation()`:** some tasks broadcast inside `Activate()` (a zero-length
+`WaitDelay`, a tag query that is already true). Bind first.
 
-**Calling EndAbility inside a task without ending the task first:** The task will linger.
-Let `EndAbility` clean it up, or call `EndTask()` explicitly if the task should stop without
-ending the ability.
+**Broadcasting after the ability ended:** guard every broadcast with
+`ShouldBroadcastAbilityTaskDelegates()`.
 
-**Broadcasting delegates after ability ends:** Always check `ShouldBroadcastAbilityTaskDelegates()`
-before broadcasting inside `TickTask` or callback functions to avoid operating on a cleaned-up
-ability.
+**Ticking without `bTickingTask`:** `TickTask` is never called unless `Activate()` sets
+`bTickingTask = true`.
 
-**Tick-heavy tasks in non-instanced abilities:** If `InstancingPolicy` is `NonInstanced`, the
-CDO runs the ability. Ticking tasks on a CDO can produce shared state issues. Use
-`InstancedPerActor` or `InstancedPerExecution` when using ticking tasks.
+**Binding a non-`UFUNCTION` handler:** `AddDynamic` on a dynamic multicast delegate fails at
+runtime if the callback is not marked `UFUNCTION()`.
+
+**Deleting tasks:** never `delete` a task. Call `EndTask()`, or let `EndAbility` tear it down.
+
+**Ticking tasks on an ability that runs on the CDO:** use `InstancedPerActor` or
+`InstancedPerExecution` so the task has per-instance state to work with.

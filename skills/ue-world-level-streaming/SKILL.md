@@ -1,489 +1,489 @@
 ---
 name: ue-world-level-streaming
-description: "Use this skill when working with World Partition, level streaming, level travel, OpenLevel, ServerTravel, data layer, world subsystem, level instance, sub-level, seamless travel, open world, or HLOD. See references/streaming-patterns.md for configuration patterns by game type."
+description: "Use when streaming levels in and out, setting up World Partition, or moving between maps. Also use when the user mentions 'level streaming', 'World Partition', 'data layer', 'UDataLayerManager', 'SetDataLayerRuntimeState', 'LoadStreamLevel', 'UnloadStreamLevel', 'ULevelStreamingDynamic', 'LoadLevelInstance', 'ALevelInstance', 'streaming source', 'streaming volume', 'HLOD', 'OpenLevel', 'ServerTravel', 'seamless travel', 'sub-level', 'open world', or 'UWorldSubsystem'. For replication and net relevancy, see ue-networking-replication; for GameMode travel callbacks, see ue-gameplay-framework; for saving world state to disk, see ue-serialization-savegames."
 metadata:
-  version: 1.0.0
+  version: "2.0.0"
+  engine: "5.8"
 ---
 
 # UE World & Level Streaming
 
-You are an expert in Unreal Engine's world management and level streaming systems.
+Target engine: **UE 5.8**. APIs below are verified against the 5.8 headers; older forms are listed under "Deprecated — do not use".
 
----
+This skill covers how a `UWorld` is composed and swapped at runtime: World Partition grids, data layers, HLOD, level instances, classic sub-level streaming, streaming volumes, and map travel. Everything here lives in the `Engine` module (`Engine/Source/Runtime/Engine`), so `Core`, `CoreUObject` and `Engine` in `PublicDependencyModuleNames` is all that is needed. The one exception is the Level Streaming Persistence plugin, which adds the `LevelStreamingPersistence` module.
+
+For end-to-end configurations per game type (open world, hub-and-spoke, procedural, chapter-based, volume-driven, dedicated server), see [streaming patterns](references/streaming-patterns.md).
 
 ## Context
 
-Read `.agents/ue-project-context.md` before advising. Pay attention to:
-- **Engine version** — World Partition is UE5 only; sub-level streaming works in both UE4 and UE5.
-- **Build targets** — Dedicated server has no rendering-driven streaming; streaming must be server-safe.
-- **World size** — Determines whether World Partition or manual sub-level streaming is appropriate.
-- **Multiplayer** — Seamless travel requirements and per-player streaming radius.
+Read `.agents/ue-project-context.md` if it exists (module names, conventions, enabled plugins, GAS/networking setup). Do not stop if it is missing.
 
----
+Identify the area from the request and the codebase. Ask only when two plausible readings would produce different code.
 
-## Information to Gather
+| Request is about… | Go to |
+|---|---|
+| Picking between World Partition and sub-levels | [Choosing a Streaming Model](#choosing-a-streaming-model) |
+| Grid streaming, streaming sources, blocking loads, CVars | [World Partition Runtime](#world-partition-runtime) |
+| Turning content on and off inside a partitioned world | [Data Layers](#data-layers) |
+| Reusable level chunks placed in the editor, packed actors | [Level Instances](#level-instances) |
+| `LoadStreamLevel`, `ULevelStreaming`, volumes, runtime instancing | [Sub-Level Streaming](#sub-level-streaming) |
+| `OpenLevel`, `ServerTravel`, `ClientTravel`, seamless travel | [Level Travel](#level-travel) |
+| Distant proxies for streamed-out cells | [HLOD](#hlod) |
+| Keeping actor changes across a streaming cycle | [Level Streaming Persistence](#level-streaming-persistence) |
+| Per-world managers, state that must survive travel | [World Subsystems and Cross-Level State](#world-subsystems-and-cross-level-state) |
 
-Before recommending a streaming approach, confirm:
+## Choosing a Streaming Model
 
-1. **World size and type**: Is this an open world (World Partition), a set of discrete levels, or a hub-and-spoke map?
-2. **Multiplayer**: Are you running a dedicated server? Are per-player streaming radii needed?
-3. **Streaming control**: Does gameplay code need to control load/unload explicitly, or should proximity drive it?
-4. **Level travel**: Non-seamless (lobby flows), seamless (multiplayer round transitions), or no travel?
-5. **Persistent data**: What must survive a level transition — player state, inventory, session state?
+| Situation | Use | Why |
+|---|---|---|
+| One large continuous map | World Partition grid | Automatic spatial cells, no manual sub-level bookkeeping |
+| Optional content inside a partitioned map | Data layers | `EDataLayerRuntimeState` toggles without travel |
+| The same level asset placed many times in the editor | `ALevelInstance` / `APackedLevelActor` | Edited as a unit, packed into instanced meshes |
+| The same level package spawned many times at runtime | `ULevelStreamingDynamic::LoadLevelInstance` | Creates a uniquely named package per instance |
+| Discrete hand-authored zones in a non-partitioned map | `ULevelStreaming` sub-levels | Explicit load and visibility control per zone |
+| Proximity-driven interiors in a non-partitioned map | `ALevelStreamingVolume` | Camera-position driven, no gameplay code |
+| A different map entirely | `OpenLevel` / `ServerTravel` | Tears down and rebuilds the world |
 
----
+World Partition and sub-level streaming are mutually exclusive on the same persistent level. `UWorld::IsPartitionedWorld()` (`Engine/World.h:2968`) reports which one is in play; `AWorldSettings::GetWorldPartition()` (`GameFramework/WorldSettings.h:837`) returns the partition object (the `WorldPartition` member is protected).
 
-## World Partition (UE5)
+## World Partition Runtime
 
-### Enabling World Partition
-
-Enable via the Level menu: **World -> World Partition -> Convert Level**. Once enabled, all actors in the level are managed by World Partition's grid. The level can no longer have traditional sub-levels. Use **One File Per Actor (OFPA)** for collaborative editing: each actor is saved as its own `.uasset` under `__ExternalActors__`.
-
-### Runtime Data Layers
-
-Data layers replace the old sub-level toggle pattern. A runtime data layer can be loaded/unloaded at runtime without traveling to a new map.
+`UWorldPartition` (`WorldPartition/WorldPartition.h`) owns the runtime hash that turns actors into cells. `UWorldPartitionSubsystem` is the per-world entry point and is a `UTickableWorldSubsystem`.
 
 ```cpp
-// MyGameMode.cpp
+#include "WorldPartition/WorldPartition.h"
+#include "WorldPartition/WorldPartitionSubsystem.h"
+
+UWorldPartitionSubsystem* Subsystem = GetWorld()->GetSubsystem<UWorldPartitionSubsystem>();
+if (Subsystem && Subsystem->IsAllStreamingCompleted())
+{
+    // Every cell has finished loading, adding to or removing from the world.
+}
+
+Subsystem->ForEachWorldPartition([](UWorldPartition* Partition)
+{
+    return Partition->IsStreamingEnabled(); // return false to stop iterating
+});
+```
+
+`UWorldPartitionRuntimeCell` is the unit the hash produces. Query readiness at an arbitrary point with a query source instead of polling actors:
+
+```cpp
+#include "WorldPartition/WorldPartitionRuntimeCell.h"
+#include "WorldPartition/WorldPartitionStreamingSource.h"
+
+TArray<FWorldPartitionStreamingQuerySource> QuerySources;
+QuerySources.Emplace(TargetLocation); // FVector
+
+const bool bReady = Subsystem->IsStreamingCompleted(
+    EWorldPartitionRuntimeCellState::Activated, QuerySources, /*bExactState=*/false);
+```
+
+`EWorldPartitionRuntimeCellState` is `Unloaded`, `Loaded`, `Activated` (`WorldPartitionRuntimeCell.h:202`).
+
+### Streaming sources
+
+Any object can drive streaming by implementing `IWorldPartitionStreamingSourceProvider` (a plain interface struct in `WorldPartitionStreamingSource.h`) and registering it with the subsystem. For the common "this actor pulls cells in" case, add a `UWorldPartitionStreamingSourceComponent` instead — it already implements the provider and registers itself.
+
+The two virtuals to override are `virtual bool GetStreamingSources(TArray<FWorldPartitionStreamingSource>& StreamingSources) const` and `virtual const UObject* GetStreamingSourceOwner() const`. Register in `BeginPlay` with `UWorldPartitionSubsystem::RegisterStreamingSourceProvider(this)` and release in `EndPlay` with `UnregisterStreamingSourceProvider(this)`. A complete actor implementation is in [streaming patterns](references/streaming-patterns.md#custom-streaming-source-provider).
+
+- `EStreamingSourceTargetState`: `Loaded` (in memory, not added to the world) or `Activated`.
+- `EStreamingSourcePriority`: `Highest`, `High`, `Normal`, `Low`, `Lowest`, `Default` (equals `Normal`).
+- `TargetGrids` plus `EStreamingSourceTargetBehavior` (`Include` / `Exclude`) restrict a source to named runtime grids.
+- `bBlockOnSlowLoading` opts the source into the engine's blocking path when streaming falls behind. Leave it false for cosmetic sources.
+- `UWorldPartitionSubsystem::GetStreamingSources(const UWorldPartition*, TArray<FWorldPartitionStreamingSource>&)` reads back everything currently registered.
+
+### Runtime CVars
+
+| CVar | Effect |
+|---|---|
+| `wp.Runtime.EnableServerStreaming` | Server-side cell streaming on dedicated and listen servers |
+| `wp.Runtime.EnableServerStreamingOut` | Lets the server stream cells back out |
+| `wp.Runtime.BlockOnSlowStreaming` | Blocks the game thread when a blocking source falls behind |
+| `wp.Runtime.MaxLoadingStreamingCells` | Caps concurrent cell loads |
+| `wp.Runtime.OverrideRuntimeLoadingRange` | Overrides a grid's loading range for testing |
+| `wp.Runtime.ToggleDrawRuntimeHash2D` | Draws the cell grid on screen |
+| `wp.Runtime.DumpStreamingSources` | Logs every registered streaming source |
+| `wp.Runtime.HLOD` | Enables and disables HLOD proxies at runtime |
+
+## Data Layers
+
+Actors reference data layers through `AActor::DataLayerAssets` (`TArray<TSoftObjectPtr<UDataLayerAsset>>`, `GameFramework/Actor.h:1123`). `UDataLayerAsset` is the authored asset, `UDataLayerInstance` is its per-world instance, and `UDataLayerManager` is the runtime accessor, reachable from any object inside a partitioned world.
+
+```cpp
+// MyDataLayerController.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "MyDataLayerController.generated.h"
+
+class UDataLayerAsset;
+
+UCLASS()
+class MYGAME_API AMyDataLayerController : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    UFUNCTION(BlueprintCallable, Category = "MyGame|Streaming")
+    void SetDungeonActive(bool bActive);
+
+    UFUNCTION(BlueprintCallable, Category = "MyGame|Streaming")
+    bool IsDungeonActivated() const;
+
+protected:
+    UPROPERTY(EditAnywhere, Category = "MyGame|Streaming")
+    TObjectPtr<const UDataLayerAsset> DungeonLayer;
+};
+```
+
+```cpp
+// MyDataLayerController.cpp
+#include "MyDataLayerController.h"
+#include "WorldPartition/DataLayer/DataLayerAsset.h"
+#include "WorldPartition/DataLayer/DataLayerInstance.h"
 #include "WorldPartition/DataLayer/DataLayerManager.h"
 
-void AMyGameMode::ActivateDungeonDataLayer()
+void AMyDataLayerController::SetDungeonActive(bool bActive)
 {
-    UDataLayerManager* DLMgr = UDataLayerManager::GetDataLayerManager(GetWorld());
-    if (!DLMgr) return;
+    UDataLayerManager* Manager = UDataLayerManager::GetDataLayerManager(this);
+    if (!Manager || !DungeonLayer)
+    {
+        return;
+    }
 
-    // Get by asset reference (set up in editor as a UDataLayerAsset)
-    UDataLayerAsset* DungeonLayer = DungeonDataLayerAsset.LoadSynchronous();
-    DLMgr->SetDataLayerRuntimeState(DungeonLayer, EDataLayerRuntimeState::Activated);
+    const EDataLayerRuntimeState NewState =
+        bActive ? EDataLayerRuntimeState::Activated : EDataLayerRuntimeState::Unloaded;
+
+    Manager->SetDataLayerRuntimeState(DungeonLayer, NewState, /*bInIsRecursive=*/true);
 }
 
-void AMyGameMode::DeactivateDungeonDataLayer()
+bool AMyDataLayerController::IsDungeonActivated() const
 {
-    UDataLayerManager* DLMgr = UDataLayerManager::GetDataLayerManager(GetWorld());
-    if (!DLMgr) return;
+    UDataLayerManager* Manager = UDataLayerManager::GetDataLayerManager(this);
+    if (!Manager || !DungeonLayer)
+    {
+        return false;
+    }
 
-    UDataLayerAsset* DungeonLayer = DungeonDataLayerAsset.LoadSynchronous();
-    DLMgr->SetDataLayerRuntimeState(DungeonLayer, EDataLayerRuntimeState::Unloaded);
+    const UDataLayerInstance* Instance = Manager->GetDataLayerInstanceFromAsset(DungeonLayer);
+    return Instance && Manager->GetDataLayerInstanceRuntimeState(Instance) == EDataLayerRuntimeState::Activated;
 }
 ```
 
-**Data layer states:**
-- `Unloaded` — not loaded, not visible.
-- `Loaded` — loaded into memory, not visible (pre-warming).
-- `Activated` — loaded and visible (fully active).
+`EDataLayerRuntimeState` (`DataLayerInstance.h:23`): `Unloaded`, `Loaded` (in memory but not visible — use it to pre-warm), `Activated` (loaded and visible).
 
-### Streaming Sources
-
-Each player controller is a streaming source by default. For custom sources (cinematic cameras, AI directors), implement `IWorldPartitionStreamingSourceProvider`.
-
-### HLOD
-
-HLOD provides distant merged-mesh representations of World Partition cells. Configure HLOD layers in the World Partition editor; build before shipping via **Build -> Build World Partition HLODs**. Without HLOD, content beyond the streaming radius is simply absent.
-
-### Converting Sub-Levels to World Partition
-
-Use **Tools -> World Partition -> Convert Level**. Actors migrate into the persistent level under WP management. Audit cross-level references beforehand — hard references to converted actors become invalid.
-
-### World Partition and Multiplayer
-
-In a multiplayer session, each player controller acts as a streaming source with a configurable radius. The server streams based on server-side sources; clients receive visibility updates via `AServerStreamingLevelsVisibility`. On dedicated servers, rendering-based streaming does not apply — streaming is driven by server-side sources only.
-
-Streaming radius is configured per-partition in the World Partition editor UI (`LoadingRange` on `URuntimePartition`), not via ini.
-
----
-
-## Level Streaming (Manual Sub-Levels)
-
-### ULevelStreaming State Machine
-
-From `LevelStreaming.h`, the full state sequence is:
-
-```
-Removed -> Unloaded -> Loading -> LoadedNotVisible -> MakingVisible -> LoadedVisible -> MakingInvisible -> LoadedNotVisible
-                                      |
-                                 FailedToLoad   (check logs; level asset missing or corrupt)
-```
-
-Query state with:
+Other manager entry points: `SetDataLayerInstanceRuntimeState(const UDataLayerInstance*, EDataLayerRuntimeState, bool bInIsRecursive)`, `GetDataLayerInstanceEffectiveRuntimeState`, `GetDataLayerInstances()`, `GetDataLayerInstanceFromName(const FName&)`, and the `BlueprintAssignable` delegate `OnDataLayerInstanceRuntimeStateChanged`. To sweep every instance:
 
 ```cpp
-ULevelStreaming* StreamingLevel = /* ... */;
-ELevelStreamingState State = StreamingLevel->GetLevelStreamingState();
-
-switch (State)
+Manager->ForEachDataLayerInstance([](UDataLayerInstance* Instance)
 {
-    case ELevelStreamingState::Unloaded:         /* not in memory */ break;
-    case ELevelStreamingState::Loading:          /* async load in progress */ break;
-    case ELevelStreamingState::LoadedNotVisible: /* in memory, not rendered */ break;
-    case ELevelStreamingState::MakingVisible:    /* adding to world */ break;
-    case ELevelStreamingState::LoadedVisible:    /* fully active */ break;
-    case ELevelStreamingState::MakingInvisible:  /* removing from rendering */ break;
-    case ELevelStreamingState::FailedToLoad:     /* check logs */ break;
+    return Instance->IsRuntime(); // return false to stop early
+});
+```
+
+**Authority:** a runtime data layer with no load filter only responds to state changes made on the server, and the resulting state replicates. Client-only layers must be changed on the client, server-only layers on the server. The old world-subsystem accessor still exists as a deprecated shim — see [Deprecated — do not use](#deprecated--do-not-use); route everything through `UDataLayerManager`.
+
+## Level Instances
+
+`ALevelInstance` (`LevelInstance/LevelInstanceActor.h`) places a `.umap` as a reusable chunk and implements `ILevelInstanceInterface`. `ULevelInstanceSubsystem` is the `UWorldSubsystem` that tracks them.
+
+```cpp
+#include "Engine/World.h"
+#include "LevelInstance/LevelInstanceActor.h"
+#include "LevelInstance/LevelInstanceSubsystem.h"
+
+void AMyLevelInstanceDriver::ShowRoom(ALevelInstance* RoomInstance)
+{
+    if (!RoomInstance)
+    {
+        return;
+    }
+
+    RoomInstance->LoadLevelInstance(); // queued; loads on the subsystem's next streaming update, so IsLoaded() is false this frame
+
+    ULevelInstanceSubsystem* Subsystem = GetWorld()->GetSubsystem<ULevelInstanceSubsystem>();
+    if (Subsystem && Subsystem->IsLoaded(RoomInstance))
+    {
+        Subsystem->ForEachActorInLevelInstance(RoomInstance, [](AActor* LevelActor)
+        {
+            LevelActor->SetActorTickEnabled(true);
+            return true;
+        });
+    }
 }
 ```
 
-### UGameplayStatics: LoadStreamLevel / UnloadStreamLevel
+- `ILevelInstanceInterface` runtime members: `LoadLevelInstance()`, `UnloadLevelInstance()`, `IsLoaded()`, `GetLoadedLevel()`, `GetLevelStreaming()`, `GetWorldAsset()`, `GetLevelInstanceID()`, `IsInitiallyVisible()`.
+- `ULevelInstanceSubsystem` runtime members: `GetLevelInstance(const FLevelInstanceID&)`, `GetOwningLevelInstance(const ULevel*)`, `RequestLoadLevelInstance(ILevelInstanceInterface*, bool bUpdate)`, `RequestUnloadLevelInstance(ILevelInstanceInterface*)`, `IsLoaded`, `IsLoading`, `ForEachActorInLevelInstance`, `GetLevelInstanceLevel`. The editing entry points are `WITH_EDITOR` only.
+- `ELevelInstanceRuntimeBehavior` (`LevelInstanceTypes.h:56`) picks how the instance reaches the runtime: `Partitioned` (actors move into the main partition grid; shown as "Embedded") or `LevelStreaming` (its own streaming level; shown as "Standalone").
+- `APackedLevelActor` (`PackedLevelActor/PackedLevelActor.h`) derives from `ALevelInstance` and bakes its static meshes into instanced-mesh components. It reports `ELevelInstanceRuntimeBehavior::None` and loads no level at runtime.
 
-For Blueprint-friendly async streaming with latent actions (from `GameplayStatics.h`):
+## Sub-Level Streaming
+
+### ULevelStreaming state
+
+`ELevelStreamingState` (`Engine/LevelStreaming.h:110`) is `Removed`, `Unloaded`, `FailedToLoad`, `Loading`, `LoadedNotVisible`, `MakingVisible`, `LoadedVisible`, `MakingInvisible`. Read it with `GetLevelStreamingState()`. The requested side is `ELevelStreamingTargetState` (`Unloaded`, `UnloadedAndRemoved`, `LoadedNotVisible`, `LoadedVisible`).
 
 ```cpp
-// MyActor.cpp — async load using FLatentActionInfo
+#include "Engine/LevelStreaming.h"
 #include "Kismet/GameplayStatics.h"
 
-void AMyActor::StreamInRoom(FName LevelName)
+ULevelStreaming* Streaming = UGameplayStatics::GetStreamingLevel(this, FName("/Game/Levels/L_Zone_A"));
+if (Streaming)
+{
+    Streaming->SetShouldBeLoaded(true);
+    Streaming->SetShouldBeVisible(true);
+
+    const bool bReady = Streaming->IsLevelLoaded() && Streaming->IsLevelVisible();
+    ULevel* Loaded = Streaming->GetLoadedLevel();
+}
+```
+
+Four `BlueprintAssignable` delegates, all with no parameters: `OnLevelLoaded`, `OnLevelUnloaded`, `OnLevelShown`, `OnLevelHidden`. Bind with `AddDynamic` to a no-argument `UFUNCTION()`.
+
+Use `SetIsRequestingUnloadAndRemoval(true)` to drop the streaming level object entirely. Never mutate `UWorld::StreamingLevels` directly — use `AddStreamingLevel`, `AddStreamingLevels`, `RemoveStreamingLevel`, `RemoveStreamingLevels` and `UpdateStreamingLevelShouldBeConsidered` (`Engine/World.h:1073-1109`), which maintain `StreamingLevelsToConsider`.
+
+### Latent load and unload
+
+`UGameplayStatics::LoadStreamLevel(const UObject* WorldContextObject, FName LevelName, bool bMakeVisibleAfterLoad, bool bShouldBlockOnLoad, FLatentActionInfo LatentInfo)` and `UnloadStreamLevel(const UObject* WorldContextObject, FName LevelName, FLatentActionInfo LatentInfo, bool bShouldBlockOnUnload)` resume through `FLatentActionInfo::ExecutionFunction`, which is resolved **by name through the reflection system**. The callback therefore has to be a `UFUNCTION()` declared inside a class body in a header.
+
+```cpp
+// MyStreamingActor.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "MyStreamingActor.generated.h"
+
+UCLASS()
+class MYGAME_API AMyStreamingActor : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    void StreamInRoom(FName LevelName);
+    void StreamOutRoom(FName LevelName);
+
+    // UFUNCTION on the declaration is mandatory: FLatentActionInfo::ExecutionFunction
+    // is looked up by name on CallbackTarget's UClass.
+    UFUNCTION()
+    void OnRoomLoaded();
+
+    UFUNCTION()
+    void OnRoomUnloaded();
+
+protected:
+    bool bRoomReady = false;
+};
+```
+
+```cpp
+// MyStreamingActor.cpp
+#include "MyStreamingActor.h"
+#include "Engine/LatentActionManager.h"
+#include "Kismet/GameplayStatics.h"
+
+void AMyStreamingActor::StreamInRoom(FName LevelName)
 {
     FLatentActionInfo LatentInfo;
     LatentInfo.CallbackTarget = this;
     LatentInfo.ExecutionFunction = FName("OnRoomLoaded");
     LatentInfo.Linkage = 0;
-    LatentInfo.UUID = GetUniqueID();
+    LatentInfo.UUID = 1; // unique per pending latent action on this object
 
-    UGameplayStatics::LoadStreamLevel(
-        this,           // WorldContextObject
-        LevelName,      // e.g., FName("Room_01")
-        true,           // bMakeVisibleAfterLoad
-        false,          // bShouldBlockOnLoad — keep false for async
-        LatentInfo
-    );
+    UGameplayStatics::LoadStreamLevel(this, LevelName,
+        /*bMakeVisibleAfterLoad=*/true, /*bShouldBlockOnLoad=*/false, LatentInfo);
 }
 
-UFUNCTION()
-void AMyActor::OnRoomLoaded()
-{
-    // Room is now loaded and visible
-}
-
-void AMyActor::StreamOutRoom(FName LevelName)
+void AMyStreamingActor::StreamOutRoom(FName LevelName)
 {
     FLatentActionInfo LatentInfo;
     LatentInfo.CallbackTarget = this;
     LatentInfo.ExecutionFunction = FName("OnRoomUnloaded");
     LatentInfo.Linkage = 0;
-    LatentInfo.UUID = GetUniqueID() + 1;
+    LatentInfo.UUID = 2;
 
-    UGameplayStatics::UnloadStreamLevel(
-        this,
-        LevelName,
-        LatentInfo,
-        false // bShouldBlockOnUnload
-    );
+    UGameplayStatics::UnloadStreamLevel(this, LevelName, LatentInfo, /*bShouldBlockOnUnload=*/false);
+}
+
+void AMyStreamingActor::OnRoomLoaded()
+{
+    bRoomReady = true;
+}
+
+void AMyStreamingActor::OnRoomUnloaded()
+{
+    bRoomReady = false;
 }
 ```
 
-For soft object pointers (preferred for packaging safety), use `LoadStreamLevelBySoftObjectPtr` with the same arguments.
+`LoadStreamLevelBySoftObjectPtr` and `UnloadStreamLevelBySoftObjectPtr` take a `TSoftObjectPtr<UWorld>` in place of the `FName` and are the packaging-safe form. `UGameplayStatics::FlushLevelStreaming(const UObject*)` blocks until pending work completes; `UWorld::FlushLevelStreaming(EFlushLevelStreamingType)` gives finer control (`None`, `Full`, `Visibility`).
 
-### ULevelStreamingDynamic: Runtime Level Instances
+### Runtime level instancing
 
-Use `ULevelStreamingDynamic::LoadLevelInstance` to load the same level package multiple times at different transforms — for procedural dungeons, modular buildings, or instanced rooms (from `LevelStreamingDynamic.h`):
+`ULevelStreamingDynamic` loads one package repeatedly at different transforms. Prefer the params-struct overload, because the by-name overload cannot express a full `FTransform`.
 
 ```cpp
 #include "Engine/LevelStreamingDynamic.h"
+#include "Engine/World.h"
 
-void AMyDungeonGenerator::SpawnRoom(FVector Location, FRotator Rotation)
+ULevelStreamingDynamic* AMyDungeonGenerator::SpawnRoom(const FTransform& RoomTransform, const FString& InstanceName)
 {
+    ULevelStreamingDynamic::FLoadLevelInstanceParams Params(
+        GetWorld(), TEXT("/Game/Levels/L_Room_Corridor"), RoomTransform);
+
+    Params.OptionalLevelNameOverride = &InstanceName; // identical on server and clients
+    Params.bInitiallyVisible = true;
+
     bool bSuccess = false;
-    ULevelStreamingDynamic* StreamingLevel = ULevelStreamingDynamic::LoadLevelInstance(
-        this,                              // WorldContextObject
-        TEXT("/Game/Levels/Room_Corridor"), // LongPackageName — full path
-        Location,
-        Rotation,
-        bSuccess
-    );
-
-    if (bSuccess && StreamingLevel)
-    {
-        // Bind to delegate to know when visible
-        StreamingLevel->OnLevelShown.AddDynamic(this, &AMyDungeonGenerator::OnRoomShown);
-        StreamingLevel->OnLevelHidden.AddDynamic(this, &AMyDungeonGenerator::OnRoomHidden);
-
-        LoadedRooms.Add(StreamingLevel);
-    }
-}
-
-void AMyDungeonGenerator::UnloadRoom(ULevelStreamingDynamic* StreamingLevel)
-{
-    if (StreamingLevel)
-    {
-        StreamingLevel->SetShouldBeLoaded(false);
-        StreamingLevel->SetShouldBeVisible(false);
-        StreamingLevel->SetIsRequestingUnloadAndRemoval(true);
-    }
+    ULevelStreamingDynamic* Level = ULevelStreamingDynamic::LoadLevelInstance(Params, bSuccess);
+    return bSuccess ? Level : nullptr;
 }
 ```
 
-For networking: use `OptionalLevelNameOverride` to give all clients and server the same package name for a given instance. Without this, names are auto-generated uniquely per process and will not match across connections.
+Tear an instance down with `SetShouldBeVisible(false)`, `SetShouldBeLoaded(false)`, then `SetIsRequestingUnloadAndRemoval(true)`. A generator that tracks its instances and binds `OnLevelShown` is in [streaming patterns](references/streaming-patterns.md#pattern-3-procedural-and-instanced-level-streaming).
 
-```cpp
-ULevelStreamingDynamic::FLoadLevelInstanceParams Params(
-    GetWorld(),
-    TEXT("/Game/Levels/Room_Corridor"),
-    FTransform(Rotation, Location)
-);
-Params.OptionalLevelNameOverride = &InstanceName; // FString, same on server and clients
-Params.bInitiallyVisible = true;
+`FLoadLevelInstanceParams` members: `World`, `LongPackageName`, `LevelTransform`, `OptionalLevelNameOverride` (`const FString*`), `OptionalLevelStreamingClass`, `bLoadAsTempPackage`, `bInitiallyVisible`, `bAllowReuseExitingLevelStreaming`, `EditorPathOwner`, `LevelStreamingCreatedCallback`.
 
-bool bSuccess = false;
-ULevelStreamingDynamic* Level = ULevelStreamingDynamic::LoadLevelInstance(Params, bSuccess);
-```
+The Blueprint-exposed overloads are `LoadLevelInstance(UObject* WorldContextObject, FString LevelName, FVector Location, FRotator Rotation, bool& bOutSuccess, const FString& OptionalLevelNameOverride, TSubclassOf<ULevelStreamingDynamic> OptionalLevelStreamingClass, bool bLoadAsTempPackage)` and `LoadLevelInstanceBySoftObjectPtr`, which takes a `TSoftObjectPtr<UWorld>` in place of `LevelName` and the same tail parameters; a C++-only `BySoftObjectPtr` overload takes an `FTransform` (`Engine/LevelStreamingDynamic.h:94`).
 
-### OnLevelShown / OnLevelHidden Delegates
+### Streaming volumes
 
-From `LevelStreaming.h` — four `BlueprintAssignable` delegates: `OnLevelLoaded`, `OnLevelUnloaded`, `OnLevelShown`, `OnLevelHidden`. Bind with `AddDynamic`:
-
-```cpp
-StreamingLevel->OnLevelShown.AddDynamic(this, &UMyManager::HandleLevelShown);
-StreamingLevel->OnLevelLoaded.AddDynamic(this, &UMyManager::HandleLevelLoaded);
-```
-
-### Streaming Volumes
-
-`ALevelStreamingVolume` automatically controls sub-level loading when the player camera is inside or outside the volume. From `LevelStreamingVolume.h`:
-
-```cpp
-// EStreamingVolumeUsage — set on the volume in editor
-SVB_Loading                 // load but do not make visible
-SVB_LoadingAndVisibility    // load and make visible (most common)
-SVB_VisibilityBlockingOnLoad // force blocking load when entering
-SVB_BlockingOnLoad          // block load of associated levels
-SVB_LoadingNotVisible       // load, keep invisible (pre-warm)
-```
-
-Volumes are assigned to a sub-level via its `EditorStreamingVolumes` array. Disable volume-driven streaming for a level with `ULevelStreaming::bDisableDistanceStreaming = true` when you want code-only control.
-
-### Manual Visibility Control
-
-```cpp
-// Get streaming level reference from world
-const TArray<ULevelStreaming*>& Levels = GetWorld()->GetStreamingLevels();
-for (ULevelStreaming* Level : Levels)
-{
-    if (Level->GetWorldAssetPackageFName() == FName("/Game/Levels/MySubLevel"))
-    {
-        Level->SetShouldBeLoaded(true);
-        Level->SetShouldBeVisible(true);
-        break;
-    }
-}
-```
-
-Force flush all streaming (blocks until complete — use sparingly):
-```cpp
-UGameplayStatics::FlushLevelStreaming(this);
-```
-
----
-
-## Level Instances
-
-`ALevelInstance` places a level as a reusable chunk in the editor. Actors inside are editable as a unit. For runtime instancing, see `ULevelStreamingDynamic` above.
-
-**Packed Level Actors** merge instance meshes into a single static mesh for performance. Enable via right-click on Level Instance → **Pack Level Actor**.
-
-**Per-instance property overrides (UE5.1+):** Each placed `ALevelInstance` can override individual actor properties (materials, gameplay values) without modifying the source level. Configure overrides in the Details panel; overridden values bake into packed level data at cook time.
-
----
+`ALevelStreamingVolume` drives sub-levels from camera position. `EStreamingVolumeUsage` values: `SVB_Loading`, `SVB_LoadingAndVisibility`, `SVB_VisibilityBlockingOnLoad`, `SVB_BlockingOnLoad`, `SVB_LoadingNotVisible`. Set `StreamingUsage` on the volume; `StreamingLevelNames` lists what it affects and a streaming level's `EditorStreamingVolumes` array is the editor-side link. Set `ULevelStreaming::bDisableDistanceStreaming = true` to take a level off volume control, and `MinTimeBetweenVolumeUnloadRequests` to damp flicker at volume boundaries. Streaming volumes do nothing in a partitioned world.
 
 ## Level Travel
 
-### Non-Seamless: UGameplayStatics::OpenLevel
+| Call | Header | Effect |
+|---|---|---|
+| `UGameplayStatics::OpenLevel(const UObject*, FName LevelName, bool bAbsolute, FString Options)` | `Kismet/GameplayStatics.h:340` | Tears down the world; clients disconnect |
+| `UGameplayStatics::OpenLevelBySoftObjectPtr(const UObject*, TSoftObjectPtr<UWorld>, bool, FString)` | `Kismet/GameplayStatics.h:350` | Same, packaging-safe reference |
+| `UWorld::ServerTravel(const FString& InURL, bool bAbsolute, bool bShouldSkipGameNotify)` | `Engine/World.h:4231` | Server moves, clients follow |
+| `APlayerController::ClientTravel(const FString& URL, ETravelType, bool bSeamless, FGuid)` | `GameFramework/PlayerController.h:1413` | Client-initiated; `TRAVEL_Absolute`, `TRAVEL_Partial`, `TRAVEL_Relative` |
+| `UWorld::SeamlessTravel(const FString& InURL, bool bAbsolute)` | `Engine/World.h:4243` | Background transition, connections kept |
+| `UGameplayStatics::GetCurrentLevelName(const UObject*, bool bRemovePrefixString)` | `Kismet/GameplayStatics.h:358` | Current map name |
 
-Destroys the current world and loads a new one; all clients disconnect. From `GameplayStatics.h`:
+### Seamless travel
 
-```cpp
-UGameplayStatics::OpenLevel(this, FName("/Game/Maps/MainMenu"), true);
-UGameplayStatics::OpenLevel(this, FName("/Game/Maps/GameLevel"), true, TEXT("?Difficulty=Hard"));
-UGameplayStatics::OpenLevelBySoftObjectPtr(this, GameLevelAsset, true); // packaging-safe
-```
-
-### Server Travel (Multiplayer, Non-Seamless)
-
-Initiated on the server; all connected clients follow (`World.h`):
-
-```cpp
-GetWorld()->ServerTravel(TEXT("/Game/Maps/Level02?listen"), /*bAbsolute=*/false);
-```
-
-### Seamless Travel
-
-Seamless travel loads the destination map in the background via a transition (midpoint) map. Clients stay connected. From `World.h`:
-
-```cpp
-void UWorld::SeamlessTravel(const FString& InURL, bool bAbsolute);
-bool UWorld::IsInSeamlessTravel() const;
-void UWorld::SetSeamlessTravelMidpointPause(bool bNowPaused);
-```
-
-**Setup requirements:**
-
-1. Set `bUseSeamlessTravel = true` on `AGameModeBase`:
-
-```cpp
-// bUseSeamlessTravel is already declared in AGameModeBase — do NOT redeclare it.
-// Just set it in the constructor:
-
-// MyGameMode.cpp constructor
-bUseSeamlessTravel = true;
-```
-
-2. Set a transition map in `DefaultEngine.ini`:
+1. Set `bUseSeamlessTravel = true` in the GameMode constructor. It is already a `UPROPERTY` on `AGameModeBase` (`GameModeBase.h:579`) — do not redeclare it.
+2. Set a transition map. Without one the engine transitions through an empty dummy world (`World.cpp:8367`). In PIE, seamless travel falls back to hard travel unless `net.AllowPIESeamlessTravel=1` (`GameModeBase.cpp:506`).
 
 ```ini
-[/Script/Engine.GameMapsSettings]
-TransitionMap=/Game/Maps/Transition
+[/Script/EngineSettings.GameMapsSettings]
+TransitionMap=/Game/Maps/L_Transition.L_Transition
 ```
 
-3. Override `GetSeamlessTravelActorList` to control which actors persist:
+3. Override the persistence hooks. Signatures are verbatim from `GameFramework/GameModeBase.h:239-268`:
 
 ```cpp
-// GameMode — called on server side during transition
+// MyGameMode.cpp
 void AMyGameMode::GetSeamlessTravelActorList(bool bToTransition, TArray<AActor*>& ActorList)
 {
     Super::GetSeamlessTravelActorList(bToTransition, ActorList);
 
-    if (!bToTransition)
+    if (MyPersistentManager)
     {
-        // bToTransition=false means we're moving TO the destination
-        // Add actors that should survive (e.g., GameState, custom managers)
-        ActorList.Add(MyPersistentManager);
+        ActorList.Add(MyPersistentManager); // called for both legs (to transition, then to destination); add on both
     }
 }
 
-// GameMode — called after destination map is loaded
 void AMyGameMode::PostSeamlessTravel()
 {
     Super::PostSeamlessTravel();
-    // Re-initialize any post-travel systems
 }
 
-// GameMode — handle re-possessing players after travel
 void AMyGameMode::HandleSeamlessTravelPlayer(AController*& C)
 {
     Super::HandleSeamlessTravelPlayer(C);
-    // Restore player-specific state here
 }
 ```
 
-4. Trigger on server:
+`APlayerController::GetSeamlessTravelActorList(bool bToEntry, TArray<AActor*>& ActorList)` is the client-side counterpart. `APlayerController::SeamlessTravelTo(APlayerController* NewPC)` / `SeamlessTravelFrom(APlayerController* OldPC)` and `APlayerState::SeamlessTravelTo(APlayerState* NewPlayerState)` copy per-player state onto the new objects. `UWorld::IsInSeamlessTravel()` and `UWorld::SetSeamlessTravelMidpointPause(bool bNowPaused)` control the midpoint; `UWorld::OnSeamlessTravelStart` and `UWorld::OnSeamlessTravelTransition` are static multicast delegates for observers.
 
-```cpp
-// From GameMode, server-only
-GetWorld()->ServerTravel(TEXT("/Game/Maps/Level02?listen"));
-// Seamless travel is automatic because bUseSeamlessTravel is true
-```
+Replication behaviour across travel (channel teardown, actor re-creation, net relevancy) belongs to `ue-networking-replication`; `UNetDriver::NotifyActorLevelUnloaded(AActor*)` is the hook it uses when a streamed level goes away.
 
-**Travel sequence:** current world -> transition map -> destination world. Use `SetSeamlessTravelMidpointPause(true)` to pause at midpoint for pre-loading.
+## HLOD
 
-### Client Travel
+HLOD produces stand-in proxies for cells that are streamed out. `UHLODLayer` (`WorldPartition/HLOD/HLODLayer.h`) configures a tier; grid placement comes from the runtime partition's settings rather than the layer. Hash and rebuild bookkeeping runs through `UHLODRebuildPolicy` and `UHLODRebuildPolicyData`, and builder settings (`UHLODBuilderSettings`) implement `ComputeHLODHash(FHLODHashBuilder&)`.
 
-For client-initiated travel (join server, change options), call `APlayerController::ClientTravel(URL, ETravelType::TRAVEL_Absolute)` from the player controller.
+At runtime, `UWorldPartitionHLODRuntimeSubsystem` (a `UWorldSubsystem`) tracks proxies as `IWorldPartitionHLODObject`, not as actors: `RegisterHLODObject`, `UnregisterHLODObject`, `GetHLODObjectsForCell(const UWorldPartitionRuntimeCell*)`, `OnHLODObjectRegisteredEvent()`, `OnHLODObjectUnregisteredEvent()`, `IsHLODEnabled()`, `IsWarmupEnabled()`. `AWorldPartitionHLOD` and `AWorldPartitionCustomHLOD` (`WorldPartition/HLOD/CustomHLODActor.h`) both implement that interface, and `AWorldPartitionHLODSourceCellPlaceholder` stands in for a source cell during builds.
 
----
+Build HLODs before shipping. Without them, everything past the loading range is simply absent.
 
-## World Subsystems
+## Level Streaming Persistence
 
-`UWorldSubsystem` (from `Subsystems/WorldSubsystem.h`) is auto-instantiated once per `UWorld`. It is destroyed when the world is destroyed — including on level travel. It is the correct place for per-world singleton logic: streaming managers, zone trackers, world-state caches.
+The Level Streaming Persistence plugin (Experimental in 5.8) keeps property values, destroyed-actor records and respawn data attached to streaming levels, so a level that streams out and back in returns changed. Add the `LevelStreamingPersistence` module to `Build.cs`.
 
-```cpp
-// MyStreamingManager.h
-UCLASS()
-class MYGAME_API UMyStreamingManager : public UWorldSubsystem
-{
-    GENERATED_BODY()
-public:
-    virtual void PostInitialize() override;                          // after all subsystems init
-    virtual void OnWorldBeginPlay(UWorld& InWorld) override;         // after all BeginPlay
-    virtual void PreDeinitialize() override;                         // cleanup hook
-    virtual bool ShouldCreateSubsystem(UObject* Outer) const override; // filter world type
+`ULevelStreamingPersistenceManager` is a `UWorldSubsystem`. Blueprint-callable: `SerializeTo(TArray<uint8>& OutPayload, bool bForceUpdate)`, `InitializeFrom(const TArray<uint8>& InPayload)`, `EjectPlacedActor(AActor*)`, `RecreateActorInLevel(AActor*, ULevel* NewOwningLevel)`, `RecreateActorInPersistentLevel(AActor*)`. Templated accessors `SetPropertyValue`, `TrySetPropertyValue` and `GetPropertyValue` read and write individual persisted properties by object path and property name. Which properties persist is declared in `ULevelStreamingPersistenceSettings`, a `UDeveloperSettings` with config `Engine`.
 
-    void RequestLoadZone(FName ZoneName);
-    void RequestUnloadZone(FName ZoneName);
-private:
-    TMap<FName, TWeakObjectPtr<ULevelStreaming>> ActiveZones;
-};
-```
+Call `InitializeFrom` once per map and early — from a custom `UWorldSubsystem::Initialize` — so values land before actors begin play. The payload it produces is what a `USaveGame` stores; see `ue-serialization-savegames`.
 
-Access from anywhere with a world context:
+## World Subsystems and Cross-Level State
 
-```cpp
-UMyStreamingManager* Manager = GetWorld()->GetSubsystem<UMyStreamingManager>();
-if (Manager)
-{
-    Manager->RequestLoadZone(FName("Zone_A"));
-}
-```
+`UWorldSubsystem` (`Subsystems/WorldSubsystem.h`) is created once per `UWorld` and dies with it, including on travel — the right home for a streaming manager or zone tracker. The full subsystem type table lives in `ue-cpp-foundations`.
 
-### UTickableWorldSubsystem
+Overridable hooks, verbatim from `Subsystems/WorldSubsystem.h:34-66`: `virtual bool ShouldCreateSubsystem(UObject* Outer) const`, `virtual void PostInitialize()`, `virtual void OnWorldBeginPlay(UWorld& InWorld)`, `virtual void OnWorldEndPlay(UWorld& InWorld)`, `virtual void OnWorldComponentsUpdated(UWorld& World)`, `virtual void PreDeinitialize()`, `virtual bool DoesSupportWorldType(const EWorldType::Type WorldType) const`. Reach it with `GetWorld()->GetSubsystem<UMyStreamingManager>()`. A worked zone-manager subsystem is in [streaming patterns](references/streaming-patterns.md#pattern-2-hub-and-spoke-with-manual-sub-level-streaming).
 
-For per-frame updates (distance checks, zone detection). Inherit from `UTickableWorldSubsystem`. Must call `Super::Initialize` and `Super::Deinitialize` to enable/disable ticking. Implement `GetStatId` returning a `RETURN_QUICK_DECLARE_CYCLE_STAT`.
+For per-frame work derive from `UTickableWorldSubsystem` and implement `Tick(float DeltaTime)` plus `GetStatId() const` (pure virtual). Its `Initialize` and `Deinitialize` overrides are what arm and disarm ticking, so always call `Super::` in both.
 
----
-
-## Persistent Data Across Level Transitions
-
-| Mechanism | Lifetime | Use Case |
+| Mechanism | Lifetime | Use for |
 |---|---|---|
-| `UGameInstance` | Entire application session | Cross-level player state, session config |
-| `UGameInstanceSubsystem` | Entire application session | Services that outlive any world |
-| Seamless travel actor list | Transition only | Actors that physically cross (GameState, managers) |
-| `USaveGame` + `SaveGameToSlot` | Disk-persistent | Long-term saves, progression |
-| `UWorldSubsystem` | Per world | World-scoped cache; push data to `UGameInstance` in `Deinitialize()` before travel clears it |
+| `UGameInstance` | Whole application session | Cross-map player and session data |
+| `UGameInstanceSubsystem` | Whole application session | Services that outlive every world |
+| Seamless travel actor list | Transition only | Actors that physically cross |
+| `UWorldSubsystem` | One world | World-scoped caches; push to `UGameInstance` before travel |
+| `USaveGame` | Disk | Progression — see `ue-serialization-savegames` |
 
-### GameInstance Pattern
+## Deprecated — do not use
 
-Store cross-level data in `UGameInstance` properties (survives all level travel). Access from anywhere with a world context:
-
-```cpp
-UMyGameInstance* GI = GetGameInstance<UMyGameInstance>();
-if (GI) GI->PlayerScore += 100;
-```
-
----
-
-## Common Mistakes and Anti-Patterns
-
-**Loading everything at once.** Setting `bShouldBlockOnLoad = true` on many sub-levels causes hitches. Use async loading and the latent action pattern. Only block on load when the game is behind a loading screen.
-
-**Streaming volume gaps.** Overlapping volumes cause spurious unload/reload cycles. Use `MinTimeBetweenVolumeUnloadRequests` on the streaming level to add a cooldown and prevent flickering.
-
-**Broken seamless travel in multiplayer.** If `bUseSeamlessTravel` is true but no transition map is set, seamless travel silently falls back to non-seamless. Always set `TransitionMap` in `DefaultEngine.ini`.
-
-**Cross-level hard references.** Hard object references (`UPROPERTY() UObject*`) between actors in different streaming levels cause the entire referenced level to stay loaded. Always use `TSoftObjectPtr` or `TSoftClassPtr` across level boundaries.
-
-**Dynamic streaming level names not matching server and client.** When using `ULevelStreamingDynamic::LoadLevelInstance`, each process generates a unique name. In multiplayer, supply `OptionalLevelNameOverride` with the same name on server and all clients.
-
-**World Partition on dedicated server.** The server does not use rendering-driven streaming. Streaming sources must be explicitly added server-side (e.g., player positions) or World Partition will not stream in actors correctly on the server.
-
-**Modifying `StreamingLevels` directly.** Do not add to `UWorld::StreamingLevels` directly. Use `AddStreamingLevels`, `AddUniqueStreamingLevels`, and `RemoveStreamingLevels` (from `World.h`) which handle internal bookkeeping and `StreamingLevelsToConsider`.
-
-**Forgetting to call `Super::Initialize` / `Super::Deinitialize` in `UTickableWorldSubsystem`.** These calls enable and disable ticking respectively. Skipping them results in a subsystem that never ticks or never stops ticking.
-
----
-
-## Quick Reference: Key APIs
-
-| API | Header | Notes |
+| Do not emit | Use in 5.8 | Source |
 |---|---|---|
-| `UGameplayStatics::LoadStreamLevel` | `Kismet/GameplayStatics.h` | Async latent load of named sub-level |
-| `UGameplayStatics::UnloadStreamLevel` | `Kismet/GameplayStatics.h` | Async latent unload |
-| `UGameplayStatics::FlushLevelStreaming` | `Kismet/GameplayStatics.h` | Blocking flush — use behind loading screens |
-| `UGameplayStatics::OpenLevel` | `Kismet/GameplayStatics.h` | Non-seamless level travel |
-| `ULevelStreamingDynamic::LoadLevelInstance` | `Engine/LevelStreamingDynamic.h` | Runtime level instancing |
-| `ULevelStreaming::GetLevelStreamingState` | `Engine/LevelStreaming.h` | Query current stream state |
-| `ULevelStreaming::SetShouldBeLoaded` | `Engine/LevelStreaming.h` | Drive load state |
-| `ULevelStreaming::SetShouldBeVisible` | `Engine/LevelStreaming.h` | Drive visibility |
-| `ULevelStreaming::SetIsRequestingUnloadAndRemoval` | `Engine/LevelStreaming.h` | Remove level from world |
-| `UWorld::ServerTravel` | `Engine/World.h` | Multiplayer level transition |
-| `UWorld::SeamlessTravel` | `Engine/World.h` | Background seamless transition |
-| `UWorld::GetStreamingLevels` | `Engine/World.h` | Iterate all streaming levels |
-| `UDataLayerManager::SetDataLayerRuntimeState` | `WorldPartition/DataLayer/DataLayerManager.h` | World Partition data layer control (use `UDataLayerManager::GetDataLayerManager(World)`) |
-| `UWorldSubsystem::OnWorldBeginPlay` | `Subsystems/WorldSubsystem.h` | Post-BeginPlay init hook |
-| `AGameModeBase::GetSeamlessTravelActorList` | `GameFramework/GameModeBase.h` | Control actor persistence |
+| `AActor::DataLayers`, `FActorDataLayer` | `AActor::DataLayerAssets` | `UE_DEPRECATED(5.8)` in `GameFramework/Actor.h:1115` |
+| `UDataLayerSubsystem` | `UDataLayerManager` | `UE_DEPRECATED(5.3)` in `WorldPartition/DataLayer/DataLayerSubsystem.h:37` |
+| `AWorldDataLayers::OverwriteDataLayerRuntimeStates` | `UDataLayerManager::SetDataLayerRuntimeState` | `UE_DEPRECATED(5.8)` in `WorldPartition/DataLayer/WorldDataLayers.h:135` |
+| `UDataLayerInstance::GetDataLayerFName` | `UObject::GetFName` | `UE_DEPRECATED(5.8)` in `WorldPartition/DataLayer/DataLayerInstance.h:190` |
+| `UDataLayerManager::GetDataLayerInstanceNames` outside the editor | Pass asset or instance pointers at runtime | `UE_DEPRECATED(5.8)` in `WorldPartition/DataLayer/DataLayerManager.h:121` |
+| `ULevelStreaming::ECurrentState`, `GetCurrentState()` | `ELevelStreamingState`, `GetLevelStreamingState()` | `UE_DEPRECATED(5.2)` in `Engine/LevelStreaming.h:367` |
+| `UWorldPartitionLevelStreamingDynamic::LoadInEditor` / `UnloadFromEditor` | No supported replacement | `UE_DEPRECATED(5.7)` in `WorldPartition/WorldPartitionLevelStreamingDynamic.h:63` |
+| `UHLODBuilderSettings::GetCRC()` | `ComputeHLODHash(FHLODHashBuilder&)` | `UE_DEPRECATED(5.7)` in `WorldPartition/HLOD/HLODBuilder.h:43` |
+| `UWorldPartitionHLODSourceActors::GetHLODHash()` | `ComputeHLODHash(FHLODHashBuilder&)` | `UE_DEPRECATED(5.7)` in `WorldPartition/HLOD/HLODSourceActors.h:27` |
+| `AWorldPartitionHLOD::GetHLODHash` / `ComputeHLODHash` / `SetHLODHash` | `GetHLODRebuildPolicyDataSet` / `SetHLODRebuildPolicyDataSet` with `UHLODRebuildPolicyData` | `UE_DEPRECATED(5.8)` in `WorldPartition/HLOD/HLODActor.h:146` |
+| `UHLODLayer::GetCellSize` / `GetLoadingRange` / `IsSpatiallyLoaded` | Runtime partition settings | `UE_DEPRECATED(5.7)` in `WorldPartition/HLOD/HLODLayer.h:82` |
+| `UWorldPartitionHLODRuntimeSubsystem::RegisterHLODActor` / `GetHLODActorsForCell` / `GetNumOutdatedHLODActors` | `RegisterHLODObject` / `GetHLODObjectsForCell` / `GetNumOutdatedHLODObjects` | `UE_DEPRECATED(5.6)` in `WorldPartition/HLOD/HLODRuntimeSubsystem.h:77` |
+| `AWorldPartitionCustomHLODPlaceholder` | `AWorldPartitionHLODSourceCellPlaceholder` | `UE_DEPRECATED(5.8)` in `WorldPartition/HLOD/CustomHLODPlaceholderActor.h:9` |
+| `UWorldPartitionStreamingSourceComponent::TargetGrid` / `TargetHLODLayers` | `TargetGrids` with `TargetBehavior` | `DeprecatedProperty` in `Components/WorldPartitionStreamingSourceComponent.h:63` |
 
----
+## Common Mistakes
+
+**`UFUNCTION()` above an out-of-line definition.** A latent callback written as `UFUNCTION() void AMyActor::OnRoomLoaded() {}` in a `.cpp` is invisible to UHT, so `FLatentActionInfo::ExecutionFunction` never resolves and the continuation silently never fires. Declare it inside the class body in the header.
+
+**Reusing one `FLatentActionInfo::UUID`.** Two pending actions on the same `CallbackTarget` that share a UUID collide and one is dropped. Give each call site its own constant.
+
+**Blocking loads outside a loading screen.** `bShouldBlockOnLoad = true`, `FlushLevelStreaming` and `wp.Runtime.BlockOnSlowStreaming` all stall the game thread. On a server they stall every client.
+
+**Setting data-layer state on the client.** A runtime data layer with no load filter only responds on the server; the state then replicates. Client-side calls appear to do nothing.
+
+**Mismatched dynamic level names in multiplayer.** `ULevelStreamingDynamic::LoadLevelInstance` generates a unique package name per process. Without `OptionalLevelNameOverride` set to the same string on server and clients, the instances are different packages and nothing lines up.
+
+**Hard references across level boundaries.** Unloading marks every object in the level package as garbage (`LevelStreamingGCHelper.cpp:201-208`), so a `UPROPERTY()` pointer from a persistent actor into a streamed level is nulled (a non-`UPROPERTY` raw pointer dangles) and does not re-point when the level streams back in. Use `TSoftObjectPtr` or `TWeakObjectPtr` across boundaries.
+
+**Expecting streaming volumes to work in World Partition.** They do not. Use data layers or a streaming source instead.
+
+**Assuming the dedicated server streams like a client.** Server cell streaming is off unless enabled, and its sources are the ones you register. Check `UWorldPartition::IsServerStreamingEnabled()` before debugging "missing" actors on the server.
+
+**Mutating `UWorld::StreamingLevels` directly.** It bypasses `StreamingLevelsToConsider`, so the level is never evaluated. Use the `AddStreamingLevel` / `RemoveStreamingLevel` family.
+
+**Skipping `Super::Initialize` / `Super::Deinitialize` in a `UTickableWorldSubsystem`.** Those calls are what enable and disable ticking.
 
 ## Related Skills
 
-- `ue-gameplay-framework` — GameMode travel callbacks, `PostSeamlessTravel`, actor persistence rules.
-- `ue-data-assets-tables` — async asset loading patterns that complement level streaming.
-- `ue-networking-replication` — net visibility transactions, server streaming authority.
-- `ue-cpp-foundations` — subsystem patterns, `UGameInstance` lifetime.
+- `ue-cpp-foundations` — the full subsystem type table, `TObjectPtr`, `TSoftObjectPtr`, GC and object lifetime rules.
+- `ue-networking-replication` — replication across travel, net relevancy, `DOREPLIFETIME`, dedicated-server authority.
+- `ue-gameplay-framework` — GameMode and GameState travel callbacks, login flow, `UGameInstance` role.
+- `ue-data-assets-tables` — `UDataAsset` (the base of `UDataLayerAsset`), async asset loading, Asset Manager.
+- `ue-procedural-generation` — PCG-driven content that populates partitioned levels.
+- `ue-serialization-savegames` — `USaveGame`, writing the Level Streaming Persistence payload to disk.
+- `ue-actor-component-architecture` — component design for streaming-source actors and world managers.
+- `ue-game-features` — Game Feature plugins, GameFeatureAction and the modular component manager
+- `ue-sequencer-cinematics` — Level Sequences, playback, cine cameras and Movie Render Graph

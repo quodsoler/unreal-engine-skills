@@ -1,97 +1,135 @@
 ---
 name: ue-state-trees
-description: "Use this skill when working with State Tree, StateTree, UStateTree, state machine, StateTreeTask, StateTreeCondition, StateTreeEvaluator, StateTreeSchema, AI State Tree, Mass StateTree, FStateTreeExecutionContext, or data-driven state logic in Unreal Engine. See references/state-tree-patterns.md for task/condition/evaluator templates and references/state-tree-mass-integration.md for Mass Entity integration."
+description: "Use when writing or debugging State Tree logic in Unreal Engine C++ — tasks, conditions, evaluators, considerations, schemas, transitions, events or Mass behaviours. Also use when the user mentions 'StateTree', 'state tree', 'FStateTreeTaskBase', 'FStateTreeExecutionContext', 'GetInstanceDataType', 'FInstanceDataType', 'UStateTreeComponent', 'UStateTreeAIComponent', 'FStateTreeReference', 'SendStateTreeEvent', 'EStateTreeRunStatus', 'StateTree schema', 'utility selection', 'scheduled tick', 'FinishTask', or 'Mass StateTree'. For behaviour trees, perception and navigation, see ue-ai-navigation; for Mass processors and fragments, see ue-mass-entity; for USTRUCT basics, see ue-cpp-foundations."
 metadata:
-  version: 1.0.0
+  version: "2.0.0"
+  engine: "5.8"
 ---
 
 # UE State Trees
 
-You are an expert in Unreal Engine's State Tree system for building flexible, data-driven state machines.
+Target engine: **UE 5.8**. APIs below are verified against the 5.8 headers; older forms are listed under "Deprecated — do not use".
 
-## Context Check
+State Tree is a data-driven hierarchical state machine authored as a `UStateTree` data asset and executed from C++ through an execution context. Runtime types live in the `StateTreeModule` (plugin `StateTree`); actor-facing components and schemas live in `GameplayStateTreeModule` (plugin `GameplayStateTree`). Mass-entity behaviours add `MassAIBehavior` (plugin `MassAI`, Experimental in 5.8) plus `MassEntity`, `MassCore` and `MassSignals`. Add the modules you use to `PublicDependencyModuleNames` in your `.Build.cs`.
 
-Read `.agents/ue-project-context.md` to determine:
-- Whether `StateTreeModule` and `GameplayStateTreeModule` plugins are enabled
-- If Mass Entity integration is needed (`MassEntity`, `MassAIBehavior` plugins)
-- Existing AI frameworks — behavior trees, custom FSMs to migrate from
-- Schema types in use and any custom schemas
+## Context
 
-## Information Gathering
+Read `.agents/ue-project-context.md` if it exists (module names, conventions, enabled plugins, GAS/networking setup). Do not stop if it is missing.
 
-Before implementing, clarify:
-1. What is the use case? (AI behavior, game logic, UI state, entity processing)
-2. What scale? (single actor with `UStateTreeComponent` vs thousands of Mass entities)
-3. How complex? (simple linear FSM vs hierarchical states with linked subtrees)
-4. Are there existing behavior trees to migrate from?
-5. What external data do tasks need? (actor references, subsystems, world state)
+Identify the area from the request and the codebase. Ask only when two plausible readings would produce different code.
 
----
+| Request is about… | Go to |
+|---|---|
+| What the runtime looks like, instance data, contexts | [Architecture](#architecture), [Execution Contexts](#execution-contexts) |
+| Writing a task | [Tasks](#tasks) |
+| Writing a condition or gating a transition | [Conditions](#conditions) |
+| Utility scoring, "pick the best child state" | [Considerations](#considerations) |
+| Feeding world data into the tree | [Evaluators](#evaluators), [External Data](#external-data) |
+| When and how states change | [Transitions](#transitions), [State Types and Selection](#state-types-and-selection) |
+| Tag-driven signals into the tree | [Events](#events) |
+| Reacting to a C++ callback instead of polling | [Delegates](#delegates) |
+| Restricting which nodes an asset may use | [Schemas](#schemas) |
+| Running a tree on an actor or AI controller | [Component and AI Setup](#component-and-ai-setup) |
+| Reducing tick cost / sleeping trees | [Scheduled Tick](#scheduled-tick) |
+| Thousands of entities | [Mass Entity Integration](#mass-entity-integration) |
+| Finishing work from a callback or another thread | [Async Completion](#async-completion) |
 
-## StateTree Architecture
-
-A State Tree is a hierarchical finite state machine authored as a `UStateTree` data asset:
+## Architecture
 
 ```
-UStateTree (UDataAsset)
-  ├── UStateTreeSchema         ← defines allowed context/external data
-  ├── States[]                 ← hierarchical state tree
-  │     ├── Tasks[]            ← work performed while state is active
-  │     ├── Transitions[]      ← rules for leaving this state
-  │     └── Conditions[]       ← gates on transitions
-  ├── Evaluators[]             ← global data providers (tick before transitions)
-  └── Parameters               ← FInstancedPropertyBag default inputs
+UStateTree (UDataAsset)          IsReadyToRun() must be true before execution
+  ├── UStateTreeSchema           which nodes and context data are allowed
+  ├── States                     hierarchy of States/Groups/Linked/Subtree
+  │     ├── Tasks                work performed while the state is active
+  │     ├── EnterConditions      gate on selecting the state
+  │     ├── Considerations       utility score used by selection behaviours
+  │     └── Transitions          rules for leaving the state
+  ├── Evaluators                 global data providers, tick before transitions
+  └── Parameters                 FInstancedPropertyBag global parameters
 ```
 
-**Runtime flow per tick:** 1) Evaluators tick, 2) Transitions checked from active leaf up to root, 3) If transition fires: ExitState on old tasks then EnterState on new, 4) Active tasks tick.
+Nodes are `USTRUCT`s, not `UObject`s, and every node virtual is `const`. Mutable per-instance state lives in a separate instance-data struct owned by `FStateTreeInstanceData`, which is what persists across frames. The execution context is a short-lived view constructed over that instance data.
 
-**Key classes:**
-
-| Class | Role |
-|-------|------|
-| `UStateTree` | Data asset — call `IsReadyToRun()` before execution |
-| `FStateTreeExecutionContext` | Per-tick context — constructed each frame, NOT persisted |
-| `FStateTreeInstanceData` | Persistent runtime state — survives across ticks |
-| `UStateTreeComponent` | Actor component that manages tree lifecycle |
+| Type | Role |
+|---|---|
+| `UStateTree` | The compiled asset. `IsReadyToRun()` reports link success |
+| `FStateTreeInstanceData` | Persistent runtime storage — hold this, not the context |
+| `FStateTreeExecutionContext` | Full read/write context; construct per tick |
+| `FStateTreeReference` | `UStateTree*` plus overridden global parameters |
 | `EStateTreeRunStatus` | `Running`, `Stopped`, `Succeeded`, `Failed`, `Unset` |
 
-**Build.cs modules**: `StateTreeModule`, `GameplayStateTreeModule`
-
-The execution context is constructed per-tick from persistent instance data:
 ```cpp
-FStateTreeInstanceData InstanceData;  // persists across frames
-// Each tick:
-FStateTreeExecutionContext Context(Owner, *StateTree, InstanceData);
+// MyTreeRunner.h — persistent storage on the owner
+UPROPERTY(Transient)
+FStateTreeInstanceData InstanceData;
+
+// .cpp — one context per tick over the same instance data
+FStateTreeExecutionContext Context(*this, *StateTreeAsset, InstanceData);
+Context.SetCollectExternalDataCallback(
+    FOnCollectStateTreeExternalData::CreateUObject(this, &UMyTreeRunner::CollectExternalData));
+
+FStateTreeExecutionContext::FStartParameters StartParams;
+StartParams.RandomSeed = 1234;
+Context.Start(StartParams);
+// later frames
 Context.Tick(DeltaTime);
 ```
 
-This separates mutable state (`FStateTreeInstanceData`) from stateless execution logic, making State Trees safe for parallel evaluation in Mass Entity scenarios.
+`Tick` can be split when transitions must be evaluated after other systems have run: call `TickUpdateTasks(DeltaTime)` first and `TickTriggerTransitions()` afterwards.
 
----
+## Execution Contexts
 
-## Schema System
+5.8 splits the context by capability. Pick the narrowest one that compiles.
 
-Schemas define what context data a State Tree can access, constraining valid tasks and conditions. This prevents authoring errors at edit time rather than runtime.
+| Context | Gets you | Typical use |
+|---|---|---|
+| `FStateTreeReadOnlyExecutionContext` | `GetOwner`, `GetWorld`, `GetStateTree`, `HasEventToProcess`, `IsValid` | `GetDebugInfo` overrides, gameplay debugger |
+| `FStateTreeMinimalExecutionContext` | adds `SendEvent`, `ScheduleNextTick`, scheduled-tick requests | sending an event from outside the tick |
+| `FStateTreeExecutionContext` | adds `Start`/`Stop`/`Tick`, instance data, external data, `FinishTask`, `BindDelegate` | everything inside a node |
+| `FStateTreeWeakExecutionContext` | weak handles captured for later | lambdas, latent actions, timers |
+| `FStateTreeStrongExecutionContext` | resolved access from a weak context | inside the callback, via `MakeStrongExecutionContext()` |
 
-| Schema | Context Provided | Use Case |
-|--------|-----------------|----------|
-| `UStateTreeComponentSchema` | Actor + BrainComponent | General actor logic |
-| `UStateTreeAIComponentSchema` | Above + `AIControllerClass` | AI behavior |
-| `UMassStateTreeSchema` | Mass entity context | Mass Entity processing |
+`FStateTreeMinimalExecutionContext` derives from `FStateTreeReadOnlyExecutionContext`, and `FStateTreeExecutionContext` from `FStateTreeMinimalExecutionContext`, so a node method taking the full context can call anything above it.
 
-`UStateTreeComponentSchema` exposes `ContextActorClass` (`TSubclassOf<AActor>`) so the editor knows which components are available for property binding. `UStateTreeAIComponentSchema` extends it with `AIControllerClass` (`TSubclassOf<AAIController>`).
+### Async Completion
 
-### Custom Schemas
-
-Subclass `UStateTreeSchema` for project-specific trees:
+Capture `FStateTreeWeakExecutionContext` (constructed from the live context) and finish the task when the async work returns. See [state-tree-patterns.md](references/state-tree-patterns.md) for the full latent-task template.
 
 ```cpp
-UCLASS()
-class UMyGameSchema : public UStateTreeSchema
+const FStateTreeWeakExecutionContext WeakContext = Context.MakeWeakExecutionContext();
+OnRequestFinished.AddLambda([WeakContext]()
+{
+    WeakContext.FinishTask(EStateTreeFinishTaskType::Succeeded);
+});
+```
+
+Inside a tick, a task finishes itself with `Context.FinishTask(*this, EStateTreeFinishTaskType::Succeeded)` or by returning a completion status from `Tick`.
+
+## Schemas
+
+A schema declares which node structs, which classes and which context data an asset may use. `IsStructAllowed` is what makes your nodes appear in the editor, so derive custom nodes from the `*CommonBase` structs the stock schemas accept: `FStateTreeTaskCommonBase`, `FStateTreeConditionCommonBase`, `FStateTreeEvaluatorCommonBase`, `FStateTreeConsiderationCommonBase`, `FStateTreePropertyFunctionCommonBase`.
+
+| Schema | Context data it publishes |
+|---|---|
+| `UStateTreeComponentSchema` | `Actor` (class from `ContextActorClass`) |
+| `UStateTreeAIComponentSchema` | `Actor` (defaults to `APawn`) plus `AIController` |
+| `UMassStateTreeSchema` | Mass entity data, via `FMassStateTreeExecutionContext` |
+
+```cpp
+// MyGameStateTreeSchema.h
+#pragma once
+#include "StateTreeSchema.h"
+#include "StateTreeExecutionTypes.h"
+#include "MyGameStateTreeSchema.generated.h"
+
+UCLASS(BlueprintType, EditInlineNew, CollapseCategories, meta = (DisplayName = "My Game Schema"))
+class MYGAME_API UMyGameStateTreeSchema : public UStateTreeSchema
 {
     GENERATED_BODY()
-public:
-    virtual bool IsStructAllowed(const UScriptStruct* InStruct) const override;
+
+protected:
+    virtual bool IsStructAllowed(const UScriptStruct* InScriptStruct) const override;
+    virtual bool IsClassAllowed(const UClass* InScriptStruct) const override;
     virtual bool IsExternalItemAllowed(const UStruct& InStruct) const override;
     virtual TConstArrayView<FStateTreeExternalDataDesc> GetContextDataDescs() const override;
 
@@ -99,59 +137,56 @@ public:
     virtual bool AllowEvaluators() const override { return true; }
     virtual bool AllowMultipleTasks() const override { return true; }
     virtual bool AllowGlobalParameters() const override { return true; }
-#endif // WITH_EDITOR
+    virtual bool AllowUtilityConsiderations() const override { return true; }
+#endif
+
+    UPROPERTY()
+    TArray<FStateTreeExternalDataDesc> ContextDataDescs;
 };
 ```
 
-Override `GetContextDataDescs()` to declare context objects (actor refs, subsystems). The editor uses this to validate property bindings.
-
----
+`AllowEnterConditions`, `AllowUtilityConsiderations`, `AllowEvaluators`, `AllowMultipleTasks`, `AllowGlobalParameters`, `AllowTasksCompletion` and `AllowQueuedCompilation` are declared inside `#if WITH_EDITOR` (`StateTreeSchema.h:96-138`) — they only drive the editor/compiler, so your overrides must be guarded the same way or game builds fail with "does not override". `IsStructAllowed`, `IsClassAllowed`, `IsExternalItemAllowed`, `IsScheduledTickAllowed`, `IsStateSelectionAllowed`, `IsStateTypeAllowed` and `GetContextDataDescs` are runtime virtuals (`StateTreeSchema.h:36-79`).
 
 ## Tasks
 
-Tasks are the primary work units in a state. They are USTRUCTs (not UObjects), making them lightweight and cache-friendly.
+Every task overrides the virtuals it needs **and** `GetInstanceDataType()`. The `using FInstanceDataType = …;` alias alone allocates nothing; `FStateTreeNodeBase::GetInstanceDataType()` returns `nullptr` by default (`StateTreeNodeBase.h:94`) and the compiler reserves no storage, so `Context.GetInstanceData(*this)` then hits `check(Memory != nullptr)` (`PropertyBindingDataView.h:116`).
 
-### FStateTreeTaskBase API
-
-Key virtuals (all `const` — tasks are immutable at runtime):
-
-| Virtual | Returns | Called When |
-|---------|---------|-------------|
-| `EnterState(Context, Transition)` | `EStateTreeRunStatus` (default: Running) | State becomes active |
-| `ExitState(Context, Transition)` | `void` | State is exited |
-| `Tick(Context, DeltaTime)` | `EStateTreeRunStatus` (default: Running) | Each frame (if `bShouldCallTick`) |
-| `StateCompleted(Context, Status, CompletedStates)` | `void` | Child state completes (REVERSE order) |
-| `TriggerTransitions(Context)` | `void` | Only if `bShouldAffectTransitions` |
-
-### Behavioral Flags
-
-| Flag | Default | Purpose |
-|------|---------|---------|
-| `bShouldStateChangeOnReselect` | `true` | Exit+Enter when transitioning to same state |
-| `bShouldCallTick` | `true` | Enable per-frame Tick calls |
-| `bShouldCallTickOnlyOnEvents` | `false` | Tick only when events are pending |
-| `bShouldCopyBoundPropertiesOnTick` | `true` | Refresh property bindings each tick |
-| `bShouldAffectTransitions` | `false` | Enable `TriggerTransitions` calls |
-
-Set `bShouldCallTick = false` for fire-and-forget tasks that only need `EnterState`/`ExitState`.
-
-### Instance Data Pattern
-
-Tasks are `const` at runtime — mutable per-instance state lives in a separate struct via the `typedef FInstanceDataType` pattern:
+| Virtual (verbatim signature) | Returns |
+|---|---|
+| `EnterState(FStateTreeExecutionContext& Context, const FStateTreeTransitionResult& Transition) const` | `EStateTreeRunStatus` |
+| `ExitState(FStateTreeExecutionContext& Context, const FStateTreeTransitionResult& Transition) const` | `void` |
+| `StateCompleted(FStateTreeExecutionContext& Context, const EStateTreeRunStatus CompletionStatus, const FStateTreeActiveStates& CompletedActiveStates) const` | `void` |
+| `Tick(FStateTreeExecutionContext& Context, const float DeltaTime) const` | `EStateTreeRunStatus` |
+| `TriggerTransitions(FStateTreeExecutionContext& Context) const` | `void` |
+| `GetDebugInfo(const FStateTreeReadOnlyExecutionContext& Context) const` | `FString` |
 
 ```cpp
+// MyTimedTask.h
+#pragma once
+#include "StateTreeTaskBase.h"
+#include "StateTreeExecutionContext.h"
+#include "MyTimedTask.generated.h"
+
 USTRUCT()
-struct FMyTaskInstanceData
+struct FMyTimedTaskInstanceData
 {
     GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, Category = "Parameter")
+    float Duration = 2.0f;
+
+    UPROPERTY()
     float ElapsedTime = 0.f;
 };
 
-USTRUCT(meta=(DisplayName="My Custom Task"))
-struct FMyTask : public FStateTreeTaskBase
+USTRUCT(meta = (DisplayName = "My Timed Task"))
+struct FMyTimedTask : public FStateTreeTaskCommonBase
 {
     GENERATED_BODY()
-    typedef FMyTaskInstanceData FInstanceDataType;  // required — framework allocates storage
+
+    using FInstanceDataType = FMyTimedTaskInstanceData;
+
+    virtual const UStruct* GetInstanceDataType() const override { return FInstanceDataType::StaticStruct(); }
 
     virtual EStateTreeRunStatus EnterState(FStateTreeExecutionContext& Context,
         const FStateTreeTransitionResult& Transition) const override
@@ -162,304 +197,286 @@ struct FMyTask : public FStateTreeTaskBase
     }
 
     virtual EStateTreeRunStatus Tick(FStateTreeExecutionContext& Context,
-        float DeltaTime) const override
+        const float DeltaTime) const override
     {
         FInstanceDataType& Data = Context.GetInstanceData(*this);
         Data.ElapsedTime += DeltaTime;
-        return Data.ElapsedTime >= Duration
-            ? EStateTreeRunStatus::Succeeded : EStateTreeRunStatus::Running;
+        return Data.ElapsedTime >= Data.Duration
+            ? EStateTreeRunStatus::Succeeded
+            : EStateTreeRunStatus::Running;
     }
-
-    UPROPERTY(EditAnywhere, Category = "Parameter")
-    float Duration = 2.0f;
 };
 ```
 
-See `references/state-tree-patterns.md` for complete task, condition, and evaluator templates.
+Editable parameters usually live on the instance data so they can be bound in the editor; properties placed on the node struct itself are shared by every instance and cannot be bound.
 
-### Multiple Tasks Per State
+### Behavioural flags
 
-When `AllowMultipleTasks()` is true, a state runs several tasks simultaneously. Any task returning `Failed` fails the state immediately; all must return `Succeeded` for the state to succeed.
+Set these in the task constructor.
 
----
+| Flag | Default | Effect |
+|---|---|---|
+| `bShouldStateChangeOnReselect` | `true` | Re-run Exit/Enter when the same state is selected again |
+| `bShouldCallTick` | `true` | Call `Tick()`; false also disables property copying |
+| `bShouldCallTickOnlyOnEvents` | `false` | Tick only on frames with events (needs `bShouldCallTick` false) |
+| `bShouldCopyBoundPropertiesOnTick` | `true` | Refresh bound properties before `Tick()` |
+| `bShouldCopyBoundPropertiesOnExitState` | `true` | Refresh bound properties before `ExitState()` |
+| `bShouldAffectTransitions` | `false` | Call `TriggerTransitions()` during transition handling |
+| `bConsideredForScheduling` | `true` | Include this task when computing the scheduled tick rate |
+| `bTaskEnabled` | `true` | Node not disabled in the asset |
+
+`TransitionHandlingPriority` (`EStateTreeTransitionPriority`) orders `TriggerTransitions` across tasks of one state.
 
 ## Conditions
 
-Conditions gate transitions — evaluated to determine whether a transition should fire.
+`FStateTreeConditionBase::TestCondition(FStateTreeExecutionContext& Context) const` returns `bool` and defaults to `false`. It must be pure: the selection pass may call it several times per frame.
+
+| Member | Purpose |
+|---|---|
+| `EStateTreeExpressionOperand Operand` | `Copy`, `And`, `Or`, `Multiply` (`Multiply` is considerations only) |
+| `int8 DeltaIndent` | Parenthesis level, gives `(A AND B) OR (C AND D)` without nesting |
+| `EStateTreeConditionEvaluationMode EvaluationMode` | `Evaluated`, `ForcedTrue`, `ForcedFalse` |
+
+Conditions also receive `EnterState`, `ExitState` and `StateCompleted` (all no-ops by default) so they can cache work across the state's lifetime.
+
+Stock conditions: `FStateTreeCompareIntCondition`, `FStateTreeCompareFloatCondition`, `FStateTreeCompareBoolCondition`, `FStateTreeCompareEnumCondition`, `FStateTreeCompareNameCondition`, `FStateTreeCompareDistanceCondition`, `FStateTreeRandomCondition` (`Conditions/StateTreeCommonConditions.h`), `FStateTreeObjectIsValidCondition` (`Conditions/StateTreeObjectConditions.h`) and the gameplay-tag family in `Conditions/StateTreeGameplayTagConditions.h`. The comparison ones take `UE::StateTree::EComparisonOperator`.
+
+## Considerations
+
+Considerations score a state so a parent can choose between children. The API is marked experimental in the header, so keep custom considerations small.
 
 ```cpp
-USTRUCT(meta=(Hidden))
-struct FStateTreeConditionBase : public FStateTreeNodeBase
+USTRUCT(meta = (DisplayName = "My Threat Score"))
+struct FMyThreatConsideration : public FStateTreeConsiderationCommonBase
 {
-    virtual bool TestCondition(FStateTreeExecutionContext& Context) const;  // default: false
-    EStateTreeExpressionOperand Operand = EStateTreeExpressionOperand::And;
-    int8 DeltaIndent = 0;  // indent level for logical grouping
-    EStateTreeConditionEvaluationMode EvaluationMode = EStateTreeConditionEvaluationMode::Evaluated;
+    GENERATED_BODY()
+
+    using FInstanceDataType = FMyThreatConsiderationInstanceData;
+
+    virtual const UStruct* GetInstanceDataType() const override { return FInstanceDataType::StaticStruct(); }
+
+protected:
+    virtual float GetScore(FStateTreeExecutionContext& Context) const override
+    {
+        const FInstanceDataType& Data = Context.GetInstanceData(*this);
+        return FMath::Clamp(Data.ThreatLevel / 100.f, 0.f, 1.f);
+    }
 };
 ```
 
-**Operands:** `And` (both must be true), `Or` (either), `Copy` (hidden/internal). `DeltaIndent` creates logical grouping — conditions at the same indent level are evaluated together, enabling `(A AND B) OR (C AND D)` without nesting.
-
-**Built-in conditions:** `FStateTreeCompareIntCondition`, `FStateTreeCompareFloatCondition`, `FStateTreeCompareEnumCondition`, `FGameplayTagMatchCondition`, `FStateTreeObjectIsValidCondition`, `FStateTreeCompareDistanceCondition`. Bind inputs via property bindings.
-
----
+`GetScore` is `protected`; the framework calls the public `GetNormalizedScore`. `Operand` and `DeltaIndent` combine sibling considerations (`And` = min, `Or` = max, `Multiply` = product). Scores only matter for the two utility selection behaviours, and the schema must return true from `AllowUtilityConsiderations()`.
 
 ## Evaluators
 
-Evaluators run globally (not per-state) and execute **before** transitions and task ticks each frame. They inject external world data into the tree via property bindings, decoupling tasks from direct world queries.
+Evaluators are global (not per-state) and tick before transitions and task ticks. Use them for data many nodes read; use external data for stable references.
 
 ```cpp
-USTRUCT(meta=(Hidden))
-struct FStateTreeEvaluatorBase : public FStateTreeNodeBase
-{
-    virtual void TreeStart(FStateTreeExecutionContext& Context) const;
-    virtual void TreeStop(FStateTreeExecutionContext& Context) const;
-    virtual void Tick(FStateTreeExecutionContext& Context, float DeltaTime) const;
-    // Note: DeltaTime is 0 during preselection
-};
+virtual void TreeStart(FStateTreeExecutionContext& Context) const;
+virtual void TreeStop(FStateTreeExecutionContext& Context) const;
+virtual void Tick(FStateTreeExecutionContext& Context, const float DeltaTime) const;
+virtual FString GetDebugInfo(const FStateTreeReadOnlyExecutionContext& Context) const;
 ```
 
-Evaluators use the same `FInstanceDataType` typedef pattern as tasks. Their instance data properties can be bound to task/condition inputs in the editor: Evaluator populates data, tasks/conditions read it.
-
-**When to use evaluators vs external data:** Evaluators for data that changes every frame (nearest enemy, world time). External data handles for stable references (owning actor, subsystem).
-
----
+`DeltaTime` is `0` when the evaluator is ticked during state pre-selection. Evaluators need `GetInstanceDataType()` exactly like tasks — the full template is in [state-tree-patterns.md](references/state-tree-patterns.md).
 
 ## Transitions
 
-Transitions define how and when states change. Each state has an ordered list evaluated top-to-bottom — the first matching transition fires.
+`EStateTreeTransitionTrigger` is a bitmask (`ENUM_CLASS_FLAGS`).
 
-### Trigger Types
+| Trigger | Value | Fires when |
+|---|---|---|
+| `OnStateSucceeded` | `0x1` | The state completed with Succeeded |
+| `OnStateFailed` | `0x2` | The state completed with Failed |
+| `OnStateCompleted` | `0x1｜0x2` | Either of the above |
+| `OnTick` | `0x4` | Every tick — always gate with conditions |
+| `OnEvent` | `0x8` | A queued event matches the tag |
+| `OnDelegate` | `0x10` | A bound delegate was broadcast |
 
-`EStateTreeTransitionTrigger` is a bitmask (`ENUM_CLASS_FLAGS`, supports bitwise OR):
+`EStateTreeTransitionPriority`: `Low`, `Normal`, `Medium`, `High`, `Critical`. The first triggered transition of the highest priority wins. Transition types (`EStateTreeTransitionType`): `None`, `Succeeded`, `Failed`, `GotoState`, `Parent`, `NextState`, `NextSelectableState`, `NextParent`, `NextSelectableParent` (`StateTreeTypes.h:76`). Per-transition flags `bTransitionEnabled` and `bConsumeEventOnSelect` both default to `true`.
 
-| Trigger | Value | Fires When |
-|---------|-------|------------|
-| `OnStateSucceeded` | 1 | Active state returns Succeeded |
-| `OnStateFailed` | 2 | Active state returns Failed |
-| `OnStateCompleted` | 3 | Either Succeeded or Failed (1\|2) |
-| `OnTick` | 4 | Every frame (gate with conditions) |
-| `OnEvent` | 8 | Matching event in the queue |
-| `OnDelegate` | 16 | Bound delegate fires |
+From C++, request a transition with `Context.RequestTransition(TargetState, Priority, Fallback)` where `Fallback` is an `EStateTreeSelectionFallback`.
 
-### Priorities and Properties
+## Delegates
 
-`EStateTreeTransitionPriority`: `Low`, `Normal`, `Medium`, `High`, `Critical`. Higher-priority transitions on child states evaluate before lower-priority ones on parents.
+Delegates replace polling when an external system can tell the tree exactly when to react. One node publishes an `FStateTreeDelegateDispatcher` on its instance data, another publishes an `FStateTreeDelegateListener`, and the editor connects the two.
 
-| Property | Default | Purpose |
-|----------|---------|---------|
-| `bConsumeEventOnSelect` | `true` | Remove event from queue when transition fires |
-| `bTransitionEnabled` | `true` | Disable without removing |
-| `bReactivateTargetState` | `false` | Force Exit+Enter even if target is current state |
+```cpp
+// On the listening node's instance data
+UPROPERTY(EditAnywhere, Category = "Input")
+FStateTreeDelegateListener ArrivedListener;
 
-**Targets:** GotoState (specific named state), NextState (next sibling), Succeeded/Failed (complete parent with that status), or tree-root Succeeded/Failed to complete the entire tree.
+// EnterState — bind
+Context.BindDelegate(Data.ArrivedListener, FSimpleDelegate::CreateLambda([]()
+{
+    UE_LOG(LogMyGame, Verbose, TEXT("Arrived"));
+}));
 
----
+// ExitState — always unbind
+Context.UnbindDelegate(Data.ArrivedListener);
+
+// On the dispatching node
+Context.BroadcastDelegate(Data.ArrivedDispatcher);
+```
+
+A transition with the `OnDelegate` trigger fires when the bound dispatcher is broadcast, evaluated with the rest of the transitions.
 
 ## State Types and Selection
 
-### State Types
+`EStateTreeStateType`: `State`, `Group`, `Linked`, `LinkedAsset`, `Subtree`. `LinkedAsset` states are the sharing mechanism — override them per instance with `FStateTreeReferenceOverrides`.
 
-| Type | Purpose |
-|------|---------|
-| `State` | Normal state with tasks, conditions, transitions |
-| `Group` | Container for child states — no tasks of its own |
-| `Linked` | References another state within the same tree |
-| `LinkedAsset` | References a state in a different `UStateTree` asset |
-| `Subtree` | Embeds another `UStateTree` as a child |
+`EStateTreeStateSelectionBehavior`:
 
-`LinkedAsset` is useful for sharing common behavior patterns (patrol, investigate, flee) across AI archetypes.
+| Behaviour | Effect |
+|---|---|
+| `None` | State cannot be selected directly |
+| `TryEnterState` | Enter this state even if it has children |
+| `TrySelectChildrenInOrder` | First child whose enter conditions pass |
+| `TrySelectChildrenAtRandom` | Shuffle children, take the first that passes |
+| `TrySelectChildrenWithHighestUtility` | Highest consideration score, ties broken in order |
+| `TrySelectChildrenAtRandomWeightedByUtility` | Random weighted by normalised score |
+| `TryFollowTransitions` | Evaluate the state's transitions instead of entering |
 
-### Selection Behavior
-
-`EStateTreeStateSelectionBehavior` controls how child states are chosen on entry:
-
-| Behavior | Effect |
-|----------|--------|
-| `TryEnterState` | Enter this state directly |
-| `TrySelectChildrenInOrder` | Try children top-to-bottom, first valid wins |
-| `TrySelectChildrenAtRandom` | Random child selection |
-| `TrySelectChildrenWithHighestUtility` | Utility-based selection (highest score) |
-| `TrySelectChildrenAtRandomWeightedByUtility` | Weighted random by utility score |
-| `TryFollowTransitions` | Follow transition chain |
-
-`FStateTreeActiveStates::MaxStates = 8` — maximum depth of active state hierarchy. Stay within this limit.
-
----
+`FStateTreeActiveStates::MaxStates = 8` caps the depth of the active state path. Flatten deeper designs with subtrees or linked assets.
 
 ## Events
 
-State Trees use a GameplayTag-based event system for decoupled communication.
-
-`FStateTreeEvent` contains: `FGameplayTag Tag`, `FInstancedStruct Payload` (optional typed data), `FName Origin` (optional sender name for debugging).
+Events are gameplay-tag messages with an optional payload: `FStateTreeEvent { FGameplayTag Tag; FInstancedStruct Payload; FName Origin; }`.
 
 ```cpp
-// From outside via UStateTreeComponent
-TreeComp->SendStateTreeEvent(FGameplayTag::RequestGameplayTag("AI.Alert"));
+// From outside the tree
+StateTreeComp->SendStateTreeEvent(MyTag_AiAlert, FConstStructView::Make(AlertData), TEXT("Perception"));
 
-// With payload
-FMyAlertData AlertData;
-AlertData.ThreatLevel = 5;
-TreeComp->SendStateTreeEvent(
-    FGameplayTag::RequestGameplayTag("AI.Alert"),
-    FConstStructView::Make(AlertData), TEXT("PerceptionSystem"));
-
-// From inside a task via execution context
-Context.SendEvent(Tag, FConstStructView::Make(ResultData), TEXT("MyTask"));
+// From inside a node (available on the minimal context and above)
+Context.SendEvent(MyTag_AiAlert, FConstStructView::Make(ResultData), TEXT("MyTask"));
 ```
 
-`FStateTreeEventQueue` holds up to `MaxActiveEvents = 64` events per tick. Events are processed during transition evaluation. Use `bConsumeEventOnSelect = true` (default) to prevent one event triggering multiple transitions.
-
----
+`FStateTreeEventQueue::MaxActiveEvents = 64` per instance. Iterate with `Context.ForEachEvent(Lambda)`, whose lambda returns `EStateTreeLoopEvents` (`Next`, `Break`, `Consume` — `StateTreeEvents.h:35`) and remove one with `Context.ConsumeEvent(SharedEvent)` (returns `void`). `Context.HasEventToProcess(Tag)` is a cheap existence check. For where gameplay tags are declared, see `ue-gameplay-tags-messaging`.
 
 ## External Data
 
-External data provides typed references to objects outside the tree (actors, components, subsystems) without going through evaluators.
+External data gives a node a typed reference to an object or struct supplied by the schema's owner — subsystems, the owning actor, components.
 
 ```cpp
-// Declare handles in your task/condition/evaluator struct
-TStateTreeExternalDataHandle<FMyActorContext, EStateTreeExternalDataRequirement::Required> ActorHandle;
-TStateTreeExternalDataHandle<FMySubsystemContext, EStateTreeExternalDataRequirement::Optional> SubsystemHandle;
+TStateTreeExternalDataHandle<UMyWorldSubsystem> SubsystemHandle;
+TStateTreeExternalDataHandle<AActor, EStateTreeExternalDataRequirement::Optional> ActorHandle;
 
-// Link in the Link override
 virtual bool Link(FStateTreeLinker& Linker) override
 {
-    Linker.LinkExternalData(ActorHandle);
     Linker.LinkExternalData(SubsystemHandle);
+    Linker.LinkExternalData(ActorHandle);
     return true;
 }
 
-// Access at runtime
-auto& ActorCtx = Context.GetExternalData(ActorHandle);       // Required — reference
-auto* SubsystemCtx = Context.GetExternalDataPtr(SubsystemHandle);  // Optional — pointer
+// Required handles return a reference, Optional handles a pointer
+UMyWorldSubsystem& Subsystem = Context.GetExternalData(SubsystemHandle);
+AActor* Actor = Context.GetExternalDataPtr(ActorHandle);
 ```
 
-The schema's `CollectExternalData` populates these handles at tree start, validating at link time rather than runtime.
+`Link` returns `bool` (`[[nodiscard]]` on the base, `StateTreeNodeBase.h:116`); return `true` on success, `false` fails linking.
 
----
-
-## UStateTreeComponent
-
-`UStateTreeComponent` extends `UBrainComponent` and manages the full tree lifecycle on an actor.
+`UStateTreeComponentSchema::IsExternalItemAllowed` accepts `AActor`, `UActorComponent` and `UWorldSubsystem` subclasses only. The owning actor is published separately as *context data* named `Actor` (and `AIController` for the AI schema); the idiomatic way to reach it is an instance-data property the editor binds automatically:
 
 ```cpp
-void SetStateTree(UStateTree* NewStateTree);
-void SetStateTreeReference(FStateTreeReference NewStateTreeRef);
-void SendStateTreeEvent(const FStateTreeEvent& Event);
-void SendStateTreeEvent(FGameplayTag Tag, FConstStructView Payload, FName Origin);
-EStateTreeRunStatus GetStateTreeRunStatus() const;
-// Delegate — fires when run status changes
-FStateTreeRunStatusChanged OnStateTreeRunStatusChanged;  // BlueprintAssignable
-bool bStartLogicAutomatically = true;  // EditAnywhere
+UPROPERTY(EditAnywhere, Category = "Context")
+TObjectPtr<AActor> Actor = nullptr;
 ```
+
+There is no `FStateTreeActorContext` type in the engine — use the above.
+
+## Component and AI Setup
+
+`UStateTreeComponent : UBrainComponent, IGameplayTaskOwnerInterface, IStateTreeSchemaProvider` runs one tree on an actor. `UStateTreeAIComponent` derives from it and returns `UStateTreeAIComponentSchema`, which guarantees an `AAIController` context value — use it on AI controllers.
+
+```cpp
+// MyAIController.h — inside the AMyAIController class body
+UPROPERTY(VisibleAnywhere, Category = "AI")
+TObjectPtr<UStateTreeAIComponent> StateTreeComp;
+
+// MyAIController.cpp
+AMyAIController::AMyAIController()
+{
+    StateTreeComp = CreateDefaultSubobject<UStateTreeAIComponent>(TEXT("StateTree"));
+    StateTreeComp->SetStartLogicAutomatically(true);
+}
+```
+
+`bStartLogicAutomatically` is `protected`; write it through `SetStartLogicAutomatically(const bool)`. Public surface: `SetStateTree`, `SetStateTreeReference`, `AddLinkedStateTreeOverrides(FGameplayTag, FStateTreeReference)`, `RemoveLinkedStateTreeOverrides(FGameplayTag)`, `SendStateTreeEvent`, `GetStateTreeRunStatus`, and the `BlueprintAssignable` `OnStateTreeRunStatusChanged`. `StartLogic`, `StopLogic`, `PauseLogic` and `ResumeLogic` come from `UBrainComponent`.
+
+Subclass and override the protected `SetContextRequirements(FStateTreeExecutionContext& Context, bool bLogErrors)` / `CollectExternalData(const FStateTreeExecutionContext& Context, const UStateTree* StateTree, TArrayView<const FStateTreeExternalDataDesc> Descs, TArrayView<FStateTreeDataView> OutDataViews) const` to publish extra context or external data.
 
 ### FStateTreeReference
 
-`FStateTreeReference` wraps a `UStateTree*` with parameter overrides:
 ```cpp
 FStateTreeReference TreeRef;
-TreeRef.SetStateTree(MyStateTreeAsset);
-TreeRef.SyncParameters();
-TreeRef.GetParameters().SetValueFloat(TEXT("AggroRange"), 1500.f);
+TreeRef.SetStateTree(MyStateTreeAsset);          // also calls SyncParameters()
+TreeRef.GetMutableParameters().SetValueFloat(TEXT("AggroRange"), 1500.f);
+StateTreeComp->SetStateTreeReference(TreeRef);
 ```
 
-`FStateTreeReferenceOverrides` swaps tree references at runtime by tag:
-```cpp
-Overrides.AddOverride(Tag_CombatVariant, CombatTreeRef);
-Overrides.RemoveOverride(Tag_CombatVariant);
-```
+`GetParameters()` returns `const FInstancedPropertyBag&` — mutating needs `GetMutableParameters()`.
 
-Subclass `UStateTreeComponent` to customize context via `SetContextRequirements(FStateTreeExecutionContext&, bool bLogErrors)` and `CollectExternalData(...)`.
+## Scheduled Tick
 
----
+A tree whose active tasks all opt out of ticking can sleep instead of running every frame. `FStateTreeScheduledTick::MakeSleep()`, `MakeNextFrame()`, `MakeEveryFrames()` and `MakeCustomTickRate(DeltaTime)` describe the desired cadence; `FStateTreeMinimalExecutionContext::AddScheduledTickRequest` / `UpdateScheduledTickRequest` / `RemoveScheduledTickRequest` manage a request, and `ScheduleNextTick()` wakes the tree. `UStateTreeComponent` implements this through `FStateTreeComponentExecutionExtension`, gated by `UStateTreeComponentSchema::IsScheduledTickAllowed()` and the `StateTree.Component.DefaultScheduledTickAllowed` console variable. A task that must not be counted sets `bConsideredForScheduling = false`.
 
-## AI Integration
-
-`UStateTreeAIComponentSchema` adds `AIControllerClass` to the component schema, making the AI controller available as context data for property bindings.
-
-```cpp
-AMyAIController::AMyAIController()
-{
-    StateTreeComp = CreateDefaultSubobject<UStateTreeComponent>(TEXT("StateTree"));
-    StateTreeComp->bStartLogicAutomatically = true;
-}
-```
-
-Assign the `UStateTree` asset in the controller defaults. Set the schema's `ContextActorClass` to your Pawn class so the editor can bind to its components.
-
-### State Tree vs Behavior Tree
-
-| Aspect | State Tree | Behavior Tree |
-|--------|-----------|---------------|
-| Structure | Hierarchical FSM with transitions | Tree of composites, decorators, tasks |
-| Data flow | Evaluators + property bindings (typed) | Blackboard (string-keyed, loosely typed) |
-| Conditions | First-class on transitions | Decorators on tree nodes |
-| Mass Entity | Native via `UMassStateTreeSchema` | No Mass support |
-| Best for | Data-driven FSMs, Mass entities, flat logic | Deep decision hierarchies, complex aborts |
-
-Prefer State Trees for new AI needing Mass Entity scaling or data-driven transitions. Keep Behavior Trees for deeply nested decision logic with complex abort/decorator patterns.
-
----
+For per-instance descriptions and custom tick scheduling on your own runner, implement `FStateTreeExecutionExtension` (`GetInstanceDescription`, `ScheduleNextTick`, `OnLinkedStateTreeOverridesSet`, `OnBeginApplyTransition`) and pass it in `FStartParameters::ExecutionExtension`.
 
 ## Mass Entity Integration
 
-State Trees integrate natively with Mass Entity for processing thousands of entities. See `references/state-tree-mass-integration.md` for complete setup.
+Mass behaviours use `UMassStateTreeSchema` and the `FMassStateTreeTaskBase`, `FMassStateTreeConditionBase` and `FMassStateTreeEvaluatorBase` node types, which add `GetDependencies(UE::MassBehavior::FStateTreeDependencyBuilder&) const` so the dynamically created `UMassStateTreeProcessor` (a `UMassSignalProcessorBase`) can build the right fragment query. Full setup, fragment table, signal names and processor flow are in [state-tree-mass-integration.md](references/state-tree-mass-integration.md). For Mass architecture itself, see `ue-mass-entity`.
 
-Key concepts:
-- `UMassStateTreeSchema` constrains trees to Mass-compatible node types (`FMassStateTreeTaskBase`, etc.)
-- `UMassStateTreeSubsystem` manages pooled instance data (`AllocateInstanceData`/`FreeInstanceData`)
-- `UMassStateTreeProcessor` evaluates trees per entity each frame
-- `FMassStateTreeExecutionContext` wraps execution context with `SetEntity`/`GetEntity`
-- Mass-specific tasks override `GetDependencies(UE::MassBehavior::FStateTreeDependencyBuilder&)` to declare fragment read/write requirements
+## Deprecated — do not use
 
-For Mass Entity architecture details, see `ue-mass-entity`.
-
----
+| Do not emit | Use in 5.8 | Source |
+|---|---|---|
+| `Start(const FInstancedPropertyBag*, int32 RandomSeed)` | `Start(FStartParameters)` | `UE_DEPRECATED(5.8)` in `StateTreeExecutionContext.h:492` |
+| `AppendDebugInfoString(FString&, const FStateTreeExecutionContext&)` | `GetDebugInfo(const FStateTreeReadOnlyExecutionContext&)` | `UE_DEPRECATED(5.8)` in `StateTreeEvaluatorBase.h:44` |
+| `EGenericAICheck` operator on the compare conditions | `UE::StateTree::EComparisonOperator` | `UE_DEPRECATED(5.8)` in `Conditions/StateTreeCommonConditions.h:47` |
+| `STATETREE_POD_INSTANCEDATA(Type)` | `UE_STATETREE_ZEROED_TRIVIALLY_COPIED_NO_DESTRUCTOR_INSTANCEDATA(Type)` (or the `_CONSTRUCTED_` variant) | `UE_DEPRECATED_MACRO(5.8)` in `StateTreeTypes.h:1388` |
+| `FStateTreePropertyRefExternalHandle` | `FStateTreePropertyRef` read through the execution context | `UE_DEPRECATED(5.8)` in `StateTreePropertyRef.h:295` |
+| `AddDelegateListener(Listener, Delegate)` | `BindDelegate(Listener, Delegate)` | `UE_DEPRECATED(5.6)` in `StateTreeExecutionContext.h:530` |
+| `RemoveDelegateListener(Listener)` | `UnbindDelegate(Listener)` | `UE_DEPRECATED(5.6)` in `StateTreeExecutionContext.h:541` |
+| `FinishTask(const UE::StateTree::FFinishedTask&, EStateTreeFinishTaskType)` | `FinishTask(const FStateTreeTaskBase&, EStateTreeFinishTaskType)` | `UE_DEPRECATED(5.6)` in `StateTreeExecutionContext.h:790` |
+| `FStateTreeWeakTaskRef` / `FStateTreeStrongTaskRef` | `FStateTreeWeakExecutionContext` | `UE_DEPRECATED(5.6)` in `StateTreeNodeRef.h:15,51` |
+| `OnBindingChanged(…, const FStateTreePropertyPath&, …)` | the `FPropertyBindingPath` overload | `UE_DEPRECATED(5.6)` in `StateTreeNodeBase.h:186` |
+| `TrySelectChildrenAtUniformRandom` | `TrySelectChildrenAtRandom` | `UE_DEPRECATED(all)` in `StateTreeTypes.h:196` |
+| `TrySelectChildrenBasedOnRelativeUtility` | `TrySelectChildrenAtRandomWeightedByUtility` | `UE_DEPRECATED(all)` in `StateTreeTypes.h:197` |
+| `Compile(FStateTreeDataView, TArray<FText>&)` | `Compile(UE::StateTree::ICompileNodeContext&)` | `UE_DEPRECATED(5.6)` `final` stub in `StateTreeNodeBase.h:141` |
+| `StateTreeComp->bStartLogicAutomatically = true;` | `StateTreeComp->SetStartLogicAutomatically(true);` | `protected` in `Components/StateTreeComponent.h:187` |
+| `TreeRef.GetParameters().SetValueFloat(…)` | `TreeRef.GetMutableParameters().SetValueFloat(…)` | const accessor in `StateTreeReference.h:61` |
+| `FStateTreeActorContext` | `TStateTreeExternalDataHandle<AActor>` or a `Category = "Context"` instance-data property | no such type in the engine |
 
 ## Common Mistakes
 
-**Persisting FStateTreeExecutionContext across frames:**
+**Omitting `GetInstanceDataType()`:** the single most common State Tree bug. `using FInstanceDataType = …;` documents the type; only the override registers storage.
 ```cpp
-// WRONG — context is per-tick, NOT persistent
-FStateTreeExecutionContext* SavedContext;  // dangling after tick
-
-// RIGHT — reconstruct each tick from persistent instance data
-FStateTreeExecutionContext Context(Owner, *StateTree, InstanceData);
-Context.Tick(DeltaTime);
+using FInstanceDataType = FMyTaskInstanceData;
+virtual const UStruct* GetInstanceDataType() const override { return FInstanceDataType::StaticStruct(); }
 ```
 
-**Mutating task struct directly instead of using instance data:**
-```cpp
-// WRONG — task structs are const at runtime
-virtual EStateTreeRunStatus Tick(...) const override {
-    Timer += DeltaTime;  // compile error — 'this' is const
-}
+**Storing the execution context:** it is a per-tick view over `FStateTreeInstanceData`. Keep the instance data as a `UPROPERTY(Transient)` on the owner and rebuild the context each tick, or capture `FStateTreeWeakExecutionContext` if you need it later.
 
-// RIGHT — use FInstanceDataType typedef
-typedef FMyInstanceData FInstanceDataType;
-virtual EStateTreeRunStatus Tick(...) const override {
-    auto& Data = Context.GetInstanceData(*this);
-    Data.Timer += DeltaTime;
-}
-```
+**Mutating the node struct:** every node virtual is `const`, so `Timer += DeltaTime;` on a member will not compile. Write to `Context.GetInstanceData(*this)`.
 
-**Conditions with side effects:** `TestCondition` may be called multiple times per frame during transition evaluation. Never modify state in conditions — they must be pure functions.
+**Deriving from `FStateTreeTaskBase` directly:** stock schemas only allow `FStateTreeTaskCommonBase` and siblings, so the node never appears in the editor picker. Derive from the `*CommonBase` struct (or the Mass/AI base) that your schema accepts.
 
-**Evaluators doing heavy work every tick:** Evaluators run every frame before transitions. Cache results in instance data and only refresh when inputs change.
+**Not guarding schema `Allow*` overrides with `#if WITH_EDITOR`:** the base declares them editor-only (`StateTreeSchema.h:96`), so an unguarded `override` compiles in the editor and fails in Game/Shipping targets.
 
-**Exceeding MaxStates depth:** `FStateTreeActiveStates::MaxStates = 8`. Deeply nested hierarchies silently fail. Flatten with linked states or subtrees.
+**Side effects in `TestCondition`:** selection may test the same condition several times in a frame. Keep it pure; cache in the condition's `EnterState` instead.
 
-**Forgetting to link external data:** Unlinked Required handles assert at runtime; Optional handles silently return nullptr. Always link all declared handles in `Link()`.
+**Leaving delegates bound:** `BindDelegate` in `EnterState` requires `UnbindDelegate` in `ExitState`, otherwise the listener fires against a state that is no longer active.
 
-**Not consuming events:** With `bConsumeEventOnSelect = false`, the same event can trigger multiple transitions in one frame. Leave default `true` unless broadcast behavior is intended.
+**Exceeding `MaxStates`:** the active state path is capped at 8. Deeper hierarchies fail selection rather than warning loudly.
 
----
+**Assuming `Tick` runs:** with `bShouldCallTick = false`, or when a scheduled tick puts the tree to sleep, tasks do not tick and bound properties are not copied. Drive those tasks from events or delegates.
 
 ## Related Skills
 
-- `ue-ai-navigation` — Behavior tree patterns, AI controller setup, perception system
-- `ue-mass-entity` — Mass Entity architecture, processors, fragments, traits
-- `ue-gameplay-abilities` — Ability-driven state transitions, GAS integration
-- `ue-gameplay-framework` — Game state machines, controller/pawn lifecycle
-- `ue-actor-component-architecture` — Component setup for `UStateTreeComponent`
-- `ue-cpp-foundations` — USTRUCT patterns, delegates, subsystem access
+- `ue-ai-navigation` — behaviour trees, perception, EQS, navigation and Smart Objects
+- `ue-mass-entity` — Mass processors, fragments, traits, entity queries
+- `ue-gameplay-abilities` — abilities and effects that drive or react to state changes
+- `ue-gameplay-framework` — controllers, pawns and game-mode lifecycle around the tree
+- `ue-actor-component-architecture` — component ownership, ticking and replication setup
+- `ue-cpp-foundations` — `USTRUCT` rules, delegates, subsystem access
+- `ue-gameplay-tags-messaging` — declaring gameplay tags used by State Tree events and transitions
+- `ue-gameplay-cameras` — spring arms, view targets, camera modifiers, shakes and the Gameplay Camera System

@@ -1,8 +1,13 @@
 # Enhanced Input: Trigger and Modifier Reference
 
-Complete reference for built-in `UInputTrigger` and `UInputModifier` classes.
-All classes are in the `EnhancedInput` plugin module.
-Source headers: `InputTriggers.h`, `InputModifiers.h`.
+Companion reference for the `ue-input-system` skill. Covers the built-in `UInputTrigger` and `UInputModifier`
+classes with their exact properties and defaults, the mapping-context and subsystem APIs, input-mode filtering,
+and the `UEnhancedInputUserSettings` rebinding path. Everything lives in the `EnhancedInput` plugin module.
+
+Source headers: `InputAction.h`, `InputActionValue.h`, `InputTriggers.h`, `InputModifiers.h`,
+`InputMappingContext.h`, `EnhancedActionKeyMapping.h`, `EnhancedInputSubsystemInterface.h`,
+`EnhancedInputSubsystems.h`, `EnhancedInputDeveloperSettings.h`, `EnhancedInputPlatformSettings.h`,
+`PlayerMappableKeySettings.h`, `EnhancedInputLibrary.h`, `UserSettings/EnhancedInputUserSettings.h`.
 
 ---
 
@@ -38,7 +43,7 @@ Available inside `FInputActionInstance` callbacks:
 
 | Method | Returns | Description |
 |---|---|---|
-| `GetValue()` | `FInputActionValue` | Current value; zero when event is not `Triggered` |
+| `GetValue()` | `FInputActionValue` | Current value in every phase (`EnhancedInput.bAlwaysGetRealValueFromActionInstanceData` defaults to 1, `InputAction.cpp:18`; set it to 0 for the legacy zero-unless-`Triggered` behaviour the header comment still describes) |
 | `GetTriggerEvent()` | `ETriggerEvent` | Current event state |
 | `GetElapsedTime()` | `float` | Seconds since action began evaluating (Started + Ongoing + Triggered) |
 | `GetTriggeredTime()` | `float` | Seconds the action has been in `Triggered` state only |
@@ -248,7 +253,7 @@ If held past the threshold without release, the trigger does not fire.
 DisplayName: "Repeated Tap"
 Class: UInputTriggerRepeatedTap : public UInputTriggerTimedBase
 TriggerType: Explicit
-SupportedEvents: Instant
+SupportedEvents: Ongoing (inherited from UInputTriggerTimedBase)
 ```
 
 **Behavior:** Fires `Triggered` when the input is tapped `NumberOfTapsWhichTriggerRepeat`
@@ -307,8 +312,9 @@ NotInputConfigurable: true (not exposed in per-mapping settings)
 ```
 
 **Behavior:** This action only fires when `ChordAction` is simultaneously in `Triggered`
-state. Automatically creates a `UInputTriggerChordBlocker` on `ChordAction` to prevent
-the chord key from also firing solo actions while the chord is active.
+state. When mappings rebuild, the subsystem injects a `UInputTriggerChordBlocker` into every
+lower-priority mapping that shares the chorded mapping's key, so that key's solo actions are
+blocked while the chord is active (`EnhancedInputSubsystemInterface.cpp:587-609`).
 
 **Properties:**
 
@@ -320,43 +326,9 @@ the chord key from also firing solo actions while the chord is active.
 **Setup pattern — Shift+E for special interact:**
 
 1. Create `IA_Sprint` (Bool) bound to Shift in the IMC
-2. Create `IA_SpecialInteract` (Bool) bound to E in the IMC
+2. Create `IA_SpecialInteract` (Bool) bound to E, and `IA_Interact` (Bool) also bound to E in a later (lower-priority) mapping
 3. On `IA_SpecialInteract`, add a `UInputTriggerChordAction` with `ChordAction = IA_Sprint`
 4. Result: E fires `IA_Interact`; Shift+E fires `IA_SpecialInteract`; E while Shift is held does NOT fire `IA_Interact`
-
----
-
-### UInputTriggerCombo (Beta)
-
-```
-DisplayName: "Combo (Beta)"
-Class: UInputTriggerCombo : public UInputTrigger
-TriggerType: Implicit
-SupportedEvents: All
-NotInputConfigurable: true
-```
-
-**Behavior:** Fires when all `ComboActions` are completed in order. Each step must be
-completed within its `TimeToPressKey` window after the previous step. The trigger fires
-for one frame then resets. Actions in `InputCancelActions` abort the combo if triggered.
-
-**Properties:**
-
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `ComboActions` | `TArray<FInputComboStepData>` | empty | Ordered sequence of steps |
-| `InputCancelActions` | `TArray<FInputCancelAction>` | empty | Actions that abort the combo |
-
-**FInputComboStepData fields:**
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `ComboStepAction` | `const UInputAction*` | `nullptr` | The action for this step |
-| `ComboStepCompletionStates` | `uint8` (bitmask of `ETriggerEvent`) | `Triggered` | Which events count as completing this step |
-| `TimeToPressKey` | `float` | `0.5` | Seconds after previous step within which this step must complete |
-
-**Use for:** Fighting game input sequences (Down, Down-Right, Right + Attack = Hadouken),
-multi-step ability combos.
 
 ---
 
@@ -385,8 +357,8 @@ Values above `UpperThreshold` are clamped to 1.
 
 | Value | Description |
 |---|---|
-| `Axial` | Dead zone applied independently per axis. Matches UE4 legacy behavior. Results in chamfered corners on 2D sticks. |
-| `Radial` | Dead zone applied to the combined magnitude. Gives smooth circular coverage. Recommended for most sticks. |
+| `Axial` | Dead zone applied independently per axis. Results in chamfered corners on 2D sticks; on a 1D axis it behaves exactly like `Radial`. |
+| `Radial` | Display name "Smoothed Radial". Dead zone applied to the combined magnitude, with smoothing. Recommended for most sticks. |
 | `UnscaledRadial` | Radial dead zone without the value smoothing. Can feel "jumpy" at the threshold boundary. |
 
 **Use for:** All gamepad analog stick mappings. Add per-stick-mapping in the IMC, not on the action asset.
@@ -494,9 +466,10 @@ Class: UInputModifierSmooth : public UInputModifier
 
 **Behavior:** Averages the input value over recent samples to reduce per-frame jitter.
 Uses a rolling average with `TotalSampleTime` as the accumulation window
-(default ~8.3ms, i.e., roughly one frame at 120fps). Resets when input returns to zero.
+(`SMOOTH_TOTAL_SAMPLE_TIME_DEFAULT` = `0.0083f`). Resets when input returns to zero.
 
-No configurable public properties (sample window is a compile-time constant).
+No configurable properties: `TotalSampleTime` is a protected member with no `UPROPERTY`,
+so it is not editable on the asset and not reachable from Blueprint.
 
 **Use for:** Smoothing raw mouse delta input for look controls. Add alongside `Scalar`
 on mouse look mappings.
@@ -524,6 +497,7 @@ input value, using one of many configurable interpolation methods.
 **ENormalizeInputSmoothingType options:**
 `Lerp`, `Interp_To`, `Interp_Constant_To`, `Interp_Circular_In/Out/In_Out`,
 `Interp_Ease_In/Out/In_Out`, `Interp_Expo_In/Out/In_Out`, `Interp_Sin_In/Out/In_Out`
+(`None` also exists, `UMETA(Hidden)`, `InputModifiers.h:83`)
 
 **Use for:** Smooth acceleration/deceleration on stick or mouse input where you want
 to author the feel curve precisely.
@@ -591,7 +565,7 @@ a consistent angular displacement per mouse unit regardless of zoom level.
 | Property | Type | Default | Description |
 |---|---|---|---|
 | `FOVScale` | `float` | `1.0` | Additional scalar applied on top of the FOV calculation |
-| `FOVScalingType` | `EFOVScalingType` | `Standard` | `Standard` = correct; `UE4_BackCompat` = legacy incorrect calculation for migration |
+| `FOVScalingType` | `EFOVScalingType` | `Standard` | `Standard` for new work; `UE4_BackCompat` reproduces the older incorrect `UPlayerInput::MassageAxisInput` calculation for back-compat only |
 
 **Use for:** Mouse look on any character with a zoom/aim-down-sights mechanic.
 Without this, zoomed-in aim feels faster than unzoomed aim in terms of screen pixels.
@@ -626,18 +600,17 @@ Modifiers are applied in this sequence:
 Within each group, modifiers execute in array order. The output of modifier N is the
 input to modifier N+1.
 
-**Typical keyboard+mouse stack for a look action:**
+**Typical keyboard+mouse stack for a look action** (per mapping, in order):
 ```
-Mapping modifiers: [Scalar(0.4, 0.4, 1.0), Smooth, FOVScaling]
-Action modifiers:  [] (none needed at action level)
+Scalar (0.4, 0.4, 1.0)  ->  Smooth  ->  FOV Scaling
 ```
 
-**Typical gamepad stick move action:**
+**Typical gamepad stick move action** (per mapping, in order):
 ```
-Mapping modifiers: [DeadZone(Radial, 0.2, 1.0), SwizzleAxis(YXZ)]  // for W/S keys
-Mapping modifiers: [DeadZone(Radial, 0.2, 1.0)]                     // for D/A keys
-Action modifiers:  []
+Y stick axis mapping: Dead Zone (Radial, 0.2, 1.0)  ->  Swizzle Input Axis Values (YXZ)
+X stick axis mapping: Dead Zone (Radial, 0.2, 1.0)
 ```
+No action-level modifiers are needed in either case.
 
 ---
 
@@ -649,9 +622,10 @@ Override in a `UInputTrigger` subclass:
 |---|---|---|
 | `UpdateState_Implementation` | `ETriggerState(const UEnhancedPlayerInput*, FInputActionValue, float DeltaTime)` | Core per-tick evaluation; return None/Ongoing/Triggered |
 | `GetTriggerType_Implementation` | `ETriggerType()` | Return Explicit, Implicit, or Blocker |
-| `GetSupportedTriggerEvents` | `ETriggerEventsSupported()` | Declare which ETriggerEvent types this trigger can produce |
-| `IsBlocking` | `bool(ETriggerState)` | Return true to block all other triggers (used by ChordBlocker) |
-| `GetDebugState` | `FString()` | Text shown in `ShowDebug EnhancedInput` HUD |
+| `GetSupportedTriggerEvents` | `ETriggerEventsSupported() const` | Declare which `ETriggerEvent` types this trigger can produce |
+| `IsBlocking` | `bool(const ETriggerState State) const` | Return true to block all other triggers (used by `UInputTriggerChordBlocker`) |
+| `GetDebugState` | `FString() const` | Text shown in the `ShowDebug EnhancedInput` HUD |
+| `ReceiveTriggerReinstanced_Implementation` | `void(const UInputTrigger* OldTrigger)` | Transfer runtime state when a mapping rebuild replaces this trigger instance; call `Super` |
 
 `UInputTrigger::IsActuated(const FInputActionValue&)` helper:
 Returns `true` if `Value.GetMagnitudeSq() >= ActuationThreshold * ActuationThreshold`.
@@ -669,11 +643,43 @@ Override in a `UInputModifier` subclass:
 
 | Virtual Method | Signature | Description |
 |---|---|---|
-| `ModifyRaw_Implementation` | `FInputActionValue(const UEnhancedPlayerInput*, FInputActionValue CurrentValue, float DeltaTime)` | Transform and return the modified value |
-| `GetVisualizationColor_Implementation` | `FLinearColor(FInputActionValue Sample, FInputActionValue Final)` | Color used in debug visualization overlays |
+| `ModifyRaw_Implementation` | `FInputActionValue(const UEnhancedPlayerInput* PlayerInput, FInputActionValue CurrentValue, float DeltaTime)` | Transform and return the modified value |
+| `GetVisualizationColor_Implementation` | `FLinearColor(FInputActionValue SampleValue, FInputActionValue FinalValue) const` | Color used in debug visualization overlays |
 
 The returned `FInputActionValue` will be cast back to the action's `ValueType` before
 further processing, so you can return any type internally.
+
+**Worked example:**
+
+```cpp
+// MyClampMagnitudeModifier.h
+#pragma once
+
+#include "InputModifiers.h"
+#include "MyClampMagnitudeModifier.generated.h"
+
+UCLASS(EditInlineNew, meta = (DisplayName = "Clamp Magnitude"))
+class MYGAME_API UMyClampMagnitudeModifier : public UInputModifier
+{
+	GENERATED_BODY()
+
+public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Settings")
+	float MaxMagnitude = 1.0f;
+
+protected:
+	virtual FInputActionValue ModifyRaw_Implementation(
+		const UEnhancedPlayerInput* PlayerInput, FInputActionValue CurrentValue, float DeltaTime) override
+	{
+		FVector Direction = CurrentValue.Get<FVector>();
+		if (Direction.SizeSquared() > MaxMagnitude * MaxMagnitude)
+		{
+			Direction = Direction.GetSafeNormal() * MaxMagnitude;
+		}
+		return FInputActionValue(CurrentValue.GetValueType(), Direction);
+	}
+};
+```
 
 ---
 
@@ -685,14 +691,48 @@ class UInputMappingContext : public UDataAsset
 
 | Property / Method | Type | Description |
 |---|---|---|
-| `DefaultKeyMappings.Mappings` | `TArray<FEnhancedActionKeyMapping>` | Default key-to-action bindings (deprecated in 5.7 — use `GetMappings()` accessor) |
-| `MappingProfileOverrides` | `TMap<FString, FInputMappingContextMappingData>` | Per-profile key overrides (for rebinding profiles) |
+| `DefaultKeyMappings` | `FInputMappingContextMappingData` | Default key-to-action bindings; read the array with `GetMappings()` |
+| `MappingProfileOverrides` | `TMap<FString, FInputMappingContextMappingData>` | Per key-profile overrides, keyed by profile id string |
 | `RegistrationTrackingMode` | `EMappingContextRegistrationTrackingMode` | `Untracked` or `CountRegistrations` |
 | `InputModeFilterOptions` | `EMappingContextInputModeFilterOptions` | `UseProjectDefaultQuery`, `UseCustomQuery`, `DoNotFilter` |
-| `GetMappings()` | `const TArray<FEnhancedActionKeyMapping>&` | Accessor for default mappings |
-| `MapKey(Action, Key)` | `FEnhancedActionKeyMapping&` | Editor-time: add a key binding |
-| `UnmapKey(Action, Key)` | `void` | Editor-time: remove a key binding |
-| `HasMappingForInputAction(Action)` | `bool` | Returns true if action appears in this IMC |
+| `InputModeQueryOverride` | `FGameplayTagQuery` | Used when `InputModeFilterOptions` is `UseCustomQuery` |
+| `ContextDescription` | `FText` | Localized description shown in the editor |
+| `GetMappings()` | `const TArray<FEnhancedActionKeyMapping>&` | Accessor for the default mappings |
+| `GetMappingsForProfile(ProfileId)` | `const TArray<FEnhancedActionKeyMapping>&` | Override mappings for a profile, falling back to the defaults |
+| `ForEachKeyMapping(Func)` | `void` | Visit every default and override mapping |
+| `HasMappingsForProfile(ProfileId)` / `GetProfilesWithOverridenMappings()` | `bool` / `TArray<FString>` | Profile override queries |
+| `ShouldFilterMappingByInputMode()` / `GetInputModeQuery()` | `bool` / `FGameplayTagQuery` | Resolved input-mode filtering for this IMC |
+| `GetRegistrationTrackingMode()` / `GetInputModeFilterOptions()` | enum | Accessors for the two enums above |
+| `MapKey(Action, Key)` | `FEnhancedActionKeyMapping&` | Editor/config-screen only: add a key binding to the asset |
+| `UnmapKey(Action, Key)` / `UnmapAllKeysFromAction(Action)` | `void` | Editor/config-screen only: remove bindings from the asset |
+| `HasMappingForInputAction(Action)` | `bool` | True if the action appears in the default or override mappings |
+
+After mutating an IMC, call `UEnhancedInputLibrary::RequestRebuildControlMappingsUsingContext(Context, bForceImmediately)`.
+
+### FEnhancedActionKeyMapping
+
+| Member | Type | Description |
+|---|---|---|
+| `Action` | `TObjectPtr<const UInputAction>` | The action this key feeds |
+| `Key` | `FKey` | The physical key |
+| `Triggers` / `Modifiers` | `TArray<TObjectPtr<UInputTrigger>>` / `TArray<TObjectPtr<UInputModifier>>` | Per-mapping, evaluated before the action-level arrays |
+| `SettingBehavior` | `EPlayerMappableKeySettingBehaviors` | `InheritSettingsFromAction`, `OverrideSettings`, `IgnoreSettings` |
+| `PlayerMappableKeySettings` | `TObjectPtr<UPlayerMappableKeySettings>` | Used when `SettingBehavior` is `OverrideSettings` |
+| `GetPlayerMappableKeySettings()` | `UPlayerMappableKeySettings*` | Resolves the settings per `SettingBehavior`; template form casts to a subclass |
+| `GetMappingName()` | `FName` | The player-mapping row name used by the user settings |
+
+### UPlayerMappableKeySettings
+
+| Property | Type | Description |
+|---|---|---|
+| `Name` | `FName` | The mapping name used as the user-settings row key |
+| `DisplayName` | `FText` | Label for a rebinding UI |
+| `DisplayCategory` | `FText` | Grouping for a rebinding UI |
+| `Metadata` | `TObjectPtr<UObject>` | Free-form payload (icons, ability assets, and so on) |
+| `SupportedKeyProfileIds` | `TArray<FString>` | Restricts the mapping to specific key profiles |
+
+`UPlayerMappableKeySettings::GetKnownMappingNames()` returns every registered mapping name and is the
+`GetOptions` source for `UPROPERTY(meta=(GetOptions="EnhancedInput.PlayerMappableKeySettings.GetKnownMappingNames"))`.
 
 ### EMappingContextRegistrationTrackingMode
 
@@ -722,10 +762,194 @@ Subsystem->HasMappingContext(IMC);
 Subsystem->GetPlayerInput()->GetActionValue(InputAction);
 ```
 
-**FModifyContextOptions:**
+**FModifyContextOptions** — every field already holds the default below, so pass the struct only to change one:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `bIgnoreAllPressedKeysUntilRelease` | `bool` | `true` | Prevents "stuck key" ghost inputs when switching contexts while a key is held |
-| `bForceImmediately` | `bool` | `false` | Rebuild mapping caches immediately rather than deferring to end of frame |
-| `bNotifyUserSettings` | `bool` | `false` | Notify `UEnhancedInputUserSettings` of the change (for rebinding UI) |
+| `bIgnoreAllPressedKeysUntilRelease` | `bool` | `true` | Keys already down when mappings rebuild are ignored until released, which is what stops "stuck key" ghost inputs across a context switch. Set `false` to let a held key carry into the new context. |
+| `bForceImmediately` | `bool` | `false` | Rebuild mapping caches immediately rather than deferring to the end of the frame |
+| `bNotifyUserSettings` | `bool` | `false` | Register the context's mappings with `UEnhancedInputUserSettings` (needed for a rebinding UI) |
+
+Other members of `IEnhancedInputSubsystemInterface`, shared by the local-player and world subsystems:
+
+| Member | Signature | Purpose |
+|---|---|---|
+| `GetPlayerInput()` | `UEnhancedPlayerInput*` | The player input object; `GetActionValue(Action)` reads a current value |
+| `GetUserSettings()` | `UEnhancedInputUserSettings*` | Player key-rebinding settings |
+| `HasMappingContext(IMC)` / `HasMappingContext(IMC, int32& OutFoundPriority)` | `bool` | Is the context applied, and at what priority |
+| `QueryKeysMappedToAction(Action)` | `TArray<FKey>` | Keys currently feeding an action |
+| `GetAllPlayerMappableActionKeyMappings()` | `TArray<FEnhancedActionKeyMapping>` | Every applied mapping that is player-mappable |
+| `InjectInputForAction(Action, RawValue, Modifiers, Triggers)` | `void` | Simulate input as if it came from a device |
+| `InjectInputVectorForAction(Action, Value, Modifiers, Triggers)` | `void` | Same, with an explicit `FVector` |
+| `ShowDebugInfo(Canvas)` | `void(UCanvas*)` | Backing call for `ShowDebug EnhancedInput` |
+
+---
+
+## Input Mode Filtering
+
+Enable `bEnableInputModeFiltering` on `UEnhancedInputDeveloperSettings` first. The subsystem keeps a
+`FGameplayTagContainer` of the current mode; contexts whose query fails stay registered but stop producing input,
+so priorities and registration counts are untouched.
+
+| Member | Signature | Purpose |
+|---|---|---|
+| `GetInputMode()` | `FGameplayTagContainer() const` | The current mode |
+| `SetInputMode(NewMode, Options)` | `void(const FGameplayTagContainer&, const FModifyContextOptions&)` | Replace the mode |
+| `AppendTagsToInputMode(TagsToAdd, Options)` | `void(const FGameplayTagContainer&, const FModifyContextOptions&)` | Add several tags |
+| `AddTagToInputMode(TagToAdd, Options)` | `void(const FGameplayTag&, const FModifyContextOptions&)` | Add one tag |
+| `RemoveTagsFromInputMode(TagsToRemove, Options)` | `void(const FGameplayTagContainer&, const FModifyContextOptions&)` | Remove several tags |
+| `RemoveTagFromInputMode(TagToRemove, Options)` | `void(const FGameplayTag&, const FModifyContextOptions&)` | Remove one tag |
+
+### EMappingContextInputModeFilterOptions
+
+| Value | Behavior |
+|---|---|
+| `UseProjectDefaultQuery` | Match against `UEnhancedInputDeveloperSettings::DefaultMappingContextInputModeQuery` (the default) |
+| `UseCustomQuery` | Match against this IMC's own `InputModeQueryOverride` |
+| `DoNotFilter` | Always active, whatever the current mode |
+
+`UEnhancedInputDeveloperSettings::DefaultInputMode` is the tag container every new `UEnhancedPlayerInput` starts with.
+
+---
+
+## UEnhancedInputUserSettings
+
+Header: `UserSettings/EnhancedInputUserSettings.h`. A `USaveGame` created per subsystem when
+`bEnableUserSettings` is set; the class comes from `UserSettingsClass` and the save slot from
+`InputSettingsSaveSlotName`. This is the supported runtime key-rebinding path.
+
+| Member | Signature | Purpose |
+|---|---|---|
+| `LoadOrCreateSettings(LP)` | `static UEnhancedInputUserSettings*(ULocalPlayer*)` | Load or create for a local player |
+| `RegisterInputMappingContext(IMC)` | `bool(const UInputMappingContext*)` | Make an IMC's mappings visible to the settings |
+| `RegisterInputMappingContexts(MappingContexts)` | `bool(const TSet<UInputMappingContext*>&)` | Batch form |
+| `UnregisterInputMappingContext(IMC)` / `UnregisterInputMappingContexts(MappingContexts)` | `bool` | Inverse of the above |
+| `MapPlayerKey(InArgs, FailureReason)` | `void(const FMapPlayerKeyArgs&, FGameplayTagContainer&)` | Set one player mapping |
+| `UnMapPlayerKey(InArgs, FailureReason)` | `void(const FMapPlayerKeyArgs&, FGameplayTagContainer&)` | Clear one player mapping |
+| `ResetAllPlayerKeysInRow(InArgs, FailureReason)` | `void(const FMapPlayerKeyArgs&, FGameplayTagContainer&)` | Reset every slot of one mapping name |
+| `ResetKeyProfileIdToDefault(ProfileId, FailureReason)` | `void(const FString&, FGameplayTagContainer&)` | Reset a whole profile |
+| `FindKeyMapping(InArgs)` | `FPlayerKeyMapping*(const FMapPlayerKeyArgs&) const` | Look up a single mapping |
+| `FindMappingsInRow(MappingName)` | `const TSet<FPlayerKeyMapping>&(const FName) const` | Every mapping for one name |
+| `FindCurrentMappingForSlot(MappingName, InSlot)` | `const FPlayerKeyMapping*(const FName, const EPlayerMappableKeySlot) const` | One slot's mapping |
+| `FindInputActionForMapping(MappingName)` | `const UInputAction*(const FName) const` | The action behind a mapping name |
+| `SaveSettings()` / `AsyncSaveSettings()` / `ApplySettings()` | `void` | Persist and apply |
+| `GetActiveKeyProfile()` / `GetActiveKeyProfileAs<T>()` | `UEnhancedPlayerMappableKeyProfile*` | Current profile |
+| `GetActiveKeyProfileId()` | `const FString&` | Current profile id |
+| `SetActiveKeyProfile(InProfileId)` / `SetKeyProfileToDefault()` | `bool` | Switch profile |
+| `GetAllAvailableKeyProfiles()` | `const TMap<FString, TObjectPtr<UEnhancedPlayerMappableKeyProfile>>&` | Every saved profile |
+| `IsKeyProfileAvailable(ProfileId)` / `GetKeyProfileWithId(ProfileId)` / `GetKeyProfileWithIdAs<T>(ProfileId)` | — | Profile lookup |
+| `GetDefaultKeyProfile()` | `UEnhancedPlayerMappableKeyProfile*` | The engine-created default profile |
+| `CreateNewKeyProfile(InArgs)` | `UEnhancedPlayerMappableKeyProfile*(const FPlayerMappableKeyProfileCreationArgs&)` | Add a profile |
+| `OnSettingsApplied` / `OnKeyProfileChanged` | dynamic multicast delegates | Refresh a settings UI |
+
+Profile identifiers are `FString`. `MapPlayerKey` and its siblings report problems through the
+`FGameplayTagContainer& FailureReason` out-parameter rather than a return value: an empty container means success.
+
+### FMapPlayerKeyArgs
+
+| Field | Type | Description |
+|---|---|---|
+| `MappingName` | `FName` | The player-mapping row, from `UPlayerMappableKeySettings::Name` or a per-mapping override |
+| `Slot` | `EPlayerMappableKeySlot` | `First` through `Seventh`, plus `Unspecified` |
+| `NewKey` | `FKey` | The key to bind |
+| `HardwareDeviceId` | `FName` | Optional hardware-device qualifier |
+| `ProfileIdString` | `FString` | Profile to write to; empty means the active profile |
+| `bCreateMatchingSlotIfNeeded` | `uint8 : 1` | Create the slot when no mapping matches the slot plus device |
+| `bDeferOnSettingsChangedBroadcast` | `uint8 : 1` | Defer the changed delegate to the next frame |
+
+### UEnhancedPlayerMappableKeyProfile
+
+| Member | Signature | Purpose |
+|---|---|---|
+| `GetProfileIdString()` | `const FString&` | Profile identifier |
+| `GetProfileDisplayName()` / `SetDisplayName(NewDisplayName)` | `const FText&` / `void(const FText&)` | Display name |
+| `GetPlayerMappingRows()` | `const TMap<FName, FKeyMappingRow>&` | Every mapping row in the profile |
+| `FindKeyMappingRow(InMappingName)` / `FindKeyMappingRowMutable(InMappingName)` | `const FKeyMappingRow*` / `FKeyMappingRow*` | One row |
+| `ResetMappingToDefault(InMappingName)` | `void(const FName)` | Reset one row |
+| `DumpProfileToLog()` | `void` | Debug dump |
+
+`FKeyMappingRow` holds a `TSet<FPlayerKeyMapping> Mappings` and answers `HasAnyMappings()`.
+
+### FPlayerKeyMapping
+
+| Member | Signature | Purpose |
+|---|---|---|
+| `IsCustomized()` | `bool() const` | True when the player changed it from the default |
+| `IsValid()` | `bool() const` | True when the mapping is usable |
+| `IsDirty()` | `const bool() const` | True when it differs from what was last saved |
+| `SetCurrentKey(NewKey)` | `void(const FKey&)` | Assign a key |
+| `SetHardwareDeviceId(InDeviceId)` | `void(const FHardwareDeviceIdentifier&)` | Assign a device |
+| `ResetToDefault()` | `void` | Restore the mapping's default key |
+| `ToString()` | `FString() const` | Debug text |
+
+---
+
+## UEnhancedInputWorldSubsystem
+
+A `UWorldSubsystem` implementing `IEnhancedInputSubsystemInterface`, DisplayName "Enhanced Input World Subsystem
+(Experimental)". Use it to bind input on actors that will never have an owning `APlayerController`. Enable it with
+`bEnableWorldSubsystem` in `UEnhancedInputDeveloperSettings`; `DefaultWorldInputClass` chooses its
+`UEnhancedPlayerInput` class.
+
+| Member | Signature | Purpose |
+|---|---|---|
+| `AddActorInputComponent(Actor)` | `void(AActor*)` | Push the actor's `InputComponent` onto the subsystem's stack |
+| `RemoveActorInputComponent(Actor)` | `bool(AActor*)` | Pop it off again |
+| `GetPlayerInput()` | `UEnhancedPlayerInput*` | The subsystem's own player input |
+| `ShowDebugInfo(Canvas)` | `void(UCanvas*)` | Backing call for `ShowDebug WorldSubsystemInput` |
+
+The actor needs an `InputComponent`. `AActor::EnableInput` only creates one when given a `PlayerController` (`Actor.cpp:4895-4900`), so with no controller create it yourself: `NewObject<UEnhancedInputComponent>(this)`, `RegisterComponent()`, assign it to `InputComponent`, then add it (as in the SKILL.md example).
+`AddMappingContext` and the rest of the interface behave exactly as on the local-player subsystem, but there is no
+`UEnhancedInputUserSettings` here.
+
+---
+
+## EnhancedInputPlatformSettings
+
+Header: `EnhancedInputPlatformSettings.h`. Build.cs: add `DeveloperSettings` when you call `Get()` — it is inline and
+calls `UPlatformSettingsManager` (`DeveloperSettings/Public/Engine/PlatformSettingsManager.h`), so the link fails without it.
+
+```cpp
+UEnhancedInputPlatformSettings* PlatformSettings = UEnhancedInputPlatformSettings::Get();
+```
+
+| Member | Signature | Purpose |
+|---|---|---|
+| `Get()` | `static UEnhancedInputPlatformSettings*` | Resolves through `UPlatformSettingsManager::Get().GetSettingsForPlatform` |
+| `GetInputData()` | `const TArray<TSoftClassPtr<UEnhancedInputPlatformData>>&` | Configured platform data classes |
+| `ForEachInputData(Predicate)` | `void(TFunctionRef<void(const UEnhancedInputPlatformData&)>)` | Visit each loaded platform data |
+| `GetAllMappingContextRedirects(OutRedirects)` | `void(TMap<TObjectPtr<const UInputMappingContext>, TObjectPtr<const UInputMappingContext>>&)` | Collect every redirect |
+
+`UEnhancedInputPlatformData` is an abstract, Blueprintable `UObject`. Subclass it per platform and fill
+`MappingContextRedirects` to swap one `UInputMappingContext` for another; `GetContextRedirect(InContext)` returns
+the replacement, or `InContext` itself when there is none.
+
+---
+
+## UEnhancedInputLibrary
+
+A `UBlueprintFunctionLibrary` in `EnhancedInputLibrary.h`.
+
+| Function | Signature | Purpose |
+|---|---|---|
+| `RequestRebuildControlMappingsUsingContext` | `static void(const UInputMappingContext* Context, bool bForceImmediately = false)` | Rebuild mappings after editing an IMC |
+| `ForEachSubsystem` | `static void(TFunctionRef<void(IEnhancedInputSubsystemInterface*)>)` | Visit every Enhanced Input subsystem |
+| `GetPlayerMappableKeySettings` | `static UPlayerMappableKeySettings*(const FEnhancedActionKeyMapping&)` | Resolved settings for a mapping |
+| `GetMappingName` | `static FName(const FEnhancedActionKeyMapping&)` | Player-mapping row name |
+| `IsActionKeyMappingPlayerMappable` | `static bool(const FEnhancedActionKeyMapping&)` | Whether a settings UI should list it |
+| `MakeInputActionValueOfType` / `BreakInputActionValue` | `static` | Construct or decompose an `FInputActionValue` |
+| `GetBoundActionValue` | `static FInputActionValue(AActor*, const UInputAction*)` | Current value of an action bound on an actor |
+
+---
+
+## FInputActionValue
+
+| Member | Signature | Notes |
+|---|---|---|
+| `Get<T>()` | `T() const` | `T` is `bool`, `FInputActionValue::Axis1D` (`float`), `Axis2D` (`FVector2D`) or `Axis3D` (`FVector`) |
+| `GetValueType()` | `EInputActionValueType() const` | `Boolean`, `Axis1D`, `Axis2D`, `Axis3D` |
+| `GetMagnitude()` / `GetMagnitudeSq()` | `float() const` | Shape-aware magnitude; `Boolean` and `Axis1D` use X only |
+| `IsNonZero(Tolerance = KINDA_SMALL_NUMBER)` | `bool(float) const` | Squared-length test |
+| `ConvertToType(Type)` / `ConvertToType(Other)` | `FInputActionValue&` | Reshape in place |
+| `GetValueTypeFromKey(Key)` | `static EInputActionValueType(FKey)` | Derives the shape from an `FKey` |
+| `FInputActionValue(EInputActionValueType InValueType, Axis3D InValue)` | constructor | Builds an arbitrary shape from a `FVector` — the form custom modifiers return |

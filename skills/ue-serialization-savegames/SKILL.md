@@ -1,500 +1,450 @@
 ---
 name: ue-serialization-savegames
-description: "Use when implementing save/load systems, player progress persistence, or data serialization in Unreal Engine. Triggers on: save game, USaveGame, FArchive, serialization, SaveGameToSlot, config, persist data, save file, load game. See references/save-system-architecture.md for full slot management and multi-user patterns."
+description: "Use when implementing save/load, player progress persistence, slot management, or binary serialization in Unreal Engine C++. Also use when the user mentions 'save game', 'USaveGame', 'SaveGameToSlot', 'AsyncSaveGameToSlot', 'LoadGameFromSlot', 'DoesSaveGameExist', 'DeleteGameInSlot', 'ULocalPlayerSaveGame', 'UPROPERTY(SaveGame)', 'FArchive', 'FMemoryWriter', 'FCustomVersion', 'save versioning', 'migrate old saves', 'save file corrupted', 'UDeveloperSettings', or 'GConfig'. For asset references, see ue-data-assets-tables; for work off the game thread, see ue-async-threading; for streamed level state, see ue-world-level-streaming."
 metadata:
-  version: 1.0.0
+  version: "2.0.0"
+  engine: "5.8"
 ---
 
 # UE Serialization & Save Games
 
-You are an expert in Unreal Engine's serialization and save game systems. You implement save/load pipelines using `USaveGame`, `FArchive`, config files, and versioning so player progress persists correctly across sessions and game updates.
+Target engine: **UE 5.8**. APIs below are verified against the 5.8 headers; older forms are listed under "Deprecated — do not use".
 
----
+This skill covers persisting game state: `USaveGame` objects through `UGameplayStatics`, the platform `ISaveGameSystem`, `FArchive` binary serialization, `UPROPERTY(SaveGame)` actor snapshots, save versioning, and config/settings storage. Build.cs modules: `Core`, `CoreUObject`, `Engine`; add `DeveloperSettings` to `PublicDependencyModuleNames` for `UDeveloperSettings`, and `Json` + `JsonUtilities` to `PrivateDependencyModuleNames` for `FJsonObjectConverter`.
 
-## Step 1: Read Project Context
+## Context
 
-Read `.agents/ue-project-context.md` before giving any recommendations. You need:
-- Engine version (UE 5.0+ has `ULocalPlayerSaveGame`; earlier versions differ)
-- Module names (the save system lives in a specific module)
-- Target platforms (console vs. PC save paths and user indices differ)
-- Whether multiplayer is in scope (server-authoritative vs. client-local saves)
+Read `.agents/ue-project-context.md` if it exists (module names, conventions, enabled plugins, GAS/networking setup). Do not stop if it is missing.
 
-If the file does not exist, ask the user to run `/ue-project-context` first.
+Identify the area from the request and the codebase. Ask only when two plausible readings would produce different code.
 
----
+| Request is about… | Go to |
+|---|---|
+| A save object, slot names, save/load/delete | [USaveGame and the Slot API](#usavegame-and-the-slot-api) |
+| Not blocking the game thread, callbacks | [Async Save and Load](#async-save-and-load) |
+| Per-player saves, settings profiles, split-screen | [ULocalPlayerSaveGame](#ulocalplayersavegame) |
+| Raw bytes, `FArchive`, memory buffers | [FArchive and Binary Serialization](#farchive-and-binary-serialization) |
+| Snapshotting actors, world state, transforms | [Actor State with UPROPERTY(SaveGame)](#actor-state-with-upropertysavegame) |
+| A `USTRUCT` needing its own `Serialize`; old saves breaking after a patch | [USTRUCT Custom Serialization](#ustruct-custom-serialization), [Versioning](#versioning) |
+| Console/cloud storage, slot enumeration, save UI | [ISaveGameSystem and Platform Storage](#isavegamesystem-and-platform-storage) |
+| Project settings, user options, `.ini`, JSON, compression | [Config, Settings, and File Formats](#config-settings-and-file-formats) |
+| Slot manager subsystem, metadata, thumbnails, checksums, encryption | [Save system architecture](references/save-system-architecture.md) |
 
-## Step 2: Gather Requirements
+## USaveGame and the Slot API
 
-Ask before writing code:
-1. **Save complexity**: Simple key/value data, or complex world state with hundreds of objects?
-2. **Data types**: Primitives, nested structs, asset references (soft vs. hard)?
-3. **Versioning needs**: Live game with future patches? Old saves must keep working?
-4. **Multiple save slots**: How many? Does each player/user get their own?
-5. **Async requirement**: Can save/load stall the game thread, or must it be background?
+`USaveGame` is an abstract `UObject` declared in `GameFramework/SaveGame.h:23`. Subclass it, add `UPROPERTY` fields, and route everything through `UGameplayStatics`.
 
----
-
-## Step 3: USaveGame Subclass
-
-`USaveGame` is an abstract `UObject` from `GameFramework/SaveGame.h`. Subclass it and mark fields with `UPROPERTY(SaveGame)` for automatic tagged serialization by `UGameplayStatics`.
+**`UGameplayStatics::SaveGameToSlot` writes every non-transient `UPROPERTY`** — it does not filter on the `SaveGame` flag (`Kismet/GameplayStatics.h:1159`). Mark fields `Transient` to exclude them. The `SaveGame` specifier only matters for archives with `ArIsSaveGame` set — see [Actor State](#actor-state-with-upropertysavegame).
 
 ```cpp
-// MyGameSaveGame.h
+// MySaveGame.h
 #pragma once
+
 #include "CoreMinimal.h"
 #include "GameFramework/SaveGame.h"
-#include "MyGameSaveGame.generated.h"
+#include "UObject/SoftObjectPath.h"
+#include "MySaveGame.generated.h"
 
 USTRUCT(BlueprintType)
-struct FInventoryItemData
+struct FMyInventoryItem
 {
-    GENERATED_BODY() // Required — missing GENERATED_BODY() breaks struct serialization silently
+    GENERATED_BODY()
 
-    UPROPERTY(SaveGame) FName  ItemID;
-    UPROPERTY(SaveGame) int32  Quantity = 0;
-    UPROPERTY(SaveGame) bool   bIsEquipped = false;
+    UPROPERTY(SaveGame) FName ItemId;
+    UPROPERTY(SaveGame) int32 Quantity = 0;
 };
 
 UCLASS(BlueprintType)
-class MYGAME_API UMyGameSaveGame : public USaveGame
+class MYGAME_API UMySaveGame : public USaveGame
 {
     GENERATED_BODY()
-public:
-    UPROPERTY(SaveGame) int32   SaveVersion = 0;      // Always include a version field
-    UPROPERTY(SaveGame) float   PlayerHealth = 100.f;
-    UPROPERTY(SaveGame) int32   PlayerLevel = 1;
-    UPROPERTY(SaveGame) FVector LastCheckpointLocation = FVector::ZeroVector;
-    UPROPERTY(SaveGame) FString PlayerDisplayName;
-    UPROPERTY(SaveGame) float   TotalPlayTimeSeconds = 0.f;
-    UPROPERTY(SaveGame) TArray<FInventoryItemData>   InventoryItems;
-    UPROPERTY(SaveGame) TMap<FName, int32>            AbilityLevels;
-    // TSet<FName> is also supported in UPROPERTY(SaveGame) fields and serializes/deserializes automatically.
 
-    // Asset references: FSoftObjectPath stores a string path — safe across saves
-    // Never use raw UObject* or hard TObjectPtr<> to content assets in save data
-    UPROPERTY(SaveGame) FSoftObjectPath LastEquippedWeaponPath;
+public:
+    UPROPERTY(SaveGame) int32 SaveVersion = 0;   // bump alongside MySaveStage::Latest
+    UPROPERTY(SaveGame) float PlayerHealth = 100.f;
+    UPROPERTY(SaveGame) FVector LastCheckpoint = FVector::ZeroVector;
+    UPROPERTY(SaveGame) TArray<FMyInventoryItem> InventoryItems;
+    UPROPERTY(SaveGame) TMap<FName, int32> AbilityLevels;
+
+    /** Store asset references as paths; a hard pointer cannot round-trip through a file. */
+    UPROPERTY(SaveGame) FSoftObjectPath LastEquippedWeapon;
+
+    /** Excluded from SaveGameToSlot because it is Transient. */
+    UPROPERTY(Transient) float RuntimeOnlyScratch = 0.f;
 };
 ```
 
-### Saving and Loading
+Slot functions, all static on `UGameplayStatics` (`Kismet/GameplayStatics.h`):
+
+| Call | Signature |
+|---|---|
+| `CreateSaveGameObject` | `USaveGame* (TSubclassOf<USaveGame> SaveGameClass)` (`:1124`) |
+| `SaveGameToSlot` | `bool (USaveGame*, const FString& SlotName, const int32 UserIndex)` (`:1167`) |
+| `LoadGameFromSlot` | `USaveGame* (const FString& SlotName, const int32 UserIndex)` (`:1211`) |
+| `DoesSaveGameExist` | `bool (const FString& SlotName, const int32 UserIndex)` (`:1175`) |
+| `DeleteGameInSlot` | `bool (const FString& SlotName, const int32 UserIndex)` (`:1231`) |
+| `SaveGameToMemory` | `bool (USaveGame*, TArray<uint8>& OutSaveData)` (`:1134`) |
+| `LoadGameFromMemory` | `USaveGame* (const TArray<uint8>& InSaveData)` (`:1182`) |
+| `SaveDataToSlot` | `bool (const TArray<uint8>&, const FString& SlotName, const int32 UserIndex)` (`:1143`) |
+| `LoadDataFromSlot` | `bool (TArray<uint8>&, const FString& SlotName, const int32 UserIndex)` (`:1191`) |
+
+## Async Save and Load
+
+The async entry points take plain (non-dynamic) delegates, so the bound function must **not** be a `UFUNCTION`:
+
+- `DECLARE_DELEGATE_ThreeParams(FAsyncSaveGameToSlotDelegate, const FString&, const int32, bool)` (`GameplayStatics.h:44`)
+- `DECLARE_DELEGATE_ThreeParams(FAsyncLoadGameFromSlotDelegate, const FString&, const int32, USaveGame*)` (`GameplayStatics.h:47`)
 
 ```cpp
+// MySaveSubsystem.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Subsystems/GameInstanceSubsystem.h"
+#include "MySaveSubsystem.generated.h"
+
+class UMySaveGame; class USaveGame;
+
+UCLASS()
+class MYGAME_API UMySaveSubsystem : public UGameInstanceSubsystem
+{
+    GENERATED_BODY()
+
+public:
+    void RequestSave(float PlayerHealth);
+    void RequestLoad();
+
+private:
+    void HandleSaveComplete(const FString& SlotName, const int32 UserIndex, bool bSuccess);
+    void HandleLoadComplete(const FString& SlotName, const int32 UserIndex, USaveGame* LoadedSave);
+    void RunMigrations(UMySaveGame* Save);
+
+    UPROPERTY()
+    TObjectPtr<UMySaveGame> CurrentSave = nullptr;
+    bool bSaveInProgress = false;
+};
+```
+
+```cpp
+// MySaveSubsystem.cpp
+#include "MySaveSubsystem.h"
+#include "MySaveGame.h"
 #include "Kismet/GameplayStatics.h"
 
-static const FString SlotName  = TEXT("MainSave");
-static constexpr int32 UserIdx = 0; // Always 0 on PC; use GetPlatformUserIndex() on console
+static const FString GMySaveSlot = TEXT("MainSave");
+static constexpr int32 GMyUserIndex = 0; // see ULocalPlayerSaveGame for per-user consoles
 
-// Create the object first, populate its fields, then save
-UMySaveGame* SaveGame = Cast<UMySaveGame>(UGameplayStatics::CreateSaveGameObject(UMySaveGame::StaticClass()));
-SaveGame->PlayerHealth = 75.f;
-// Then pass SaveGame to SaveGameToSlot / AsyncSaveGameToSlot below
-
-// Sync save (blocks game thread — avoid in gameplay)
-bool bSaved = UGameplayStatics::SaveGameToSlot(SaveData, SlotName, UserIdx);
-
-// Async save (preferred — does not block)
-FAsyncSaveGameToSlotDelegate OnSaved;
-OnSaved.BindUObject(this, &USaveManager::OnAsyncSaveComplete);
-UGameplayStatics::AsyncSaveGameToSlot(SaveData, SlotName, UserIdx, OnSaved);
-
-// Load
-if (UGameplayStatics::DoesSaveGameExist(SlotName, UserIdx))
+void UMySaveSubsystem::RequestSave(float PlayerHealth)
 {
-    UMyGameSaveGame* Save = Cast<UMyGameSaveGame>(
-        UGameplayStatics::LoadGameFromSlot(SlotName, UserIdx));
+    if (bSaveInProgress) { return; } // overlapping writes to one slot can truncate the file
+    if (!CurrentSave)
+    {
+        CurrentSave = Cast<UMySaveGame>(
+            UGameplayStatics::CreateSaveGameObject(UMySaveGame::StaticClass()));
+    }
+    if (!CurrentSave) { return; }
+    CurrentSave->PlayerHealth = PlayerHealth;
+    CurrentSave->SaveVersion = MySaveStage::Latest; // in-memory data is current; see Versioning
+
+    // Synchronous form blocks the game thread until the platform write finishes:
+    // UGameplayStatics::SaveGameToSlot(CurrentSave, GMySaveSlot, GMyUserIndex);
+    bSaveInProgress = true;
+    UGameplayStatics::AsyncSaveGameToSlot(CurrentSave, GMySaveSlot, GMyUserIndex,
+        FAsyncSaveGameToSlotDelegate::CreateUObject(this, &UMySaveSubsystem::HandleSaveComplete));
 }
 
-// Async load
-FAsyncLoadGameFromSlotDelegate OnLoaded;
-OnLoaded.BindUObject(this, &USaveManager::OnAsyncLoadComplete);
-UGameplayStatics::AsyncLoadGameFromSlot(SlotName, UserIdx, OnLoaded);
+void UMySaveSubsystem::HandleSaveComplete(const FString& SlotName, const int32 UserIndex, bool bSuccess)
+{
+    bSaveInProgress = false;
+    UE_LOG(LogMyGame, Log, TEXT("Save '%s' (user %d) ok=%d"), *SlotName, UserIndex, bSuccess ? 1 : 0);
+}
 
-// Delete
-UGameplayStatics::DeleteGameInSlot(SlotName, UserIdx);
+void UMySaveSubsystem::RequestLoad()
+{
+    UGameplayStatics::AsyncLoadGameFromSlot(GMySaveSlot, GMyUserIndex,
+        FAsyncLoadGameFromSlotDelegate::CreateUObject(this, &UMySaveSubsystem::HandleLoadComplete));
+}
+
+void UMySaveSubsystem::HandleLoadComplete(const FString& SlotName, const int32 UserIndex, USaveGame* LoadedSave)
+{
+    CurrentSave = Cast<UMySaveGame>(LoadedSave); // null when the slot is missing or unreadable
+    if (!CurrentSave)
+    {
+        CurrentSave = Cast<UMySaveGame>(
+            UGameplayStatics::CreateSaveGameObject(UMySaveGame::StaticClass()));
+        return;
+    }
+    RunMigrations(CurrentSave);
+}
 ```
 
----
+`CreateLambda` works when there is no owning `UObject` to keep alive; capture by value, because the call returns before the write finishes. The delegate runs on the game thread (`check(IsInGameThread())`, `GameplayStatics.cpp:2417`), and runs synchronously inside the call when the slot name is empty or serialization fails (`:2424`). `SaveGameToMemory` itself always runs on the game thread (`:2410`); only the platform write is async.
 
-## Step 4: ULocalPlayerSaveGame (UE 5.0+)
+## ULocalPlayerSaveGame
 
-`ULocalPlayerSaveGame` ties a save to a specific local player, tracks versioning via `GetLatestDataVersion()`, and provides `HandlePostLoad()` for migrations.
+`ULocalPlayerSaveGame` is declared in **`GameFramework/SaveGame.h:47`** (there is no `LocalPlayerSaveGame.h`). It binds a save to one local player, resolves the platform user index automatically, and provides versioning hooks for subclasses to override. `GetLatestDataVersion()` returns the current schema number. `HandlePostLoad()` compares it with `GetSavedDataVersion()`, which is the value stored at the last save, and migrates old data. `HandlePreSave()` sanitises fields before they are written, and `HandlePostSave(bool bSuccess)` is where save results arrive. Call `Super::` in each. A complete subclass with a two-step migration is in [references/save-system-architecture.md](references/save-system-architecture.md#7-per-player-saves-and-thumbnails).
+
+The **native** delegate overload takes a `ULocalPlayer*`; the `APlayerController*` overload takes the dynamic `FOnLocalPlayerSaveGameLoaded` instead.
 
 ```cpp
-UCLASS()
-class MYGAME_API UMyLocalPlayerSave : public ULocalPlayerSaveGame
+// Synchronous: returns null only for invalid parameters, otherwise creates a fresh instance.
+UMyLocalPlayerSave* Save = Cast<UMyLocalPlayerSave>(
+    ULocalPlayerSaveGame::LoadOrCreateSaveGameForLocalPlayer(
+        UMyLocalPlayerSave::StaticClass(), PlayerController, TEXT("PlayerSlot0")));
+
+// Asynchronous, native delegate: pass the ULocalPlayer, not the controller.
+const ULocalPlayer* LocalPlayer = PlayerController ? PlayerController->GetLocalPlayer() : nullptr;
+const bool bScheduled = ULocalPlayerSaveGame::AsyncLoadOrCreateSaveGameForLocalPlayer(
+    UMyLocalPlayerSave::StaticClass(), LocalPlayer, TEXT("PlayerSlot0"),
+    FOnLocalPlayerSaveGameLoadedNative::CreateUObject(this, &AMyPlayerController::HandleSaveLoaded));
+
+// Writing back; results arrive through HandlePostSave, not the return value.
+Save->AsyncSaveGameToSlotForLocalPlayer(); // bool: the save was requested
+Save->SaveGameToSlotForLocalPlayer();      // synchronous
+```
+
+Other verified members (`GameFramework/SaveGame.h:50-224`): `CreateNewSaveGameForLocalPlayer`, `GetLocalPlayerController`, `GetLocalPlayer`, `SetLocalPlayer`, `GetPlatformUserId`, `GetPlatformUserIndex`, `GetSaveSlotName`, `SetSaveSlotName`, `GetSavedDataVersion`, `GetInvalidDataVersion`, `WasLoaded`, `IsSaveInProgress`, `WasLastSaveSuccessful`, `WasSaveRequested`, `InitializeSaveGame`, `ResetToDefault`.
+
+## FArchive and Binary Serialization
+
+`FArchive` (`Serialization/Archive.h`) is bidirectional: one `operator<<` body handles both read and write.
+
+```cpp
+Ar.IsLoading()                 // Archive.h:272
+Ar.IsSaving()                  // Archive.h:284
+Ar.IsError()                   // Archive.h:398 — check after every block
+Ar.Tell()                      // Archive.h:185 — int64 position
+Ar.IsSaveGame()                // Archive.h:659 — reads the ArIsSaveGame field
+Ar.ArIsSaveGame = true;        // Archive.h:942 — public bitfield, no setter exists
+Ar.UsingCustomVersion(Guid);   // Archive.h:2006
+Ar.CustomVer(Guid);            // Archive.h:269 — int32
+```
+
+`FMemoryWriter` / `FMemoryReader` move bytes in and out of a `TArray<uint8>`. Both take `bIsPersistent` (`MemoryWriter.h:26`, `MemoryReader.h:52`); pass `true` so the archive behaves like an on-disk write rather than a transient in-memory one.
+
+```cpp
+#include "Serialization/MemoryWriter.h"
+#include "Serialization/MemoryReader.h"
+
+bool UMyObject::WriteBlob(TArray<uint8>& OutBytes)
+{
+    FMemoryWriter Writer(OutBytes, /*bIsPersistent=*/true);
+    int32 Magic = 0x4D595347;   // 'MYSG'
+    int32 Version = 2;
+    Writer << Magic << Version << BinaryBlob;
+    return !Writer.IsError();
+}
+
+bool UMyObject::ReadBlob(const TArray<uint8>& InBytes)
+{
+    FMemoryReader Reader(InBytes, /*bIsPersistent=*/true);
+    int32 Magic = 0;
+    int32 Version = 0;
+    Reader << Magic << Version;
+    if (Reader.IsError() || Magic != 0x4D595347 || Version < 1) { return false; }
+    Reader << BinaryBlob;
+    return !Reader.IsError();
+}
+```
+
+Overriding `virtual void UMyObject::Serialize(FArchive& Ar)` gives byte-level control on a `UObject`; call `Super::Serialize(Ar)` first so the tagged property block is written. Define a free `FArchive& operator<<(FArchive& Ar, FMyCustomData& Data)` to make a plain struct archive-serializable. `FBufferArchive` (`Serialization/BufferArchive.h:47`) derives from both the memory writer and `TArray<uint8>`, so the archive *is* the buffer.
+
+## Actor State with UPROPERTY(SaveGame)
+
+`UPROPERTY(SaveGame)` sets `CPF_SaveGame` (`UObject/ObjectMacros.h:458`, specifier at `:1194`), which is **only** honoured by archives with `ArIsSaveGame` set. That is how you snapshot live actors: wrap a memory archive in `FObjectAndNameAsStringProxyArchive` (`Serialization/ObjectAndNameAsStringProxyArchive.h:21`) so `UObject` and `FName` references survive as strings instead of load-order-dependent indices.
+
+```cpp
+// MyActorRecord.cpp — include MemoryWriter.h, MemoryReader.h,
+// ObjectAndNameAsStringProxyArchive.h and GameFramework/Actor.h.
+void FMyActorRecord::SaveActor(AActor* Actor)
+{
+    if (!Actor) { return; }
+    ActorClass = Actor->GetClass();
+    ActorTransform = Actor->GetActorTransform();
+    ByteData.Reset();
+
+    FMemoryWriter MemWriter(ByteData, /*bIsPersistent=*/true);
+    FObjectAndNameAsStringProxyArchive Ar(MemWriter, /*bInLoadIfFindFails=*/true);
+    Ar.ArIsSaveGame = true; // only UPROPERTY(SaveGame) fields are written
+    Actor->Serialize(Ar);
+}
+
+void FMyActorRecord::RestoreActor(AActor* Actor) const
+{
+    if (!Actor || ByteData.Num() == 0) { return; }
+    Actor->SetActorTransform(ActorTransform);
+
+    FMemoryReader MemReader(ByteData, /*bIsPersistent=*/true);
+    FObjectAndNameAsStringProxyArchive Ar(MemReader, /*bInLoadIfFindFails=*/true);
+    Ar.ArIsSaveGame = true;
+    Actor->Serialize(Ar);
+}
+```
+
+`FObjectAndNameAsStringProxyArchive` also exposes `bResolveRedirectors` and `bResolveCoreRedirects` (both default `false`); set them when assets may have been renamed between builds. `FNameAsStringProxyArchive` (`Serialization/NameAsStringProxyArchive.h:11`) handles `FName` only. Full world-capture pipeline, per-actor `FGuid` identity, the actor save interface and respawn ordering: [Save system architecture](references/save-system-architecture.md).
+
+## USTRUCT Custom Serialization
+
+A `USTRUCT` hook is `bool Serialize(FArchive& Ar)` **plus** a `TStructOpsTypeTraits` specialization with `WithSerializer = true`. Without the traits specialization the function is never called — the engine gates on `TStructOpsTypeTraits<CppStruct>::WithSerializer` (`UObject/Class.h:1307`; trait declared in `UObject/StructOpsTypeTraits.h:24`). Return `true` to mean "fully handled; skip the default tagged-property path".
+
+```cpp
+// MyStatBlock.h — include "CoreMinimal.h" then "MyStatBlock.generated.h".
+USTRUCT(BlueprintType)
+struct MYGAME_API FMyStatBlock
 {
     GENERATED_BODY()
-public:
-    virtual int32 GetLatestDataVersion() const override { return 3; }
-    virtual void  HandlePostLoad() override;
 
-    UPROPERTY(SaveGame) TMap<FName, int32> UnlockedAbilities;
+    UPROPERTY(SaveGame) float HP = 100.f;
+    UPROPERTY(SaveGame) float Stamina = 100.f;
+
+    bool Serialize(FArchive& Ar);
 };
 
-void UMyLocalPlayerSave::HandlePostLoad()
+template<>
+struct TStructOpsTypeTraits<FMyStatBlock> : public TStructOpsTypeTraitsBase2<FMyStatBlock>
 {
-    Super::HandlePostLoad();
-    const int32 Ver = GetSavedDataVersion(); // version when last saved
-
-    if (Ver < 2) { UnlockedAbilities.Add(TEXT("Dash"), 1); }
-    // Ver < 3 migrations go here
-}
-```
-
-```cpp
-// Load or create (sync)
-UMyLocalPlayerSave* Save = ULocalPlayerSaveGame::LoadOrCreateSaveGameForLocalPlayer(
-    UMyLocalPlayerSave::StaticClass(), PlayerController, TEXT("PlayerSlot0"));
-
-// Load or create (async)
-ULocalPlayerSaveGame::AsyncLoadOrCreateSaveGameForLocalPlayer(
-    UMyLocalPlayerSave::StaticClass(), PlayerController, TEXT("PlayerSlot0"),
-    FOnLocalPlayerSaveGameLoadedNative::CreateUObject(this, &AMyPC::OnSaveLoaded));
-
-// Save back
-Save->AsyncSaveGameToSlotForLocalPlayer(); // async (preferred)
-Save->SaveGameToSlotForLocalPlayer();      // sync
-```
-
----
-
-## Step 5: FArchive and Custom Serialization
-
-`FArchive` (from `Serialization/Archive.h`) is the base for all UE serialization. Key API:
-
-```cpp
-Ar.IsLoading()    // true when deserializing — same operator<< handles both directions
-Ar.IsSaving()     // true when serializing to output
-Ar.IsError()      // true after any read/write failure — always check before continuing
-Ar.Tell()         // current position (int64); -1 if not seekable
-Ar.CustomVer(Key) // returns the registered version number for a FGuid key
-```
-
-### FMemoryWriter and FMemoryReader
-
-`FMemoryWriter`/`FMemoryReader` (from `Serialization/MemoryWriter.h` / `MemoryReader.h`) serialize to/from `TArray<uint8>`:
-
-```cpp
-// Serialize to bytes
-TArray<uint8> OutBytes;
-FMemoryWriter Writer(OutBytes, /*bIsPersistent=*/true);
-int32 Version = 2;
-Writer << Version;          // Serialize version header first — always
-Writer << SomeData;
-checkf(!Writer.IsError(), TEXT("Serialization failed"));
-
-// Deserialize from bytes
-FMemoryReader Reader(OutBytes, /*bIsPersistent=*/true);
-int32 LoadedVersion = 0;
-Reader << LoadedVersion;
-if (LoadedVersion < 1 || Reader.IsError()) { /* corrupt data */ return; }
-Reader << SomeData;
-```
-
-### FBufferArchive
-
-`FBufferArchive` (from `Serialization/BufferArchive.h`) combines `FMemoryWriter` + `TArray<uint8>` — the object *is* the output buffer:
-
-```cpp
-FBufferArchive Buffer(/*bIsPersistent=*/true);
-int32 Magic = 0x53415645; // 'SAVE'
-Buffer << Magic;
-Buffer << MyStruct;        // requires operator<< overload
-TArray<uint8> Bytes = MoveTemp(Buffer); // FBufferArchive IS a TArray<uint8>
-```
-
-### Custom operator<< for Structs
-
-Define `operator<<` to make a struct serializable via any `FArchive` (required when passing it to `FBufferArchive`, `FMemoryWriter`, etc.):
-
-```cpp
-FArchive& operator<<(FArchive& Ar, FMyCustomData& Data)
-{
-    Ar << Data.Name << Data.Value << Data.Timestamp;
-    return Ar;
-}
-```
-
-### Compressed Archives
-
-For large saves, use `FArchiveSaveCompressedProxy` / `FArchiveLoadCompressedProxy` (from `Serialization/ArchiveSaveCompressedProxy.h`):
-
-```cpp
-// Compress
-TArray<uint8> Compressed;
-FArchiveSaveCompressedProxy Comp(Compressed, NAME_Zlib);
-Comp.Serialize(RawData.GetData(), RawData.Num());
-Comp.Flush();
-
-// Decompress
-FArchiveLoadCompressedProxy Decomp(Compressed, NAME_Zlib);
-TArray<uint8> Raw;
-Raw.SetNum(KnownUncompressedSize);
-Decomp.Serialize(Raw.GetData(), Raw.Num());
-```
-
-### Custom Serialize() on UObject
-
-Override `Serialize(FArchive& Ar)` for precise binary layout control:
-
-```cpp
-void UMyObject::Serialize(FArchive& Ar)
-{
-    Super::Serialize(Ar); // always call Super first
-    Ar << BinaryField;
-    Ar << UniqueRunID;
-    if (Ar.IsLoading() && Ar.IsError()) { /* handle corruption */ }
-}
-```
-
----
-
-## Step 6: Versioning
-
-### Integer Versioning in USaveGame
-
-```cpp
-namespace ESaveVersion
-{
-    enum Type : int32
+    enum
     {
-        Initial          = 0,
-        AddedInventory   = 1,
-        SoftRefForWeapon = 2,
-        VersionPlusOne,
-        Latest = VersionPlusOne - 1
+        WithSerializer = true
     };
-}
-
-void USaveManager::RunMigrations(UMyGameSaveGame* Save)
-{
-    if (Save->SaveVersion == ESaveVersion::Latest) { return; }
-
-    if (Save->SaveVersion < ESaveVersion::AddedInventory)
-        Save->InventoryItems.Reset();
-
-    if (Save->SaveVersion < ESaveVersion::SoftRefForWeapon)
-    { /* convert old FName field to FSoftObjectPath */ }
-
-    Save->SaveVersion = ESaveVersion::Latest; // stamp after migration
-}
-```
-
-### FCustomVersionRegistration (FArchive-based saves)
-
-```cpp
-// Declare version enum + GUID (generate once with FGuid::NewGuid(), then hardcode)
-struct FMySaveVersion
-{
-    enum Type { Initial = 0, AddedQuestData = 1, VersionPlusOne, Latest = VersionPlusOne - 1 };
-    static const FGuid GUID;
 };
-const FGuid FMySaveVersion::GUID(0xA1B2C3D4, 0xE5F60718, 0x293A4B5C, 0x6D7E8F90);
-
-// Register globally (module startup or static):
-FCustomVersionRegistration GReg(FMySaveVersion::GUID, FMySaveVersion::Latest, TEXT("MySave"));
-
-// In Serialize():
-Ar.UsingCustomVersion(FMySaveVersion::GUID);
-const int32 Ver = Ar.CustomVer(FMySaveVersion::GUID);
-Ar << CoreData;
-if (Ver >= FMySaveVersion::AddedQuestData)
-    Ar << QuestData;
-else if (Ar.IsLoading())
-    QuestData.Reset(); // Initialize missing data on old saves
 ```
 
-### Struct Field Migration
-
-When a struct field is renamed or its type changes, override `Serialize()` on the struct to migrate old data:
-
 ```cpp
-void FMyStruct::Serialize(FArchive& Ar)
+// MyStatBlock.cpp — include "MyStatBlock.h" and "MySaveVersion.h".
+bool FMyStatBlock::Serialize(FArchive& Ar)
 {
     Ar.UsingCustomVersion(FMySaveVersion::GUID);
-    if (Ar.CustomVer(FMySaveVersion::GUID) < FMySaveVersion::RenamedHealthToHP)
+    if (Ar.CustomVer(FMySaveVersion::GUID) < FMySaveVersion::SplitStamina)
     {
-        float OldHealth;
-        Ar << OldHealth;
-        HP = OldHealth; // Migrate old field name to new
+        float LegacyHealth = 0.f; // the old layout stored a single float
+        Ar << LegacyHealth;
+        HP = LegacyHealth;
+        Stamina = 100.f;
     }
     else
     {
-        Ar << HP;
+        Ar << HP << Stamina;
     }
+    return true;
 }
 ```
 
----
+Related traits on the same base (`StructOpsTypeTraits.h`): `WithPostSerialize`, `WithStructuredSerializer`, `WithSerializeFromMismatchedTag`, `WithNetSerializer`, `WithIdentical`.
 
-## Step 7: Config Files
+## Versioning
 
-### UGameUserSettings (user preferences)
+**Explicit version field** — the simplest option for a `USaveGame` written through `UGameplayStatics`, because the field is just another `UPROPERTY`:
 
 ```cpp
-UCLASS()
-class MYGAME_API UMyGameUserSettings : public UGameUserSettings
+namespace MySaveStage
 {
-    GENERATED_BODY()
-public:
-    UPROPERTY(Config, BlueprintReadWrite, Category="Game")
-    float MasterVolume = 1.0f;
+    constexpr int32 Initial = 0, AddedInventory = 1, SoftRefForWeapon = 2, Latest = SoftRefForWeapon;
+}
 
-    UPROPERTY(Config, BlueprintReadWrite, Category="Game")
-    bool bSubtitlesEnabled = true;
-
-    void ApplyAndSave() { ApplySettings(false); SaveSettings(); }
-};
-// Register in DefaultEngine.ini:
-// [/Script/Engine.Engine]
-// GameUserSettingsClassName=/Script/MyGame.MyGameUserSettings
-```
-
-### UDeveloperSettings (project settings)
-
-```cpp
-UCLASS(Config=Game, DefaultConfig, meta=(DisplayName="My Game Settings"))
-class MYGAME_API UMyProjectSettings : public UDeveloperSettings
+void UMySaveSubsystem::RunMigrations(UMySaveGame* Save)
 {
-    GENERATED_BODY()
-public:
-    UPROPERTY(Config, EditAnywhere, Category="Save") int32 MaxSaveSlots = 5;
-    UPROPERTY(Config, EditAnywhere, Category="Save") bool  bEnableAutoSave = true;
-    UPROPERTY(Config, EditAnywhere, Category="Save") float AutoSaveIntervalSeconds = 300.f;
-    static const UMyProjectSettings* Get() { return GetDefault<UMyProjectSettings>(); }
+    if (!Save || Save->SaveVersion == MySaveStage::Latest) { return; }
+    if (Save->SaveVersion < MySaveStage::AddedInventory) { Save->InventoryItems.Reset(); }
+    if (Save->SaveVersion < MySaveStage::SoftRefForWeapon) { Save->LastEquippedWeapon.Reset(); }
+    Save->SaveVersion = MySaveStage::Latest; // stamp only after every step ran
+}
+```
+
+**`FCustomVersion`** — per-archive versions (`Serialization/CustomVersion.h`: `FCustomVersion` at `:39`, `FCustomVersionRegistration` at `:211`). `SaveGameToSlot`/`SaveGameToMemory` write every registered custom version into the file header and restore them on load (`GameplayStatics.cpp:233,207`), so `CustomVer` works inside a `USaveGame`. A bare `FMemoryWriter`/`FMemoryReader` pair carries no versions: serialize `Ar.GetCustomVersions()` yourself (`Archive.h:555,562`) or `CustomVer` returns `-1` on load.
+
+```cpp
+// MySaveVersion.h — include "CoreMinimal.h" and "Misc/Guid.h".
+struct FMySaveVersion
+{
+    enum Type { Initial = 0, AddedQuestData = 1, SplitStamina = 2, VersionPlusOne, Latest = VersionPlusOne - 1 };
+
+    /** Generate once with FGuid::NewGuid(), then hardcode forever. */
+    static const FGuid GUID;
 };
+
+// MySaveVersion.cpp — include "MySaveVersion.h" and "Serialization/CustomVersion.h".
+const FGuid FMySaveVersion::GUID(0xA1B2C3D4, 0xE5F60718, 0x293A4B5C, 0x6D7E8F90);
+
+// Registers the version with every archive for the module's lifetime.
+FCustomVersionRegistration GRegisterMySaveVersion(
+    FMySaveVersion::GUID, FMySaveVersion::Latest, TEXT("MySaveVersion"));
+
+// Inside any Serialize(); UsingCustomVersion is required when saving (CustomVer asserts
+// otherwise, Archive.cpp:646) and a harmless no-op when loading (Archive.cpp:631).
+// CoreData and QuestData are UPROPERTY members of UMyObject.
+void UMyObject::SerializeVersioned(FArchive& Ar)
+{
+    Ar.UsingCustomVersion(FMySaveVersion::GUID);
+    const int32 Version = Ar.CustomVer(FMySaveVersion::GUID);
+    Ar << CoreData;
+    if (Version >= FMySaveVersion::AddedQuestData) { Ar << QuestData; }
+    else if (Ar.IsLoading())                       { QuestData.Reset(); }
+}
 ```
 
-### GConfig Direct Access
+## ISaveGameSystem and Platform Storage
+
+`UGameplayStatics` routes through the platform's `ISaveGameSystem` (`Engine/Public/SaveGameSystem.h:19`), reached via `IPlatformFeaturesModule::Get().GetSaveGameSystem()` (`Engine/Public/PlatformFeatures.h:41`). Use it directly only for capabilities `UGameplayStatics` does not expose — enumerating slots, native save UI, or multi-user checks.
 
 ```cpp
-#include "Misc/ConfigCacheIni.h"
+#include "SaveGameSystem.h"
+#include "PlatformFeatures.h"
 
-FString Value;
-GConfig->GetString(TEXT("/Script/MyGame.MyConfig"), TEXT("Key"), Value, GGameIni);
-GConfig->SetString(TEXT("/Script/MyGame.MyConfig"), TEXT("Key"), TEXT("Val"), GGameIni);
-GConfig->Flush(/*bRemoveFromCache=*/false, GGameIni);
-
-MyObject->SaveConfig();  // writes UPROPERTY(Config) fields to .ini
-MyObject->LoadConfig();  // reloads from .ini
-```
-
-**INI section naming**: Section `[/Script/ModuleName.ClassName]` maps to the CDO. `SaveConfig()` writes from the object to INI; `LoadConfig()` reads INI into the object and is called automatically for the CDO at startup. Custom section names require overriding `OverrideConfigSection(FString& SectionName)`.
-
----
-
-## Cloud Save Integration
-
-```cpp
-// Platform save systems (Steam, EOS, console) provide ISaveGameSystem
-// Access via IPlatformFeaturesModule:
 ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
-if (SaveSystem && SaveSystem->DoesSaveSystemSupportMultipleUsers())
-{
-    // Platform handles cloud sync — use UGameplayStatics normally
-    // Steam: auto-syncs Saved/SaveGames/ via Steam Cloud if configured in Steamworks
-    // EOS: use IOnlineSubsystem → IOnlineTitleFileInterface for explicit cloud read/write
-}
-
-// Cross-platform pattern: serialize to TArray<uint8>, then write via platform API
-TArray<uint8> SaveData;
-FMemoryWriter Ar(SaveData);
-SaveObject->Serialize(Ar);
-// Upload SaveData via platform SDK
-
-// Steam Cloud — write save slot directly via Steamworks API
-ISteamRemoteStorage* SteamStorage = SteamRemoteStorage();
-if (SteamStorage && SteamStorage->IsCloudEnabledForApp())
-{
-    SteamStorage->FileWrite("SaveSlot1.sav", SaveData.GetData(), SaveData.Num());
-}
-// Read back: SteamStorage->FileRead("SaveSlot1.sav", Buffer, Size)
+if (!SaveSystem) { return; }
+const bool bPerUser = SaveSystem->DoesSaveSystemSupportMultipleUsers();
+TArray<FString> FoundSlots;
+SaveSystem->GetSaveGameNames(FoundSlots, /*UserIndex=*/0);
+const ISaveGameSystem::ESaveExistsResult R = SaveSystem->DoesSaveGameExistWithResult(TEXT("MainSave"), 0);
 ```
 
-## Save Data Encryption
+Interface members (`SaveGameSystem.h:34-58`): `PlatformHasNativeUI`, `DoesSaveSystemSupportMultipleUsers`, `DoesSaveGameExist`, `DoesSaveGameExistWithResult`, `GetSaveGameNames`, `SaveGame`, `LoadGame`, `DeleteGame`. `ISaveGameSystem` also declares the async set `DoesSaveGameExistAsync`, `SaveGameAsync`, `LoadGameAsync`, `LoadGameIfExistsAsync`, `DeleteGameAsync`, `GetSaveGameNamesAsync` and `InitAsync`, all keyed by `FPlatformUserId` (`:78-97`); `FBaseAsyncSaveGameSystem` (`:178`) is the helper base that implements them on `UE::Tasks`. Never build save paths by hand: `FGenericSaveGameSystem::GetSaveGamePath` (`:169`) is the desktop fallback only, and console and cloud backends ignore the filesystem entirely.
 
-```cpp
-// Use FAES for symmetric encryption of save data
-#include "Misc/AES.h"
-// Build a zero-padded 32-byte FAESKey from a string.
-// Do NOT use Key.Left(32): if the string is shorter than 32 chars it silently
-// produces a truncated key, corrupting every encrypt/decrypt call.
-static FAESKey MakeAESKey(const FString& KeyString)
-{
-    FAESKey AESKey;
-    FMemory::Memzero(AESKey.Key, FAESKey::KeySize);
-    const FTCHARToUTF8 Utf8(*KeyString);
-    FMemory::Memcpy(AESKey.Key, Utf8.Get(), FMath::Min(Utf8.Length(), FAESKey::KeySize));
-    return AESKey;
-}
+## Config, Settings, and File Formats
 
-void EncryptSaveData(TArray<uint8>& Data, const FString& KeyString)
-{
-    int32 PaddedSize = Align(Data.Num(), FAES::AESBlockSize);
-    Data.SetNumZeroed(PaddedSize);
-    FAES::EncryptData(Data.GetData(), PaddedSize, MakeAESKey(KeyString));
-}
+Settings are a separate channel from save slots: `.ini` for options and tuning, `USaveGame` for progress.
 
-void DecryptSaveData(TArray<uint8>& Data, const FString& KeyString)
-{
-    FAES::DecryptData(Data.GetData(), Data.Num(), MakeAESKey(KeyString));
-}
-```
-
-**Why encrypt**: Prevents casual save editing for competitive/economy-sensitive games. Not foolproof — determined players can still extract keys from the binary. Combine with server-side validation for authoritative saves.
-
----
-
-## Step 8: Common Mistakes
-
-| Anti-Pattern | Problem | Fix |
+| Need | API | Header |
 |---|---|---|
-| Saving raw `UObject*` or `AActor*` | Pointers invalid between sessions | Save `FSoftObjectPath` or a stable unique ID |
-| No version field | Adding/removing fields corrupts old saves silently | Always include `int32 SaveVersion`; run migrations on load |
-| `SaveGameToSlot` on game thread per frame | Blocks rendering, causes hitches | Use `AsyncSaveGameToSlot` |
-| `USTRUCT` without `GENERATED_BODY()` in a saved field | Silent serialization failure | Add `GENERATED_BODY()` to all saved structs |
-| Ignoring `Ar.IsError()` | Reads past corrupted data, applies garbage | Check after every block; abort immediately if set |
-| Overlapping async saves | Second save starts before first completes | Guard with `bSaveInProgress` flag or `IsSaveInProgress()` |
-| Hardcoded save file paths | Breaks on consoles and different platforms | Use `UGameplayStatics` APIs; `FPaths::ProjectSavedDir()` only for debug |
+| Project Settings page, `Config=Game`, `DefaultConfig` | `UDeveloperSettings` + `GetDefault<T>()`; override `GetContainerName` / `GetCategoryName` / `GetSectionName` | `Engine/DeveloperSettings.h:23,31-35` (module `DeveloperSettings`) |
+| Player options (resolution, audio, keybinds) | `UGameUserSettings::ApplySettings(bool bCheckForCommandLineOverrides)`, `SaveSettings()`, `LoadSettings(bool bForceReload)` | `GameFramework/GameUserSettings.h:49,311,307` |
+| Write/read an object's `UPROPERTY(Config)` fields | `UObject::SaveConfig()`, `LoadConfig()`, `OverrideConfigSection(FString&)` | `UObject/Object.h:1283,1389,1370` |
+| Raw `.ini` keys | `GConfig->GetString/SetString(Section, Key, Value, GGameIni)`, `GConfig->Flush(bRemoveFromCache, GGameIni)` | `Misc/ConfigCacheIni.h:1402,1408,1395`; `GGameIni` at `CoreGlobals.h:439` |
+| `USTRUCT` to/from JSON text; byte array to/from a file (tooling only) | `FJsonObjectConverter::UStructToJsonObjectString` / `JsonObjectStringToUStruct`; `FFileHelper::SaveArrayToFile` / `LoadFileToArray` under `FPaths::ProjectSavedDir()` | `JsonObjectConverter.h:156,313`; `Misc/FileHelper.h:185,79`; `Misc/Paths.h:290` |
 
-**PIE vs. Packaged / platform paths**: In PIE, saves go to `<Project>/Saved/SaveGames/`. Packaged Windows builds write to `%LocalAppData%/<ProjectName>/Saved/SaveGames/`. Console platforms use title storage APIs. `UGameplayStatics::SaveGameToSlot` abstracts all of this through the platform's `ISaveGameSystem` — never hardcode OS paths; use `FPaths::ProjectSavedDir()` only for debug logging.
+Section `[/Script/ModuleName.ClassName]` maps to the class CDO; register a `UGameUserSettings` subclass with `GameUserSettingsClassName=/Script/MyGame.MyGameUserSettings` under `[/Script/Engine.Engine]` in `DefaultEngine.ini`. Compression uses `FCompression::CompressMemoryBound` / `CompressMemory` / `UncompressMemory` (`Misc/Compression.h:73,108,143`) with an `FName` format — `NAME_Zlib`, `NAME_Oodle`, `NAME_Gzip`, `NAME_LZ4` (`UObject/UnrealNames.inl:210-214`) — and must store the uncompressed size alongside the blob; `FArchiveSaveCompressedProxy(TArray<uint8>&, FName, ECompressionFlags)` (`Serialization/ArchiveSaveCompressedProxy.h:28`, `Flush()` at `:36`) and `FArchiveLoadCompressedProxy` (`ArchiveLoadCompressedProxy.h:22`) wrap the same thing as archives. Worked `UDeveloperSettings` class, `GConfig` calls, JSON round-trip, compression, checksum (`FCrc::MemCrc32`, `Misc/Crc.h:29`) and `FAES` encryption code: [Save system architecture](references/save-system-architecture.md).
 
----
+## Deprecated — do not use
 
-## Advanced Edge Cases
+| Do not emit | Use in 5.8 | Source |
+|---|---|---|
+| `#include "GameFramework/LocalPlayerSaveGame.h"` | `#include "GameFramework/SaveGame.h"` | `ULocalPlayerSaveGame` declared at `GameFramework/SaveGame.h:47`; no such header exists |
+| `Ar.SetIsSaveGame(true)` | `Ar.ArIsSaveGame = true;` | public bitfield at `Serialization/Archive.h:942`; no setter in the header |
+| `void FMyStruct::Serialize(FArchive&)` | `bool Serialize(FArchive&)` + `TStructOpsTypeTraits` with `WithSerializer = true` | gate at `UObject/Class.h:1307`, trait at `UObject/StructOpsTypeTraits.h:24` |
+| `COMPRESS_ZLIB` | `NAME_Zlib` | `COMPRESS_ZLIB_DEPRECATED` in `Misc/CompressionFlags.h:18` |
+| `FCompression::GetCompressionFormatFromDeprecatedFlags(Flags)` | pass `NAME_Zlib` / `NAME_Oodle` directly | `UE_DEPRECATED(5.5)` in `Misc/Compression.h:173` |
+| `UGameUserSettings::WindowPosX` / `WindowPosY` | the `WindowPositions` array | `UE_DEPRECATED(5.6)` in `GameFramework/GameUserSettings.h:480,485` |
+| `UFUNCTION()` on an `AsyncSaveGameToSlot` callback | a plain member function | `FAsyncSaveGameToSlotDelegate` is `DECLARE_DELEGATE_ThreeParams` (`GameplayStatics.h:44`), not dynamic |
+| `ISteamRemoteStorage`, `SteamRemoteStorage()`, `IOnlineTitleFileInterface` | `ISaveGameSystem` via `IPlatformFeaturesModule::Get().GetSaveGameSystem()` | none of these appear in any 5.8 engine header |
 
-**Corruption recovery**: When `Ar.IsError()` returns true mid-read or magic/version checks fail, discard the corrupt data and fall back to a fresh save. Optionally maintain a backup slot (write to `Slot_Backup` before overwriting `Slot_Primary`) so players never lose all progress:
+## Common Mistakes
 
-```cpp
-USaveGame* LoadedSave = UGameplayStatics::LoadGameFromSlot(PrimarySlot, 0);
-if (!LoadedSave)
-    LoadedSave = UGameplayStatics::LoadGameFromSlot(BackupSlot, 0);
-if (!LoadedSave)
-    LoadedSave = UGameplayStatics::CreateSaveGameObject(UMySaveGame::StaticClass());
-```
+**Assuming `UPROPERTY(SaveGame)` filters `SaveGameToSlot`:** it does not — `SaveGameToSlot` writes all non-transient properties (`GameplayStatics.h:1159`). Use `Transient` to exclude a field; `SaveGame` matters only for archives with `ArIsSaveGame = true`.
 
-**Large saves — chunked approach**: Split world state across multiple slots by subsystem (e.g., `Save_World_00`, `Save_Inventory`, `Save_Quests`). Load each with `AsyncLoadGameFromSlot` in parallel. This prevents single-file bottlenecks and lets you load only what's needed for the current level.
+**Serializing an actor without the proxy archive:** a bare `FMemoryWriter` stores `UObject` and `FName` references as indices that do not survive a restart. Always wrap it in `FObjectAndNameAsStringProxyArchive`.
 
-**Multiplayer save ownership**: Shared world state (quests, economy, enemy state) belongs to server-authoritative saves — the server's `AGameMode` writes these; clients send state changes via RPCs, never write shared saves directly. Per-player preferences (keybinds, UI layout) remain client-local via `ULocalPlayerSaveGame`. This split prevents desync and cheating.
+**Passing an `APlayerController*` with the native local-player delegate:** the `FOnLocalPlayerSaveGameLoadedNative` overload takes `const ULocalPlayer*`. Call `PlayerController->GetLocalPlayer()` first.
 
----
+**Getting versioning backwards:** set `SaveVersion = Latest` only after every migration step has run (and on every save, so fresh saves are not migrated next load). `Ar.UsingCustomVersion()` is mandatory on the *saving* archive — `CustomVer` `check()`s otherwise — while on a loading archive it is a no-op and `CustomVer` returns the file's version, or `-1` if the archive holds none (`Archive.cpp:631,646-648`).
 
-## Module Dependencies (Build.cs)
-
-```csharp
-PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });
-// For UDeveloperSettings:
-PublicDependencyModuleNames.Add("DeveloperSettings");
-```
-
----
+**Hardcoding `Saved/SaveGames/*.sav` paths:** consoles and cloud backends never touch that directory; use `UGameplayStatics` or `ISaveGameSystem`.
 
 ## Related Skills
 
-- `ue-cpp-foundations` — UPROPERTY, USTRUCT, UObject lifetime
-- `ue-data-assets-tables` — FSoftObjectPath patterns for asset references in saves
-- `ue-gameplay-framework` — GameInstance as save manager host; GameMode auto-save integration
-
-## Reference Files
-
-- `references/save-system-architecture.md` — Full slot manager subsystem, metadata bank, multi-user patterns, and migration pipeline
+- `ue-cpp-foundations` — `UPROPERTY`/`USTRUCT` specifiers, `UObject` lifetime, subsystem types
+- `ue-data-assets-tables` — `FSoftObjectPath`, `FPrimaryAssetId`, async loading behind saved references
+- `ue-gameplay-framework` — `UGameInstance` as the save manager host, GameMode-driven autosave points
+- `ue-world-level-streaming` — persisting streamed-level and World Partition actor state
+- `ue-async-threading` — running serialization or compression off the game thread
+- `ue-networking-replication` — server-authoritative saves versus client-local profiles

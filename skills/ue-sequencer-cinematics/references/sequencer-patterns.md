@@ -1,37 +1,44 @@
-# Sequencer Patterns Reference
+# Sequencer Runtime Patterns
 
-Common runtime patterns for Unreal Engine Sequencer / LevelSequence. All patterns use real
-API from LevelSequenceActor.h, LevelSequencePlayer.h, MovieSceneSequencePlayer.h,
-CineCameraActor.h, CineCameraComponent.h, and CineCameraSettings.h.
+Complete, compilable patterns for Unreal Engine 5.8 Sequencer. Every API here is verified against
+`LevelSequenceActor.h`, `LevelSequencePlayer.h`, `LevelSequenceDirector.h`,
+`MovieSceneSequencePlayer.h`, `MovieSceneSequencePlaybackSettings.h`, `MovieSceneObjectBindingID.h`,
+`CineCameraActor.h`, `CineCameraComponent.h`, `CineCameraSettings.h`, `CameraRig_Rail.h`,
+`CameraRig_Crane.h` and the `MovieRenderPipelineCore` public headers in UE 5.8.
+
+Build.cs modules, the runtime-vs-editor boundary and the deprecation table live in the skill body.
 
 ---
 
-## Pattern 1: Full-Screen Dialogue Cutscene
+## Pattern 1: Full-Screen Cutscene With Skip
 
-A cutscene triggered by gameplay that disables player input, plays a pre-authored sequence,
-then restores control.
+Disables input, plays a sequence, restores the player camera and input whether the sequence
+finishes or the player skips it.
 
 ### Header
 
 ```cpp
 // MyCutsceneManager.h
 #pragma once
+
 #include "GameFramework/Actor.h"
-#include "LevelSequencePlayer.h"
-#include "LevelSequenceActor.h"
-#include "MovieSceneSequencePlaybackSettings.h"
 #include "MyCutsceneManager.generated.h"
 
+class ALevelSequenceActor;
+class ULevelSequence;
+class ULevelSequencePlayer;
+
 UCLASS()
-class AMyCutsceneManager : public AActor
+class MYGAME_API AMyCutsceneManager : public AActor
 {
     GENERATED_BODY()
-public:
-    /** LevelSequence asset to play — assign in editor or set via SetSequenceAsset() */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cinematics")
-    ULevelSequence* CutsceneAsset;
 
-    /** Optional: named binding tag for the hero actor (tag set in Sequencer UI) */
+public:
+    /** LevelSequence asset to play. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cinematics")
+    TObjectPtr<ULevelSequence> CutsceneAsset;
+
+    /** Binding tag applied to the hero track in the Sequencer editor. */
     UPROPERTY(EditAnywhere, Category = "Cinematics")
     FName HeroBindingTag = FName("Hero");
 
@@ -41,17 +48,20 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Cinematics")
     void SkipCutscene();
 
+protected:
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
 private:
-    UPROPERTY()
-    ALevelSequenceActor* ActiveSequenceActor;
-
-    UPROPERTY()
-    ULevelSequencePlayer* ActivePlayer;
-
     UFUNCTION()
-    void OnCutsceneFinished();
+    void HandleCutsceneFinished();
 
     void RestorePlayerControl();
+
+    UPROPERTY()
+    TObjectPtr<ALevelSequenceActor> ActiveSequenceActor;
+
+    UPROPERTY()
+    TObjectPtr<ULevelSequencePlayer> ActivePlayer;
 };
 ```
 
@@ -60,189 +70,326 @@ private:
 ```cpp
 // MyCutsceneManager.cpp
 #include "MyCutsceneManager.h"
-#include "LevelSequencePlayer.h"
+
+#include "Camera/PlayerCameraManager.h"
+#include "GameFramework/PlayerController.h"
 #include "LevelSequenceActor.h"
-#include "Kismet/GameplayStatics.h"
+#include "LevelSequencePlayer.h"
+#include "MovieSceneSequencePlaybackSettings.h"
 
 void AMyCutsceneManager::PlayCutscene(AActor* HeroActor)
 {
-    if (!CutsceneAsset)
+    if (!CutsceneAsset || ActivePlayer)
     {
-        UE_LOG(LogTemp, Warning, TEXT("AMyCutsceneManager: No CutsceneAsset assigned."));
         return;
     }
 
-    // Build playback settings
     FMovieSceneSequencePlaybackSettings Settings;
-    Settings.bAutoPlay          = false;
-    Settings.PlayRate           = 1.0f;
-    Settings.LoopCount.Value    = 0;      // play once
+    Settings.bAutoPlay             = false;
+    Settings.PlayRate              = 1.0f;
+    Settings.LoopCount.Value       = 0;
     Settings.bDisableMovementInput = true;
     Settings.bDisableLookAtInput   = true;
-    Settings.bHidePlayer        = false;
-    Settings.bHideHud           = false;
-    Settings.bPauseAtEnd        = false;
-    // ForceRestoreState: if skipped mid-sequence, actors return to pre-sequence state
+    Settings.bHidePlayer           = true;
+    Settings.bHideHud              = true;
+    Settings.bPauseAtEnd           = false;
+    // Skipping mid-sequence then restores every animated actor to its pre-sequence state.
     Settings.FinishCompletionStateOverride =
         EMovieSceneCompletionModeOverride::ForceRestoreState;
 
-    // Spawn sequence actor and player
     ALevelSequenceActor* OutActor = nullptr;
     ULevelSequencePlayer* Player = ULevelSequencePlayer::CreateLevelSequencePlayer(
         this, CutsceneAsset, Settings, OutActor);
 
     if (!Player || !OutActor)
     {
-        UE_LOG(LogTemp, Error, TEXT("AMyCutsceneManager: Failed to create sequence player."));
         return;
     }
 
-    // Store references to prevent GC
     ActiveSequenceActor = OutActor;
     ActivePlayer        = Player;
 
-    // Bind actor to the Hero track before play
+    // Bind before Play() so frame 0 evaluates against the gameplay actor.
     if (HeroActor && !HeroBindingTag.IsNone())
     {
-        OutActor->SetBindingByTag(HeroBindingTag,
-                                  TArray<AActor*>{ HeroActor },
+        OutActor->SetBindingByTag(HeroBindingTag, TArray<AActor*>{ HeroActor },
                                   /*bAllowBindingsFromAsset=*/ false);
     }
 
-    // Subscribe to completion
-    Player->OnFinished.AddDynamic(this, &AMyCutsceneManager::OnCutsceneFinished);
-
-    // Play
+    Player->OnFinished.AddDynamic(this, &AMyCutsceneManager::HandleCutsceneFinished);
     Player->Play();
 }
 
 void AMyCutsceneManager::SkipCutscene()
 {
-    if (!ActivePlayer) { return; }
+    if (!ActivePlayer)
+    {
+        return;
+    }
 
-    // ForceRestoreState was set in settings, so Stop() restores actor transforms
+    // Stop() fires OnStop, not OnFinished, so restore control here.
+    ActivePlayer->SetCompletionModeOverride(EMovieSceneCompletionModeOverride::ForceRestoreState);
     ActivePlayer->Stop();
-    // OnCutsceneFinished will fire after Stop in certain configurations;
-    // call RestorePlayerControl directly to be safe
+
+    ActivePlayer->OnFinished.RemoveDynamic(this, &AMyCutsceneManager::HandleCutsceneFinished);
+    ActivePlayer        = nullptr;
+    ActiveSequenceActor = nullptr;
+
     RestorePlayerControl();
 }
 
-void AMyCutsceneManager::OnCutsceneFinished()
+void AMyCutsceneManager::HandleCutsceneFinished()
 {
-    RestorePlayerControl();
+    if (ActivePlayer)
+    {
+        ActivePlayer->OnFinished.RemoveDynamic(this, &AMyCutsceneManager::HandleCutsceneFinished);
+    }
+
     ActivePlayer        = nullptr;
     ActiveSequenceActor = nullptr;
+
+    RestorePlayerControl();
+}
+
+void AMyCutsceneManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (ActivePlayer && ActivePlayer->IsPlaying())
+    {
+        ActivePlayer->Stop();
+    }
+
+    Super::EndPlay(EndPlayReason);
 }
 
 void AMyCutsceneManager::RestorePlayerControl()
 {
-    APlayerController* PC = GetWorld()->GetFirstPlayerController();
-    if (!PC) { return; }
+    APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+    if (!PC)
+    {
+        return;
+    }
 
-    // Return camera to the player pawn with a short blend
-    APawn* PlayerPawn = PC->GetPawn();
-    if (PlayerPawn)
+    if (APawn* PlayerPawn = PC->GetPawn())
     {
         PC->SetViewTargetWithBlend(PlayerPawn, 0.5f, VTBlend_Cubic);
     }
 
+    // PlayerController.h:2085 — SetCinematicMode(bInCinematicMode, bHidePlayer, bAffectsHUD,
+    //                                            bAffectsMovement, bAffectsTurning)
+    PC->SetCinematicMode(false, /*bHidePlayer=*/ false, true, true, true);
     PC->SetIgnoreMoveInput(false);
     PC->SetIgnoreLookInput(false);
 }
 ```
 
+`SetViewTargetWithBlend` is declared in `PlayerController.h:1667`; blend functions are
+`VTBlend_Linear`, `VTBlend_Cubic`, `VTBlend_EaseIn`, `VTBlend_EaseOut`, `VTBlend_EaseInOut`
+(`Camera/PlayerCameraManager.h:29`).
+
 ---
 
-## Pattern 2: In-Game Triggered Camera (No Input Lockout)
+## Pattern 2: In-Game Camera Beat Without Input Lockout
 
-A background camera sequence that plays without hiding the HUD or disabling input — for
-scripted gameplay moments (e.g. a crane shot during a boss encounter).
+A scripted camera move during gameplay: the player keeps control, the HUD stays up, and audio
+reacts to each camera cut.
 
 ```cpp
-// In a GameMode or GameplayComponent
-void AMyGameMode::TriggerBossArrivalCamera()
+// MyEncounterDirector.h
+#pragma once
+
+#include "GameFramework/Actor.h"
+#include "MyEncounterDirector.generated.h"
+
+class ALevelSequenceActor;
+class ULevelSequence;
+class ULevelSequencePlayer;
+class UCameraComponent;
+class USoundBase;
+
+UCLASS()
+class MYGAME_API AMyEncounterDirector : public AActor
 {
-    if (!BossArrivalSequence) { return; }
+    GENERATED_BODY()
+
+public:
+    UFUNCTION(BlueprintCallable, Category = "Cinematics")
+    void PlayBossArrival();
+
+private:
+    UFUNCTION()
+    void HandleCameraCut(UCameraComponent* NewCamera);
+
+    UFUNCTION()
+    void HandleArrivalFinished();
+
+    UPROPERTY(EditAnywhere, Category = "Cinematics")
+    TObjectPtr<ULevelSequence> BossArrivalSequence;
+
+    UPROPERTY(EditAnywhere, Category = "Cinematics")
+    TObjectPtr<USoundBase> CameraCutStinger;
+
+    UPROPERTY()
+    TObjectPtr<ALevelSequenceActor> ArrivalSequenceActor;
+
+    UPROPERTY()
+    TObjectPtr<ULevelSequencePlayer> ArrivalPlayer;
+};
+```
+
+```cpp
+// MyEncounterDirector.cpp
+#include "MyEncounterDirector.h"
+
+#include "Camera/CameraComponent.h"
+#include "GameFramework/PlayerController.h"
+#include "Kismet/GameplayStatics.h"
+#include "LevelSequenceActor.h"
+#include "LevelSequencePlayer.h"
+#include "MovieSceneSequencePlaybackSettings.h"
+
+void AMyEncounterDirector::PlayBossArrival()
+{
+    if (!BossArrivalSequence)
+    {
+        return;
+    }
 
     FMovieSceneSequencePlaybackSettings Settings;
     Settings.bAutoPlay             = false;
     Settings.PlayRate              = 1.0f;
     Settings.LoopCount.Value       = 0;
-    Settings.bDisableMovementInput = false;  // player keeps control
+    Settings.bDisableMovementInput = false;   // player keeps control
     Settings.bDisableLookAtInput   = false;
     Settings.bHidePlayer           = false;
     Settings.bHideHud              = false;
-    Settings.bDisableCameraCuts    = false;  // allow camera cuts in sequence
+    Settings.bDisableCameraCuts    = false;   // the sequence owns the camera for its duration
     Settings.bPauseAtEnd           = false;
 
-    ALevelSequenceActor* OutActor  = nullptr;
-    BossArrivalPlayer = ULevelSequencePlayer::CreateLevelSequencePlayer(
+    ALevelSequenceActor* OutActor = nullptr;
+    ArrivalPlayer = ULevelSequencePlayer::CreateLevelSequencePlayer(
         this, BossArrivalSequence, Settings, OutActor);
-    BossArrivalSequenceActor = OutActor;
+    ArrivalSequenceActor = OutActor;
 
-    if (BossArrivalPlayer)
+    if (!ArrivalPlayer)
     {
-        // React to camera cut events (e.g. to trigger audio stingers)
-        BossArrivalPlayer->OnCameraCut.AddDynamic(
-            this, &AMyGameMode::OnBossArrivalCameraCut);
+        return;
+    }
 
-        BossArrivalPlayer->OnFinished.AddDynamic(
-            this, &AMyGameMode::OnBossArrivalCameraFinished);
+    ArrivalPlayer->OnCameraCut.AddDynamic(this, &AMyEncounterDirector::HandleCameraCut);
+    ArrivalPlayer->OnFinished.AddDynamic(this, &AMyEncounterDirector::HandleArrivalFinished);
+    ArrivalPlayer->Play();
+}
 
-        BossArrivalPlayer->Play();
+void AMyEncounterDirector::HandleCameraCut(UCameraComponent* NewCamera)
+{
+    if (CameraCutStinger)
+    {
+        UGameplayStatics::PlaySound2D(this, CameraCutStinger);
     }
 }
 
-UFUNCTION()
-void AMyGameMode::OnBossArrivalCameraCut(UCameraComponent* NewCamera)
+void AMyEncounterDirector::HandleArrivalFinished()
 {
-    // e.g. play a stinger sound effect when cut happens
-    UGameplayStatics::PlaySound2D(this, CameraCutStinger);
-}
-
-UFUNCTION()
-void AMyGameMode::OnBossArrivalCameraFinished()
-{
-    // Return to gameplay camera
-    APlayerController* PC = GetWorld()->GetFirstPlayerController();
-    if (PC && PC->GetPawn())
+    if (APlayerController* PC = GetWorld()->GetFirstPlayerController())
     {
-        PC->SetViewTargetWithBlend(PC->GetPawn(), 1.0f, VTBlend_EaseInOut, 2.0f);
+        if (APawn* PlayerPawn = PC->GetPawn())
+        {
+            PC->SetViewTargetWithBlend(PlayerPawn, 1.0f, VTBlend_EaseInOut, 2.0f);
+        }
     }
-    BossArrivalPlayer        = nullptr;
-    BossArrivalSequenceActor = nullptr;
+
+    ArrivalPlayer        = nullptr;
+    ArrivalSequenceActor = nullptr;
 }
 ```
 
+To leave the gameplay camera untouched entirely, set `Settings.bDisableCameraCuts = true` (or call
+`Player->SetDisableCameraCuts(true)`) and let the sequence animate only world actors.
+
 ---
 
-## Pattern 3: Scripted Event Sequence with Runtime Actor Binding
+## Pattern 3: Director-Driven Scripted Event
 
-A scripted event that binds multiple actors at runtime (e.g. two NPCs performing an
-interaction authored in Sequencer with tag-based bindings).
+Two NPCs perform an authored interaction. The trigger actor binds them by tag; the timeline calls
+back into a `ULevelSequenceDirector` subclass, which is the only legal home for an event endpoint.
 
-### Sequence Setup (in Editor)
+### Editor setup
 
-1. Create a LevelSequence asset called `LS_NPCHandshake`.
-2. Add two possessable bindings: tag them `NPC_A` and `NPC_B` via right-click -> Tags.
-3. Add transform, skeletal animation, and event tracks to each binding.
-4. Add an Event Track at frame 60 bound to `TriggerHandshakeReaction()`.
+1. Create `LS_NPCHandshake` and add two possessable bindings, tagged `NPC_A` and `NPC_B`.
+2. Add transform and skeletal animation tracks to each binding.
+3. Add an Event Track on the `NPC_A` binding, and key it at the handshake frame.
+4. Open the Director Blueprint from the Sequencer toolbar, reparent it to `UMyHandshakeDirector`,
+   and pick `OnHandshakeContact` as the event endpoint.
 
-### C++ Runtime Binding
+### Director
 
 ```cpp
-// ScriptedEventTrigger.cpp
+// MyHandshakeDirector.h
+#pragma once
 
-void AScriptedEventTrigger::TriggerHandshakeSequence(
-    AActor* NpcA, AActor* NpcB)
+#include "LevelSequenceDirector.h"
+#include "MyHandshakeDirector.generated.h"
+
+class AActor;
+
+UCLASS(Blueprintable)
+class MYGAME_API UMyHandshakeDirector : public ULevelSequenceDirector
 {
-    if (!HandshakeSequence) { return; }
+    GENERATED_BODY()
+
+public:
+    /**
+     * Event endpoint. The track sits on an object binding, so the bound actor is passed in.
+     * Endpoints take no parameters, or exactly one pass-by-value object/interface parameter.
+     */
+    UFUNCTION(BlueprintCallable, CallInEditor, Category = "Cinematics")
+    void OnHandshakeContact(AActor* BoundActor);
+};
+```
+
+```cpp
+// MyHandshakeDirector.cpp
+#include "MyHandshakeDirector.h"
+
+#include "GameFramework/Actor.h"
+#include "LevelSequencePlayer.h"
+
+void UMyHandshakeDirector::OnHandshakeContact(AActor* BoundActor)
+{
+    if (!BoundActor)
+    {
+        return;
+    }
+
+    // ULevelSequenceDirector::Player is a UPROPERTY, valid while the sequence evaluates.
+    const FQualifiedFrameTime EventTime = GetCurrentTime();
+    UE_LOG(LogMyGame, Log, TEXT("Handshake contact on %s at frame %d"),
+           *BoundActor->GetName(), EventTime.Time.FrameNumber.Value);
+}
+```
+
+### Trigger
+
+```cpp
+// MyHandshakeTrigger.cpp
+#include "MyHandshakeTrigger.h"
+
+#include "LevelSequenceActor.h"
+#include "LevelSequencePlayer.h"
+#include "MovieSceneSequencePlaybackSettings.h"
+
+void AMyHandshakeTrigger::TriggerHandshake(AActor* NpcA, AActor* NpcB)
+{
+    if (!HandshakeSequence)
+    {
+        return;
+    }
 
     FMovieSceneSequencePlaybackSettings Settings;
-    Settings.bAutoPlay          = false;
-    Settings.LoopCount.Value    = 0;
+    Settings.bAutoPlay             = false;
+    Settings.LoopCount.Value       = 0;
     Settings.bDisableMovementInput = false;
-    Settings.bHideHud           = false;
+    Settings.bHideHud              = false;
     Settings.FinishCompletionStateOverride =
         EMovieSceneCompletionModeOverride::ForceRestoreState;
 
@@ -251,57 +398,61 @@ void AScriptedEventTrigger::TriggerHandshakeSequence(
         this, HandshakeSequence, Settings, OutActor);
     HandshakeSequenceActor = OutActor;
 
-    if (!HandshakePlayer) { return; }
+    if (!HandshakePlayer || !HandshakeSequenceActor)
+    {
+        return;
+    }
 
-    // Bind both NPCs before playing
-    HandshakeSequenceActor->SetBindingByTag(
-        FName("NPC_A"), TArray<AActor*>{ NpcA }, false);
-    HandshakeSequenceActor->SetBindingByTag(
-        FName("NPC_B"), TArray<AActor*>{ NpcB }, false);
+    HandshakeSequenceActor->SetBindingByTag(FName("NPC_A"), TArray<AActor*>{ NpcA }, false);
+    HandshakeSequenceActor->SetBindingByTag(FName("NPC_B"), TArray<AActor*>{ NpcB }, false);
 
-    HandshakePlayer->OnFinished.AddDynamic(
-        this, &AScriptedEventTrigger::OnHandshakeFinished);
+    HandshakePlayer->OnFinished.AddDynamic(this, &AMyHandshakeTrigger::HandleHandshakeFinished);
     HandshakePlayer->Play();
 }
 
-// Called by the Event Track at frame 60 (must be on an object in event context)
-UFUNCTION(BlueprintCallable, Category = "Cinematics")
-void AScriptedEventTrigger::TriggerHandshakeReaction()
-{
-    // Gameplay response to the mid-sequence event
-    UE_LOG(LogTemp, Log, TEXT("Handshake event fired from Sequencer!"));
-}
-
-UFUNCTION()
-void AScriptedEventTrigger::OnHandshakeFinished()
+void AMyHandshakeTrigger::HandleHandshakeFinished()
 {
     HandshakePlayer        = nullptr;
     HandshakeSequenceActor = nullptr;
 }
 ```
 
+`AMyHandshakeTrigger` declares `HandshakeSequence`, `HandshakePlayer`, `HandshakeSequenceActor` and
+the `UFUNCTION() void HandleHandshakeFinished()` in its header, following the shape of
+`AMyCutsceneManager` above.
+
 ---
 
-## Pattern 4: Looping Ambient Sequence (Background Atmosphere)
+## Pattern 4: Looping Ambient Sequence
 
-A sequence that loops indefinitely to drive ambient elements (foliage sway, light flicker,
-water ripple) without affecting player state.
+Drives ambient elements (light flicker, foliage sway) forever without touching the player.
 
 ```cpp
-void AAtmosphereManager::BeginPlay()
+// MyAtmosphereManager.cpp
+#include "MyAtmosphereManager.h"
+
+#include "LevelSequenceActor.h"
+#include "LevelSequencePlayer.h"
+#include "MovieSceneSequencePlaybackSettings.h"
+
+void AMyAtmosphereManager::BeginPlay()
 {
     Super::BeginPlay();
 
-    if (!AmbientSequence) { return; }
+    if (!AmbientSequence)
+    {
+        return;
+    }
 
     FMovieSceneSequencePlaybackSettings Settings;
-    Settings.bAutoPlay          = false;
-    Settings.LoopCount.Value    = -1;   // -1 = infinite
+    Settings.bAutoPlay             = false;
+    Settings.LoopCount.Value       = -1;     // infinite
+    Settings.bRandomStartTime      = true;   // desynchronise multiple instances
     Settings.bDisableMovementInput = false;
     Settings.bDisableLookAtInput   = false;
-    Settings.bHidePlayer        = false;
-    Settings.bHideHud           = false;
-    Settings.bDisableCameraCuts = true; // do not take over camera
+    Settings.bHidePlayer           = false;
+    Settings.bHideHud              = false;
+    Settings.bDisableCameraCuts    = true;   // never steal the gameplay camera
 
     ALevelSequenceActor* OutActor = nullptr;
     AmbientPlayer = ULevelSequencePlayer::CreateLevelSequencePlayer(
@@ -314,316 +465,589 @@ void AAtmosphereManager::BeginPlay()
     }
 }
 
-void AAtmosphereManager::EndPlay(const EEndPlayReason::Type Reason)
+void AMyAtmosphereManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     if (AmbientPlayer && AmbientPlayer->IsPlaying())
     {
         AmbientPlayer->Stop();
     }
-    Super::EndPlay(Reason);
+
+    Super::EndPlay(EndPlayReason);
 }
 ```
 
+An ambient sequence that only ever loops can also be a placed `ALevelSequenceActor` with
+`PlaybackSettings.bAutoPlay = true` and `PlaybackSettings.LoopCount.Value = -1`, with no C++ at all.
+
 ---
 
-## Pattern 5: CineCameraActor — Runtime Camera Setup in Sequence
+## Pattern 5: Cine Camera and Rig Setup
 
-Spawning and configuring a `ACineCameraActor` then handing it to a sequence.
+Spawns a cine camera on a rail, ready to be possessed by a sequence.
 
 ```cpp
+// MyCameraRigBuilder.cpp
+#include "MyCameraRigBuilder.h"
+
+#include "CameraRig_Rail.h"
 #include "CineCameraActor.h"
 #include "CineCameraComponent.h"
-#include "CineCameraSettings.h"   // FCameraFilmbackSettings, FCameraLensSettings, FCameraFocusSettings
+#include "CineCameraSettings.h"
+#include "Components/SplineComponent.h"
 
-ACineCameraActor* AMyDirector::SpawnCineCamera(
-    FVector Location, FRotator Rotation)
+ACineCameraActor* AMyCameraRigBuilder::SpawnDollyCamera(ACameraRig_Rail* Rail, AActor* SubjectActor)
 {
-    FActorSpawnParameters Params;
-    Params.Owner = this;
+    if (!Rail)
+    {
+        return nullptr;
+    }
+
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.Owner = this;
 
     ACineCameraActor* Camera = GetWorld()->SpawnActor<ACineCameraActor>(
-        ACineCameraActor::StaticClass(),
-        Location, Rotation, Params);
+        ACineCameraActor::StaticClass(), Rail->GetActorTransform(), SpawnParams);
+    if (!Camera)
+    {
+        return nullptr;
+    }
 
-    if (!Camera) { return nullptr; }
+    Camera->AttachToComponent(Rail->GetDefaultAttachComponent(),
+                              FAttachmentTransformRules::SnapToTargetIncludingScale);
 
     UCineCameraComponent* CineComp = Camera->GetCineCameraComponent();
 
-    // 35mm full-frame sensor
+    // 35mm full-frame sensor.
     FCameraFilmbackSettings Filmback;
-    Filmback.SensorWidth  = 36.0f;  // mm
+    Filmback.SensorWidth  = 36.0f;
     Filmback.SensorHeight = 24.0f;
     CineComp->SetFilmback(Filmback);
 
-    // 35mm prime lens
+    // Fixed 35mm prime.
     FCameraLensSettings Lens;
-    Lens.MinFocalLength = 35.0f;
-    Lens.MaxFocalLength = 35.0f;
-    Lens.MinFStop       = 1.4f;
-    Lens.MaxFStop       = 16.0f;
+    Lens.MinFocalLength       = 35.0f;
+    Lens.MaxFocalLength       = 35.0f;
+    Lens.MinFStop             = 1.4f;
+    Lens.MaxFStop             = 16.0f;
     Lens.MinimumFocusDistance = 30.0f;
+    Lens.DiaphragmBladeCount  = 7;
     CineComp->SetLensSettings(Lens);
+
+    // Track focus on the subject rather than keying focus distance by hand.
+    FCameraFocusSettings Focus;
+    Focus.FocusMethod                              = ECameraFocusMethod::Tracking;
+    Focus.TrackingFocusSettings.ActorToTrack       = SubjectActor;
+    Focus.TrackingFocusSettings.RelativeOffset     = FVector(0.f, 0.f, 80.f);
+    Focus.bSmoothFocusChanges                      = true;
+    Focus.FocusSmoothingInterpSpeed                = 8.0f;
+    CineComp->SetFocusSettings(Focus);
 
     CineComp->SetCurrentFocalLength(35.0f);
     CineComp->SetCurrentAperture(2.0f);
 
-    // Manual focus at 5 meters (500 cm)
-    FCameraFocusSettings FocusSettings;
-    FocusSettings.FocusMethod         = ECameraFocusMethod::Manual;
-    FocusSettings.ManualFocusDistance = 500.0f;
-    FocusSettings.bSmoothFocusChanges      = true;
-    FocusSettings.FocusSmoothingInterpSpeed = 8.0f;
-    CineComp->SetFocusSettings(FocusSettings);
-
-    // Lookat tracking toward hero
     Camera->LookatTrackingSettings.bEnableLookAtTracking     = true;
-    Camera->LookatTrackingSettings.ActorToTrack              = HeroActor;
-    Camera->LookatTrackingSettings.RelativeOffset            = FVector(0, 0, 80.f);
+    Camera->LookatTrackingSettings.ActorToTrack              = SubjectActor;
+    Camera->LookatTrackingSettings.RelativeOffset            = FVector(0.f, 0.f, 80.f);
     Camera->LookatTrackingSettings.LookAtTrackingInterpSpeed = 4.0f;
     Camera->LookatTrackingSettings.bAllowRoll                = false;
+
+    // Key CurrentPositionOnRail in Sequencer to dolly; it is UPROPERTY(Interp).
+    Rail->CurrentPositionOnRail  = 0.0f;
+    Rail->bLockOrientationToRail = false;
 
     return Camera;
 }
 ```
 
+`ACameraRig_Crane` works the same way: attach to `GetDefaultAttachComponent()` and key
+`CraneArmLength`, `CranePitch` and `CraneYaw`, with `bLockMountPitch` / `bLockMountYaw` to keep the
+camera level while the arm swings.
+
 ---
 
-## Pattern 6: Partial Playback — Play a Specific Frame Range
+## Pattern 6: Partial Playback and Segment Chaining
 
-Play only a portion of a sequence (e.g. frames 0-60 for an intro, then frames 61-120 for the
-main loop).
+Plays frames 0-60 as an intro, then loops frames 61-119.
 
 ```cpp
-void AMySequenceController::PlayIntroSegment()
+// MySegmentController.cpp
+#include "MySegmentController.h"
+
+#include "LevelSequenceActor.h"
+#include "LevelSequencePlayer.h"
+#include "MovieSceneSequencePlaybackSettings.h"
+
+void AMySegmentController::PlayIntroSegment()
 {
-    if (!FullSequence) { return; }
+    if (!FullSequence)
+    {
+        return;
+    }
 
     FMovieSceneSequencePlaybackSettings Settings;
     Settings.bAutoPlay       = false;
     Settings.LoopCount.Value = 0;
 
     ALevelSequenceActor* OutActor = nullptr;
-    ActivePlayer = ULevelSequencePlayer::CreateLevelSequencePlayer(
+    SegmentPlayer = ULevelSequencePlayer::CreateLevelSequencePlayer(
         this, FullSequence, Settings, OutActor);
-    ActiveSequenceActor = OutActor;
+    SegmentSequenceActor = OutActor;
 
-    if (!ActivePlayer) { return; }
+    if (!SegmentPlayer)
+    {
+        return;
+    }
 
-    // Restrict playback to frames 0–60 (at the sequence's display rate)
-    ActivePlayer->SetFrameRange(0, 60);
-
-    ActivePlayer->OnFinished.AddDynamic(this, &AMySequenceController::OnIntroFinished);
-    ActivePlayer->Play();
+    // SetFrameRange(StartFrame, Duration) — display-rate frames.
+    SegmentPlayer->SetFrameRange(0, 60);
+    SegmentPlayer->OnFinished.AddDynamic(this, &AMySegmentController::HandleIntroFinished);
+    SegmentPlayer->Play();
 }
 
-UFUNCTION()
-void AMySequenceController::OnIntroFinished()
+void AMySegmentController::HandleIntroFinished()
 {
-    if (!ActivePlayer) { return; }
+    if (!SegmentPlayer)
+    {
+        return;
+    }
 
-    // Switch to main loop segment: frames 61-120, loop indefinitely
-    ActivePlayer->OnFinished.RemoveDynamic(
-        this, &AMySequenceController::OnIntroFinished);
+    SegmentPlayer->OnFinished.RemoveDynamic(this, &AMySegmentController::HandleIntroFinished);
 
-    ActivePlayer->SetFrameRange(61, 59);   // start=61, duration=59 frames
-    ActivePlayer->PlayLooping(-1);         // -1 = infinite
+    SegmentPlayer->SetFrameRange(61, 59);   // frames 61..119
+    SegmentPlayer->PlayLooping(-1);
 }
 ```
 
 ---
 
-## Pattern 7: Sub-Sequence Snapshot Inspection
+## Pattern 7: Reading the Active Shot
 
-Read the current shot name from a master sequence containing multiple sub-sequences (shots).
+A root sequence made of sub-sequences reports which shot is playing through
+`ULevelSequencePlayer::TakeFrameSnapshot`.
 
 ```cpp
-void AMyHUD::Tick(float DeltaTime)
+// MyShotHud.cpp
+#include "MyShotHud.h"
+
+#include "DrawDebugHelpers.h"
+#include "LevelSequenceActor.h"
+#include "LevelSequencePlayer.h"
+
+void AMyShotHud::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    ULevelSequencePlayer* Player = ActiveSequenceActor
-        ? ActiveSequenceActor->GetSequencePlayer()
+    ULevelSequencePlayer* Player = WatchedSequenceActor
+        ? WatchedSequenceActor->GetSequencePlayer()
         : nullptr;
 
-    if (!Player || !Player->IsPlaying()) { return; }
+    if (!Player || !Player->IsPlaying())
+    {
+        return;
+    }
 
     FLevelSequencePlayerSnapshot Snapshot;
     Player->TakeFrameSnapshot(Snapshot);
 
-    // Snapshot fields:
-    //   RootName          -- name of the root sequence
-    //   RootTime          -- current time in root sequence (FQualifiedFrameTime)
-    //   CurrentShotName   -- name of the active sub-sequence/shot
-    //   CurrentShotLocalTime -- time within the current shot
-    //   SourceTimecode    -- timecode string
-    //   CameraComponent   -- currently active camera component (TSoftObjectPtr)
-    //   ActiveShot        -- ULevelSequence* of the current shot
-
-    FString ShotInfo = FString::Printf(
-        TEXT("Shot: %s | Root Frame: %d"),
+    const FString ShotInfo = FString::Printf(
+        TEXT("%s / %s | root frame %d"),
+        *Snapshot.RootName,
         *Snapshot.CurrentShotName,
         Snapshot.RootTime.Time.FrameNumber.Value);
 
-    DrawDebugString(GetWorld(), FVector::ZeroVector, ShotInfo, nullptr,
-                    FColor::White, 0.0f, true);
+    DrawDebugString(GetWorld(), FVector::ZeroVector, ShotInfo, nullptr, FColor::White, 0.0f, true);
 }
 ```
+
+`FLevelSequencePlayerSnapshot` (`LevelSequencePlayer.h:33`) fields: `RootName`, `RootTime`,
+`SourceTime`, `CurrentShotName`, `CurrentShotLocalTime`, `CurrentShotSourceTime`, `SourceTimecode`,
+`CameraComponent` (a `TSoftObjectPtr<UCameraComponent>`) and `ActiveShot` (a `ULevelSequence*`).
+`Player->GetActiveCameraComponent()` returns the live camera directly.
 
 ---
 
-## Pattern 8: Replicated Cutscene (Multiplayer)
+## Pattern 8: Replicated Cutscene
 
-Play a cutscene on all clients synchronized via server authority.
+The server owns playback time; clients follow. Camera cuts are still applied locally on each client.
 
 ```cpp
-// Server-side: spawn and configure the sequence actor with replication enabled
-void AMyNetworkGameMode::Server_PlayCutscene_Implementation(
-    ULevelSequence* Sequence)
+// MyNetworkCutsceneGameMode.cpp
+#include "MyNetworkCutsceneGameMode.h"
+
+#include "GameFramework/PlayerController.h"
+#include "LevelSequenceActor.h"
+#include "LevelSequencePlayer.h"
+
+void AMyNetworkCutsceneGameMode::ServerPlayCutscene(ULevelSequence* Sequence)
 {
+    if (!HasAuthority() || !Sequence)
+    {
+        return;
+    }
+
     FActorSpawnParameters SpawnParams;
     SpawnParams.Owner = this;
 
-    // Spawn the actor on the server — it will replicate to clients
-    ALevelSequenceActor* SeqActor = GetWorld()->SpawnActor<ALevelSequenceActor>(
-        ALevelSequenceActor::StaticClass(), FTransform::Identity, SpawnParams);
+    // AReplicatedLevelSequenceActor is always net-relevant, so distant clients still receive it.
+    ALevelSequenceActor* SeqActor = GetWorld()->SpawnActor<AReplicatedLevelSequenceActor>(
+        AReplicatedLevelSequenceActor::StaticClass(), FTransform::Identity, SpawnParams);
+    if (!SeqActor)
+    {
+        return;
+    }
 
-    if (!SeqActor) { return; }
-
-    // Enable replication before setting any state
-    SeqActor->SetReplicatePlayback(true);   // bReplicatePlayback
+    // Configure before the player starts. The actor copied PlaybackSettings into its player during
+    // SpawnActor (LevelSequenceActor.cpp:231), so push the edited copy; the player's PlaybackSettings
+    // replicate (MovieSceneSequencePlayer.cpp:231) and the actor replicates LevelSequenceAsset.
+    SeqActor->SetReplicatePlayback(true);
+    SeqActor->PlaybackSettings.bAutoPlay             = false;
+    SeqActor->PlaybackSettings.LoopCount.Value       = 0;
+    SeqActor->PlaybackSettings.bDisableMovementInput = true;
+    SeqActor->PlaybackSettings.bHidePlayer           = false;
+    SeqActor->GetSequencePlayer()->SetPlaybackSettings(SeqActor->PlaybackSettings);
     SeqActor->SetSequence(Sequence);
 
-    // PlaybackSettings replicated to clients
-    SeqActor->PlaybackSettings.bAutoPlay          = false;
-    SeqActor->PlaybackSettings.LoopCount.Value    = 0;
-    SeqActor->PlaybackSettings.bDisableMovementInput = true;
-    SeqActor->PlaybackSettings.bHidePlayer        = false;
+    NetworkSequenceActor = SeqActor;
 
-    ULevelSequencePlayer* Player = SeqActor->GetSequencePlayer();
-    if (Player)
+    if (ULevelSequencePlayer* Player = SeqActor->GetSequencePlayer())
     {
-        Player->OnFinished.AddDynamic(this, &AMyNetworkGameMode::OnReplicatedCutsceneFinished);
-        Player->Play();   // server starts playback; clients follow via NetSyncProps
+        Player->OnFinished.AddDynamic(
+            this, &AMyNetworkCutsceneGameMode::HandleNetworkCutsceneFinished);
+        Player->Play();   // the server broadcasts playback state to clients
     }
 }
 
-UFUNCTION()
-void AMyNetworkGameMode::OnReplicatedCutsceneFinished()
+void AMyNetworkCutsceneGameMode::HandleNetworkCutsceneFinished()
 {
-    // Notify all clients to restore input
-    Multicast_RestorePlayerInput();
+    MulticastRestoreInput();
 }
 
-UFUNCTION(NetMulticast, Reliable)
-void AMyNetworkGameMode::Multicast_RestorePlayerInput()
+void AMyNetworkCutsceneGameMode::MulticastRestoreInput_Implementation()
 {
     APlayerController* PC = GetWorld()->GetFirstPlayerController();
-    if (PC)
+    if (!PC)
     {
-        PC->SetIgnoreMoveInput(false);
-        PC->SetIgnoreLookInput(false);
-        APawn* Pawn = PC->GetPawn();
-        if (Pawn)
-        {
-            PC->SetViewTargetWithBlend(Pawn, 0.5f);
-        }
+        return;
+    }
+
+    PC->SetIgnoreMoveInput(false);
+    PC->SetIgnoreLookInput(false);
+
+    if (APawn* PlayerPawn = PC->GetPawn())
+    {
+        PC->SetViewTargetWithBlend(PlayerPawn, 0.5f, VTBlend_Cubic);
     }
 }
 ```
+
+The header declares `UFUNCTION(NetMulticast, Reliable) void MulticastRestoreInput();` and
+`UFUNCTION() void HandleNetworkCutsceneFinished();`. Replication is owned by
+`ue-networking-replication`; only the Sequencer-specific parts appear here. Internally the player
+replicates through its own reliable multicast RPCs and re-syncs clients that join late, so
+`Play()` must be called on the server, never on a client.
+
+---
+
+## Pattern 9: Runtime Render With Movie Render Graph
+
+Renders one shot from a packaged build or a `-game` session using the runtime queue subsystem.
+The editor-only `UMoviePipelineQueueSubsystem` must not appear in runtime code.
+
+```cpp
+// MyRenderDirector.cpp
+#include "MyRenderDirector.h"
+
+#include "Engine/Engine.h"
+#include "Graph/MovieGraphConfig.h"
+#include "MoviePipelineQueue.h"
+#include "MoviePipelineQueueEngineSubsystem.h"
+
+void AMyRenderDirector::RenderShot()
+{
+    UMoviePipelineQueueEngineSubsystem* RenderSubsystem =
+        GEngine->GetEngineSubsystem<UMoviePipelineQueueEngineSubsystem>();
+
+    if (!RenderSubsystem || RenderSubsystem->IsRendering() || !ShotSequence || !RenderGraphAsset)
+    {
+        return;
+    }
+
+    // Optional: a progress widget class and whether to keep rendering the player viewport.
+    RenderSubsystem->SetConfiguration({}, /*bRenderPlayerViewport=*/ false);
+
+    // AllocateJob resets the queue, so exactly one job is rendered.
+    UMoviePipelineExecutorJob* Job = RenderSubsystem->AllocateJob(ShotSequence);
+    Job->JobName = TEXT("Shot_0010");
+    Job->Map     = FSoftObjectPath(GetWorld());
+    Job->SetGraphPreset(RenderGraphAsset);
+
+    RenderSubsystem->OnRenderFinished.AddDynamic(this, &AMyRenderDirector::HandleRenderFinished);
+    RenderSubsystem->RenderJob(Job);
+}
+
+void AMyRenderDirector::HandleRenderFinished(FMoviePipelineOutputData Results)
+{
+    UE_LOG(LogMyGame, Log, TEXT("Render finished, success: %s"),
+           Results.bSuccess ? TEXT("true") : TEXT("false"));
+}
+```
+
+`AMyRenderDirector` declares `UFUNCTION() void HandleRenderFinished(FMoviePipelineOutputData Results);`
+in its header — `AddDynamic` requires it. `OnRenderFinished` is an `FMoviePipelineWorkFinished`
+dynamic multicast delegate (`MoviePipelineBase.h:9`) and only fires for the `RenderJob` convenience
+path. For a batch, build the queue yourself:
+
+```cpp
+#include "MoviePipelineInProcessExecutor.h"
+
+UMoviePipelineQueue* Queue = RenderSubsystem->GetQueue();
+UMoviePipelineExecutorJob* Job =
+    Queue->AllocateNewJob(UMoviePipelineExecutorJob::StaticClass());
+Job->SetGraphPreset(RenderGraphAsset);
+RenderSubsystem->RenderQueueWithExecutor(UMoviePipelineInProcessExecutor::StaticClass());
+```
+
+### Render layers
+
+`UMovieGraphRenderLayerSubsystem` is a `UWorldSubsystem`; the modifier functions live on
+`UMovieGraphRenderLayer`. Its header instantiates Slate row widgets, so add `"Slate"` and `"SlateCore"` to
+Build.cs or the include fails to link (`Graph/MovieGraphRenderLayerSubsystem.h:250`).
+
+```cpp
+#include "Graph/MovieGraphRenderLayerSubsystem.h"
+
+UMovieGraphRenderLayerSubsystem* LayerSubsystem =
+    UMovieGraphRenderLayerSubsystem::GetFromWorld(GetWorld());
+if (LayerSubsystem)
+{
+    LayerSubsystem->AddRenderLayer(CharacterLayer);   // UMovieGraphRenderLayer*
+    CharacterLayer->AddLayerModifier(HideEnvironmentModifier);   // UMovieGraphModifierBase*
+    LayerSubsystem->SetActiveRenderLayerByName(FName("Characters"));
+}
+```
+
+`CharacterLayer->GetLayerModifiers()` returns the current modifiers (Blueprint only from a game module:
+it is not exported from the `MinimalAPI` class, `Graph/MovieGraphRenderLayerSubsystem.h:1216`) and
+`RemoveLayerModifier(Modifier)` drops one. The pre-5.7 `AddModifier` / `GetModifiers` /
+`RemoveModifier` spellings are deprecated.
+
+### Legacy Movie Render Queue configuration
+
+Use this shape only for jobs that are not graph-configured.
+
+Requires `MovieRenderPipelineRenderPasses` in Build.cs alongside `MovieRenderPipelineCore`, plus `Imath` and
+`UEOpenExr` — `MoviePipelineEXROutput.h` includes their headers (`MoviePipelineEXROutput.h:11-18`).
+
+```cpp
+#include "MoviePipelineDeferredPasses.h"     // MovieRenderPipelineRenderPasses
+#include "MoviePipelineEXROutput.h"          // MovieRenderPipelineRenderPasses
+#include "MoviePipelineOutputSetting.h"
+#include "MoviePipelinePrimaryConfig.h"
+#include "MoviePipelineQueue.h"
+
+UMoviePipelinePrimaryConfig* Config = NewObject<UMoviePipelinePrimaryConfig>(Job);
+Job->SetConfiguration(Config);
+
+UMoviePipelineOutputSetting* Output = Cast<UMoviePipelineOutputSetting>(
+    Config->FindOrAddSettingByClass(UMoviePipelineOutputSetting::StaticClass()));
+Output->OutputDirectory.Path  = TEXT("{project_dir}/Saved/MovieRenders/");
+Output->FileNameFormat        = TEXT("{sequence_name}.{frame_number}");
+Output->OutputResolution      = FIntPoint(1920, 1080);
+Output->bUseCustomFrameRate   = true;
+Output->OutputFrameRate       = FFrameRate(24, 1);
+Output->ZeroPadFrameNumbers   = 4;
+
+// Render pass and container:
+Config->FindOrAddSettingByClass(UMoviePipelineDeferredPassBase::StaticClass());
+Config->FindOrAddSettingByClass(UMoviePipelineImageSequenceOutput_EXR::StaticClass());
+```
+
+`UMoviePipelineImageSequenceOutput_PNG`, `_JPG` and `_BMP` are the other containers, and
+`UMoviePipelineDeferredPass_Unlit`, `_LightingOnly`, `_ReflectionsOnly`, `_DetailLighting` and
+`_PathTracer` are the extra deferred passes. A job is either graph-configured or legacy-configured;
+check `Job->IsUsingGraphConfiguration()` before calling `Job->GetConfiguration()`.
 
 ---
 
 ## API Quick Reference
 
-### ULevelSequencePlayer::CreateLevelSequencePlayer
+### ULevelSequencePlayer
+
 ```
 static ULevelSequencePlayer* CreateLevelSequencePlayer(
-    UObject* WorldContextObject,
-    ULevelSequence* LevelSequence,
-    FMovieSceneSequencePlaybackSettings Settings,
-    ALevelSequenceActor*& OutActor)
+    UObject* WorldContextObject, ULevelSequence* LevelSequence,
+    FMovieSceneSequencePlaybackSettings Settings, ALevelSequenceActor*& OutActor)
+
+UCameraComponent* GetActiveCameraComponent() const
+void TakeFrameSnapshot(FLevelSequencePlayerSnapshot& OutSnapshot) const
+void EnableCinematicMode(bool bEnable)
+FOnLevelSequencePlayerCameraCutEvent OnCameraCut
 ```
 
-### FMovieSceneSequencePlaybackSettings fields
+### UMovieSceneSequencePlayer
+
 ```
-bool  bAutoPlay             -- auto-play on BeginPlay
-float PlayRate              -- 1.0 = normal, 2.0 = 2x, -1.0 = reverse
-float StartTime             -- offset in seconds from sequence start
-int32 LoopCount.Value       -- 0 = no loop, -1 = infinite, N = N loops
-bool  bDisableMovementInput -- locks player movement during play
-bool  bDisableLookAtInput   -- locks player look during play
-bool  bHidePlayer           -- hides player pawn mesh
-bool  bHideHud              -- hides HUD widgets
-bool  bDisableCameraCuts    -- prevents sequence from overriding camera
-bool  bPauseAtEnd           -- pauses (not stops) at last frame
+void Play()
+void PlayReverse()
+void PlayLooping(int32 NumLoops = -1)
+void ChangePlaybackDirection()
+void Pause()
+void Scrub()
+void Stop()
+void StopAtCurrentTime()
+void GoToEndAndStop()
+void SetPlayRate(float PlayRate)
+float GetPlayRate() const
+void SetFrameRange(int32 StartFrame, int32 Duration, float SubFrames = 0.f)
+void SetTimeRange(float StartTime, float Duration)
+void SetFrameRate(FFrameRate FrameRate)
+void SetPlaybackPosition(FMovieSceneSequencePlaybackParams PlaybackParams)
+void PlayTo(FMovieSceneSequencePlaybackParams PlaybackParams,
+            FMovieSceneSequencePlayToParams PlayToParams)
+void RestoreState()
+void SetCompletionModeOverride(EMovieSceneCompletionModeOverride CompletionModeOverride)
+void SetWeight(double InWeight)          // recommended with PlaybackSettings.bDynamicWeighting = true
+void RemoveWeight()
+void SetHideHud(bool HideHud)
+void SetDisableCameraCuts(bool bInDisableCameraCuts)
+bool IsPlaying() const
+bool IsPaused() const
+bool IsReversed() const
+FQualifiedFrameTime GetCurrentTime() const
+FQualifiedFrameTime GetDuration() const
+FQualifiedFrameTime GetStartTime() const
+FQualifiedFrameTime GetEndTime() const
+int32 GetFrameDuration() const
+FFrameRate GetFrameRate() const
+UMovieSceneSequence* GetSequence() const
+FString GetSequenceName(bool bAddClientInfo = false) const
+TArray<UObject*> GetBoundObjects(FMovieSceneObjectBindingID ObjectBinding)
+TArray<FMovieSceneObjectBindingID> GetObjectBindings(UObject* InObject)
+void RequestInvalidateBinding(FMovieSceneObjectBindingID ObjectBinding)
+```
+
+Delegates: `OnPlay`, `OnPlayReverse`, `OnStop`, `OnPause`, `OnFinished`
+(`FOnMovieSceneSequencePlayerEvent`, dynamic, no parameters) and `OnNativeFinished`
+(`FOnMovieSceneSequencePlayerNativeEvent`, native).
+
+### FMovieSceneSequencePlaybackSettings
+
+```
+uint32 bAutoPlay : 1
+FMovieSceneSequenceLoopCount LoopCount      // .Value: 0 = once, -1 = infinite
+FMovieSceneSequenceTickInterval TickInterval
+float PlayRate
+float StartTime                             // seconds offset, "Start Offset" in the UI
+uint32 bRandomStartTime : 1
+uint32 bDisableMovementInput : 1
+uint32 bDisableLookAtInput : 1
+uint32 bHidePlayer : 1
+uint32 bHideHud : 1
+uint32 bDisableCameraCuts : 1
 EMovieSceneCompletionModeOverride FinishCompletionStateOverride
+uint32 bPauseAtEnd : 1
+uint32 bInheritTickIntervalFromOwner : 1
+uint32 bDynamicWeighting : 1
 ```
 
-### ALevelSequenceActor binding methods
+`EMovieSceneCompletionModeOverride`: `None`, `ForceKeepState`, `ForceRestoreState`.
+
+### ALevelSequenceActor
+
 ```
-void SetBinding(FMovieSceneObjectBindingID, TArray<AActor*>, bAllowFromAsset)
-void SetBindingByTag(FName Tag, TArray<AActor*>, bAllowFromAsset)
-void AddBinding(FMovieSceneObjectBindingID, AActor*, bAllowFromAsset)
-void AddBindingByTag(FName Tag, AActor*, bAllowFromAsset)
-void RemoveBinding(FMovieSceneObjectBindingID, AActor*)
-void RemoveBindingByTag(FName Tag, AActor*)
-void ResetBinding(FMovieSceneObjectBindingID)
+FMovieSceneSequencePlaybackSettings PlaybackSettings
+TObjectPtr<ULevelSequence> LevelSequenceAsset
+TObjectPtr<UMovieSceneBindingOverrides> BindingOverrides
+TObjectPtr<ULevelSequenceBurnInOptions> BurnInOptions
+TObjectPtr<UObject> DefaultInstanceData
+uint8 bOverrideInstanceData : 1
+uint8 bReplicatePlayback : 1
+FLevelSequenceCameraSettings CameraSettings
+
+ULevelSequence* GetSequence() const
+void SetSequence(ULevelSequence* InSequence)
+ULevelSequencePlayer* GetSequencePlayer() const
+void SetReplicatePlayback(bool ReplicatePlayback)
+void HideBurnin()
+void ShowBurnin()
+
+void SetBinding(FMovieSceneObjectBindingID Binding, const TArray<AActor*>& Actors,
+                bool bAllowBindingsFromAsset = false)
+void SetBindingByTag(FName BindingTag, const TArray<AActor*>& Actors,
+                     bool bAllowBindingsFromAsset = false)
+void AddBinding(FMovieSceneObjectBindingID Binding, AActor* Actor,
+                bool bAllowBindingsFromAsset = false)
+void AddBindingByTag(FName BindingTag, AActor* Actor, bool bAllowBindingsFromAsset = false)
+void RemoveBinding(FMovieSceneObjectBindingID Binding, AActor* Actor)
+void RemoveBindingByTag(FName Tag, AActor* Actor)
+void ResetBinding(FMovieSceneObjectBindingID Binding)
 void ResetBindings()
 FMovieSceneObjectBindingID FindNamedBinding(FName Tag) const
 const TArray<FMovieSceneObjectBindingID>& FindNamedBindings(FName Tag) const
 ```
 
-### UMovieSceneSequencePlayer playback control
+`AReplicatedLevelSequenceActor` subclasses it and is always net-relevant.
+
+### ULevelSequenceDirector
+
 ```
-void Play()
-void PlayReverse()
-void PlayLooping(int32 NumLoops = -1)
-void Pause()
-void Stop()
-void StopAtCurrentTime()
-void GoToEndAndStop()
-void SetPlayRate(float)
-void SetFrameRange(int32 StartFrame, int32 Duration, float SubFrames = 0.f)
-void SetTimeRange(float StartTime, float Duration)
-void SetPlaybackPosition(FMovieSceneSequencePlaybackParams)
-void PlayTo(FMovieSceneSequencePlaybackParams, FMovieSceneSequencePlayToParams)
-void RestoreState()
-void SetCompletionModeOverride(EMovieSceneCompletionModeOverride)
-bool IsPlaying() const
-bool IsPaused() const
-bool IsReversed() const
-float GetPlayRate() const
+UMovieSceneSequence* GetSequence()
 FQualifiedFrameTime GetCurrentTime() const
-FQualifiedFrameTime GetDuration() const
-int32 GetFrameDuration() const
-TArray<UObject*> GetBoundObjects(FMovieSceneObjectBindingID)
+FQualifiedFrameTime GetRootSequenceTime() const
+UMovieSceneClock* GetSequenceCustomClock() const
+UMovieSceneClock* GetRootSequenceCustomClock() const
+TArray<UObject*> GetBoundObjects(FMovieSceneObjectBindingID ObjectBinding)
+UObject* GetBoundObject(FMovieSceneObjectBindingID ObjectBinding)
+TArray<AActor*> GetBoundActors(FMovieSceneObjectBindingID ObjectBinding)
+AActor* GetBoundActor(FMovieSceneObjectBindingID ObjectBinding)
+void OnCreated()                          // BlueprintImplementableEvent
+TObjectPtr<ULevelSequencePlayer> Player   // UPROPERTY(BlueprintReadOnly)
 ```
 
-### UCineCameraComponent key properties/methods
-```
-FCameraFilmbackSettings Filmback             -- SensorWidth, SensorHeight (mm)
-FCameraLensSettings     LensSettings         -- MinFocalLength, MaxFocalLength, MinFStop, MaxFStop
-FCameraFocusSettings    FocusSettings        -- FocusMethod, ManualFocusDistance (cm)
-float CurrentFocalLength                     -- current zoom (mm), Interp-animatable
-float CurrentAperture                        -- f-stop, Interp-animatable
-float CurrentFocusDistance                   -- read-only, derived from FocusSettings
+### UCineCameraComponent
 
-void SetFilmback(const FCameraFilmbackSettings&)
-void SetLensSettings(const FCameraLensSettings&)
-void SetFocusSettings(const FCameraFocusSettings&)
-void SetCurrentFocalLength(float)
-void SetCurrentAperture(float)
+```
+FCameraFilmbackSettings Filmback       // SensorWidth, SensorHeight (mm); SensorAspectRatio read-only
+FCameraLensSettings LensSettings       // MinFocalLength, MaxFocalLength, MinFStop, MaxFStop,
+                                       // MinimumFocusDistance, SqueezeFactor, DiaphragmBladeCount
+FCameraFocusSettings FocusSettings     // FocusMethod, ManualFocusDistance (cm),
+                                       // TrackingFocusSettings, bSmoothFocusChanges,
+                                       // FocusSmoothingInterpSpeed
+float CurrentFocalLength               // UPROPERTY(Interp)
+float CurrentAperture                  // UPROPERTY(Interp)
+float CurrentFocusDistance             // read-only
+float CurrentHorizontalFOV             // read-only
+
+void SetFilmback(const FCameraFilmbackSettings& NewFilmback)
+void SetLensSettings(const FCameraLensSettings& NewLensSettings)
+void SetFocusSettings(const FCameraFocusSettings& NewFocusSettings)
+void SetCropSettings(const FPlateCropSettings& NewCropSettings)
+void SetCurrentFocalLength(float InFocalLength)
+void SetCurrentAperture(const float NewCurrentAperture)
+void SetCustomNearClippingPlane(const float NewCustomNearClippingPlane)
 float GetHorizontalFieldOfView() const
 float GetVerticalFieldOfView() const
+FString GetFilmbackPresetName() const
+void SetFilmbackPresetByName(const FString& InPresetName)
+void SetLensPresetByName(const FString& InPresetName)
 ```
 
-### ULevelSequencePlayer additional delegates/events
+`ECameraFocusMethod`: `DoNotOverride`, `Manual`, `Tracking`, `Disable`.
+
+### Camera rigs
+
 ```
-FOnLevelSequencePlayerCameraCutEvent OnCameraCut   -- fires on every camera cut
-FOnMovieSceneSequencePlayerEvent     OnPlay
-FOnMovieSceneSequencePlayerEvent     OnPlayReverse
-FOnMovieSceneSequencePlayerEvent     OnStop
-FOnMovieSceneSequencePlayerEvent     OnPause
-FOnMovieSceneSequencePlayerEvent     OnFinished
-FOnMovieSceneSequencePlayerNativeEvent OnNativeFinished
+// ACameraRig_Rail
+float CurrentPositionOnRail        // 0..1, UPROPERTY(Interp)
+bool bLockOrientationToRail        // UPROPERTY(Interp)
+USplineComponent* GetRailSplineComponent()
+USceneComponent* GetDefaultAttachComponent() const
+
+// ACameraRig_Crane
+float CranePitch                   // degrees, UPROPERTY(Interp)
+float CraneYaw                     // degrees, UPROPERTY(Interp)
+float CraneArmLength               // cm, UPROPERTY(Interp)
+bool bLockMountPitch
+bool bLockMountYaw
+USceneComponent* GetDefaultAttachComponent() const
 ```

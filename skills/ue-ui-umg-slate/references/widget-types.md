@@ -1,6 +1,6 @@
 # UMG Widget Type Reference
 
-> Source: `Engine/Source/Runtime/UMG/Public/Components/`
+Target engine: **UE 5.8**. Verified against `Engine/Source/Runtime/UMG/Public/Components/` and `Engine/Source/Runtime/UMG/Public/Blueprint/`.
 
 ---
 
@@ -43,11 +43,11 @@ void SetAllowDragDrop(bool bInAllowDragDrop);
 | `DownAndUp` | Default. Click fires on mouse up after mouse down. |
 | `MouseDown` | Fires immediately on mouse down. |
 | `MouseUp` | Fires on mouse up regardless of where mouse down was. |
-| `PreciseClick` | Fires on mouse up only if cursor is still over the button. |
+| `PreciseClick` | Inside a list: fires only on a precise tap, so dragging scrolls the list instead. |
 
-### UE5.2+ Deprecation Note
+### Deprecated field access
 
-Direct property access (`WidgetStyle`, `ColorAndOpacity`, `BackgroundColor`, `ClickMethod`, `TouchMethod`, `PressMethod`, `IsFocusable`) is deprecated. Use the getter/setter methods above.
+Direct access to `WidgetStyle`, `ColorAndOpacity`, `BackgroundColor`, `ClickMethod`, `TouchMethod`, `PressMethod` and `IsFocusable` is deprecated (`UE_DEPRECATED(5.2)`, `Components/Button.h:37-67`). Use the getters and setters above; focusability is read with `GetIsFocusable()`.
 
 ### BindWidget Example
 
@@ -55,7 +55,7 @@ Direct property access (`WidgetStyle`, `ColorAndOpacity`, `BackgroundColor`, `Cl
 UPROPERTY(meta=(BindWidget))
 TObjectPtr<UButton> ConfirmButton;
 
-// In NativeConstruct:
+// In NativeConstruct (HandleConfirm is a UFUNCTION() on UMyWidget):
 ConfirmButton->OnClicked.AddDynamic(this, &UMyWidget::HandleConfirm);
 ConfirmButton->SetColorAndOpacity(FLinearColor(0.2f, 0.8f, 0.2f, 1.f));
 ```
@@ -68,7 +68,7 @@ ConfirmButton->SetColorAndOpacity(FLinearColor(0.2f, 0.8f, 0.2f, 1.f));
 **Base class:** `UTextLayoutWidget`
 **Slate backing:** `STextBlock`
 
-### Key Properties (use setters in UE5.1+)
+### Key Properties (always use the setters)
 
 | Property | Type | Description |
 |---|---|---|
@@ -123,8 +123,8 @@ ScoreLabel->SetTextTransformPolicy(ETextTransformPolicy::ToUpper);
 // Ellipsis for overflow
 ScoreLabel->SetTextOverflowPolicy(ETextOverflowPolicy::Ellipsis);
 
-// Font from content
-FSlateFontInfo FontInfo = FCoreStyle::GetDefaultFont();
+// Resize the current font (FCoreStyle::GetDefaultFont() returns a FCompositeFont ref, not an FSlateFontInfo)
+FSlateFontInfo FontInfo = ScoreLabel->GetFont();
 FontInfo.Size = 32;
 ScoreLabel->SetFont(FontInfo);
 ```
@@ -226,7 +226,7 @@ void SetBorderPadding(FVector2D InBorderPadding);
 |---|---|
 | `LeftToRight` | Default, fills left to right |
 | `RightToLeft` | Fills right to left |
-| `FillFromCenter` | Fills outward from center (vertical) |
+| `FillFromCenter` | Scales outward from the midpoint on both axes |
 | `FillFromCenterHorizontal` | Fills outward from center (horizontal) |
 | `FillFromCenterVertical` | Fills up/down from vertical center |
 | `TopToBottom` | Fills top to bottom |
@@ -245,7 +245,7 @@ HealthBar->SetFillColorAndOpacity(Health > MaxHealth * 0.3f
 LoadingBar->SetIsMarquee(true);
 
 // Experience bar filling right-to-left
-XPBar->SetBarFillType(EProgressBarFillType::LeftToRight);
+XPBar->SetBarFillType(EProgressBarFillType::RightToLeft);
 XPBar->SetPercent(XP / XPToNextLevel);
 ```
 
@@ -288,7 +288,7 @@ bool IsRefreshPending() const;
 // Selection (single-selection recommended for GetSelectedItem)
 void SetSelectedItem(const UObject* Item);
 void SetSelectedIndex(int32 Index);
-UObject* GetSelectedItem() const;               // Template: GetSelectedItem<UMyData>()
+UObject* GetSelectedItem() const;               // Template: GetSelectedItem<UMyItemData>()
 bool BP_GetSelectedItems(TArray<UObject*>& Items) const;
 int32 BP_GetNumItemsSelected() const;
 void BP_ClearSelection();
@@ -308,33 +308,79 @@ RowWidgetT* GetEntryWidgetFromItem(const UObject* Item) const; // Template
 ### IUserObjectListEntry (entry widget interface)
 
 ```cpp
-// Entry widget header:
+// MyItemEntry.h
+#pragma once
+
+#include "Blueprint/IUserObjectListEntry.h"
+#include "Blueprint/UserWidget.h"
+#include "MyItemEntry.generated.h"
+
+class UTextBlock;
+
 UCLASS()
-class UMyEntryWidget : public UUserWidget, public IUserObjectListEntry
+class MYGAME_API UMyItemEntry : public UUserWidget, public IUserObjectListEntry
 {
     GENERATED_BODY()
+
 protected:
-    // Implement this — called each time the entry is assigned a new item object
+    // Called each time the entry is assigned a new item object
     virtual void NativeOnListItemObjectSet(UObject* ListItemObject) override;
 
-    // IUserListEntry helpers (from parent interface):
-    // bool IsItemSelected() const;
-    // bool IsItemExpanded() const;  // TreeView only
+    UPROPERTY(meta=(BindWidget))
+    TObjectPtr<UTextBlock> NameText;
 };
 
-// Access the assigned item from within the entry widget:
-UMyData* Data = GetListItem<UMyData>();
+// MyItemEntry.cpp
+#include "MyItemEntry.h"
+#include "Components/TextBlock.h"
 
-// Static helpers (BlueprintCallable via UUserObjectListEntryLibrary):
-// UObject* GetListItemObject(...)
-// int32 GetListItemIndex(...)
-// bool IsFirstWidget(...)
-// bool IsLastWidget(...)
+void UMyItemEntry::NativeOnListItemObjectSet(UObject* ListItemObject)
+{
+    IUserObjectListEntry::NativeOnListItemObjectSet(ListItemObject);   // Routes the event to BP
+    if (UMyItemData* Data = Cast<UMyItemData>(ListItemObject))
+    {
+        NameText->SetText(Data->DisplayName);
+    }
+}
 ```
 
-### UTileView
+Other overridables from `IUserListEntry` (`Blueprint/IUserListEntry.h`), each expecting a Super call:
 
-Works identically to `UListView` but arranges entries in a 2D grid. Entry height is set on the `UTileView`. Uses the same `IUserObjectListEntry` interface.
+```cpp
+virtual void NativeOnItemSelectionChanged(bool bIsSelected);
+virtual void NativeOnItemExpansionChanged(bool bIsExpanded);   // TreeView only
+virtual void NativeOnEntryReleased();
+virtual bool IsListItemSelectable() const;                     // Native-only; return false for separators
+```
+
+Inside the entry widget, read the item with the template accessor `GetListItem<UMyItemData>()` and query state with the interface members `IsListItemSelected()`, `IsListItemExpanded()` and `GetOwningListView()` (`Blueprint/IUserListEntry.h:32-38`); the static libraries below are the Blueprint-facing equivalents:
+
+```cpp
+// UUserListEntryLibrary (Blueprint/IUserListEntry.h)
+bool bSelected = UUserListEntryLibrary::IsListItemSelected(this);
+bool bExpanded = UUserListEntryLibrary::IsListItemExpanded(this);
+// UUserObjectListEntryLibrary (Blueprint/IUserObjectListEntry.h)
+UObject* Item  = UUserObjectListEntryLibrary::GetListItemObject(this);
+int32 Index    = UUserObjectListEntryLibrary::GetListItemIndex(this);
+bool bFirst    = UUserObjectListEntryLibrary::IsFirstWidget(this);
+bool bLast     = UUserObjectListEntryLibrary::IsLastWidget(this);
+```
+
+### UTileView and UTreeView
+
+`UTileView` works identically to `UListView` but arranges entries in a 2D grid; tile width and height are set on the `UTileView`. `UTreeView` adds expansion state and uses `IUserObjectListEntry` too. Both share the `UListViewBase` / `ITypedUMGListView<UObject*>` API above.
+
+### C++ selection and click handling
+
+`BP_OnItemClicked`, `BP_OnItemDoubleClicked` and `BP_OnItemSelectionChanged` are Blueprint-only private delegates. From C++, subclass `UListView` and override the `ListViewBase` hooks:
+
+```cpp
+virtual void OnItemClickedInternal(UObject* Item) override;
+virtual void OnItemDoubleClickedInternal(UObject* Item) override;
+virtual void OnSelectionChangedInternal(UObject* FirstSelectedItem) override;
+```
+
+`InitHorizontalEntrySpacing` and `InitVerticalEntrySpacing` are deprecated (`UE_DEPRECATED(5.6)`, `Components/ListView.h:343,346`) — call `SetHorizontalEntrySpacing` / `SetVerticalEntrySpacing`.
 
 ---
 
@@ -347,10 +393,23 @@ Works identically to `UListView` but arranges entries in a 2D grid. Entry height
 // Programmatic scroll
 MyScrollBox->ScrollToStart();
 MyScrollBox->ScrollToEnd();
-MyScrollBox->ScrollWidgetIntoView(ChildWidget, /*bAnimateScroll=*/true);
+MyScrollBox->ScrollWidgetIntoView(ChildWidget, /*AnimateScroll=*/true);
 MyScrollBox->SetScrollOffset(200.f);
 float Offset = MyScrollBox->GetScrollOffset();
+float EndOffset = MyScrollBox->GetScrollOffsetOfEnd();
+MyScrollBox->EndInertialScrolling();
+
+// Layout and behaviour
+MyScrollBox->SetOrientation(Orient_Vertical);            // EOrientation: Orient_Horizontal, Orient_Vertical
+MyScrollBox->SetScrollBarVisibility(ESlateVisibility::Collapsed);
+MyScrollBox->SetAlwaysShowScrollbar(false);
+MyScrollBox->SetAllowOverscroll(true);
+MyScrollBox->SetAnimateWheelScrolling(true);
+MyScrollBox->SetWheelScrollMultiplier(1.5f);
+MyScrollBox->SetConsumeMouseWheel(EConsumeMouseWheel::WhenScrollingPossible);
 ```
+
+Full signature: `ScrollWidgetIntoView(UWidget* WidgetToFind, bool AnimateScroll = true, EDescendantScrollDestination ScrollDestination = EDescendantScrollDestination::IntoView, float Padding = 0)`.
 
 ---
 
@@ -406,7 +465,7 @@ MyInput->OnTextCommitted.AddDynamic(this, &UMyWidget::HandleTextCommitted);
 ## USlider
 
 ```cpp
-float Value = MySlider->GetValue();       // 0.0 – 1.0
+float Value = MySlider->GetValue();       // In [MinValue, MaxValue] (default 0 – 1)
 MySlider->SetValue(0.5f);
 MySlider->SetMinValue(0.f);
 MySlider->SetMaxValue(100.f);
@@ -485,3 +544,90 @@ bool bHasFocus = Widget->HasKeyboardFocus();
 // Slate widget access (for Slate-only APIs)
 TSharedPtr<SWidget> SlateWidget = Widget->GetCachedWidget();
 ```
+
+---
+
+## UWidgetTree
+
+`UUserWidget::WidgetTree` owns every widget built from the Widget Blueprint.
+
+```cpp
+// Iteration (Blueprint/WidgetTree.h)
+WidgetTree->ForEachWidget([](UWidget* Widget) { Widget->SetRenderOpacity(1.f); });
+WidgetTree->ForEachWidgetAndDescendants([](UWidget* Widget) { Widget->SetIsEnabled(true); });
+// ForEachWidgetUntil exists but is not UMG_API-exported (WidgetTree.h:96): LNK2019 outside UMG
+UWidgetTree::ForWidgetAndChildren(RootWidget, [](UWidget* Widget) { Widget->SetCursor(EMouseCursor::Default); });
+
+// Lookup
+UButton* Found = WidgetTree->FindWidget<UButton>(TEXT("PlayButton"));
+UWidget* ByName = WidgetTree->FindWidget(FName(TEXT("PlayButton")));
+
+TArray<UWidget*> AllWidgets;
+WidgetTree->GetAllWidgets(AllWidgets);
+
+TArray<UWidget*> Children;
+UWidgetTree::GetChildWidgets(ParentWidget, Children);
+
+int32 ChildIndex = INDEX_NONE;
+UPanelWidget* Parent = UWidgetTree::FindWidgetParent(Found, ChildIndex);
+
+// Construction and removal (ConstructWidget forwards UUserWidget subclasses to CreateWidget(this, ...), WidgetTree.h:110)
+UMyItemEntry* Entry = WidgetTree->ConstructWidget<UMyItemEntry>(EntryWidgetClass);
+WidgetTree->RemoveWidget(Entry);
+```
+
+---
+
+## UWidgetBlueprintLibrary
+
+**Header:** `Blueprint/WidgetBlueprintLibrary.h` — static helpers, each a `UFUNCTION(BlueprintCallable)` or `UFUNCTION(BlueprintPure)`.
+
+```cpp
+// Brushes
+FSlateBrush TextureBrush  = UWidgetBlueprintLibrary::MakeBrushFromTexture(MyTexture, 64, 64);
+FSlateBrush MaterialBrush = UWidgetBlueprintLibrary::MakeBrushFromMaterial(MyMaterial, 32, 32);
+FSlateBrush EmptyBrush    = UWidgetBlueprintLibrary::NoResourceBrush();
+UMaterialInstanceDynamic* BrushMID = UWidgetBlueprintLibrary::GetDynamicMaterial(MaterialBrush);
+UTexture2D* BrushTexture = UWidgetBlueprintLibrary::GetBrushResourceAsTexture2D(TextureBrush);
+
+// Event replies (FEventReply, the Blueprint-facing wrapper around FReply)
+FEventReply Reply = UWidgetBlueprintLibrary::Handled();
+Reply = UWidgetBlueprintLibrary::CaptureMouse(Reply, CapturingWidget);
+Reply = UWidgetBlueprintLibrary::SetUserFocus(Reply, FocusWidget, /*bInAllUsers=*/false);
+Reply = UWidgetBlueprintLibrary::DetectDrag(Reply, WidgetDetectingDrag, EKeys::LeftMouseButton);
+Reply = UWidgetBlueprintLibrary::EndDragDrop(Reply);
+FEventReply Unhandled = UWidgetBlueprintLibrary::Unhandled();
+
+// Drag and drop state
+bool bDragging = UWidgetBlueprintLibrary::IsDragDropping();
+UDragDropOperation* Payload = UWidgetBlueprintLibrary::GetDragDroppingContent();
+UWidgetBlueprintLibrary::CancelDragDrop();
+UWidgetBlueprintLibrary::DismissAllMenus();
+
+// Custom painting - only valid inside NativePaint / OnPaint, where Context is the FPaintContext
+UWidgetBlueprintLibrary::DrawLine(Context, FVector2D(0.f, 0.f), FVector2D(100.f, 0.f),
+    FLinearColor::White, /*bAntiAlias=*/true, /*Thickness=*/1.f);
+// DrawText (FString) is meta=DeprecatedFunction; use DrawTextFormatted (WidgetBlueprintLibrary.h:117,127)
+UWidgetBlueprintLibrary::DrawTextFormatted(Context, NSLOCTEXT("HUD", "Tag", "HUD"), FVector2D(8.f, 8.f), MyFont, 16.f);
+```
+
+Input-mode helpers also live here: `SetInputMode_UIOnlyEx`, `SetInputMode_GameAndUIEx`, `SetInputMode_GameOnly`, `SetFocusToGameViewport` — prefer the `FInputModeUIOnly` / `FInputModeGameAndUI` / `FInputModeGameOnly` structs on `APlayerController` from C++ (see `ue-input-system`).
+
+---
+
+## USlateBlueprintLibrary
+
+**Header:** `Blueprint/SlateBlueprintLibrary.h` — geometry space conversions.
+
+```cpp
+// MyGeometry is the FGeometry handed to NativePaint / NativeTick / an input handler.
+FVector2D Absolute = USlateBlueprintLibrary::LocalToAbsolute(MyGeometry, LocalPoint);
+FVector2D Local    = USlateBlueprintLibrary::AbsoluteToLocal(MyGeometry, AbsolutePoint);
+FVector2D PixelPos, ViewportPos;
+USlateBlueprintLibrary::LocalToViewport(this, MyGeometry, LocalPoint, PixelPos, ViewportPos);
+USlateBlueprintLibrary::ScreenToWidgetLocal(this, MyGeometry, ScreenPoint, Local);
+FVector2D VectorOut = USlateBlueprintLibrary::Vector_LocalToAbsolute(MyGeometry, LocalVector);
+float ScalarOut     = USlateBlueprintLibrary::Scalar_AbsoluteToLocal(MyGeometry, AbsoluteScalar);
+```
+
+`TransformScalarAbsoluteToLocal`, `TransformScalarLocalToAbsolute`, `TransformVectorAbsoluteToLocal` and `TransformVectorLocalToAbsolute` are deprecated (`UE_DEPRECATED(5.6)`, `Blueprint/SlateBlueprintLibrary.h:77-92`) — they returned inverted results, so the replacements are the opposite-direction `Scalar_*` / `Vector_*` functions.

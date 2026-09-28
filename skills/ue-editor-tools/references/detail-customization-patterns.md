@@ -1,154 +1,227 @@
 # Detail Customization Patterns
 
-Reference for common `IDetailCustomization` and `IPropertyTypeCustomization` patterns with Slate widget examples. All patterns are based on the real UE source interfaces in `Engine/Source/Editor/PropertyEditor/Public/`.
+Reference for `IDetailCustomization` and `IPropertyTypeCustomization` in UE 5.8. Every signature below is copied from `Engine/Source/Editor/PropertyEditor/Public`. Module: `PropertyEditor`.
+
+Header names to include: `IDetailCustomization.h`, `IPropertyTypeCustomization.h`, `DetailLayoutBuilder.h`, `DetailCategoryBuilder.h`, `IDetailChildrenBuilder.h`, `IDetailPropertyRow.h`, `DetailWidgetRow.h`, `PropertyHandle.h`, `PropertyCustomizationHelpers.h`, `PropertyEditorModule.h`.
 
 ---
 
-## IDetailLayoutBuilder Key Methods
+## IDetailLayoutBuilder — verbatim signatures
 
-From `DetailLayoutBuilder.h` (`IDetailLayoutBuilder`):
+From `DetailLayoutBuilder.h`:
 
 ```cpp
-// Edit or create a category
-IDetailCategoryBuilder& EditCategory(
-    FName CategoryName,
+static FSlateFontInfo GetDetailFont();
+static FSlateFontInfo GetDetailFontBold();
+static FSlateFontInfo GetDetailFontItalic();
+
+virtual const TArray<TWeakObjectPtr<UObject>>& GetSelectedObjects() const = 0;
+virtual void GetObjectsBeingCustomized(TArray<TWeakObjectPtr<UObject>>& OutObjects) const = 0;
+
+virtual IDetailCategoryBuilder& EditCategory(FName CategoryName,
     const FText& NewLocalizedDisplayName = FText::GetEmpty(),
-    ECategoryPriority::Type CategoryType = ECategoryPriority::Default);
+    ECategoryPriority::Type CategoryType = ECategoryPriority::Default) = 0;
+virtual IDetailCategoryBuilder& EditCategoryAllowNone(FName CategoryName,
+    const FText& NewLocalizedDisplayName = FText::GetEmpty(),
+    ECategoryPriority::Type CategoryType = ECategoryPriority::Default) = 0;
+virtual void HideCategory(FName CategoryName) = 0;
 
-// Hide an entire category
-void HideCategory(FName CategoryName);
+virtual IDetailPropertyRow& AddPropertyToCategory(TSharedPtr<IPropertyHandle> InPropertyHandle) = 0;
 
-// Get a property handle by member name — use GET_MEMBER_NAME_CHECKED for safety
-TSharedRef<IPropertyHandle> GetProperty(
-    const FName PropertyPath,
-    const UStruct* ClassOutermost = nullptr,
-    FName InstanceName = NAME_None) const;
+virtual TSharedRef<IPropertyHandle> GetProperty(const FName PropertyPath,
+    const UStruct* ClassOutermost = NULL, FName InstanceName = NAME_None) const = 0;
+virtual void HideProperty(const TSharedPtr<IPropertyHandle> PropertyHandle) = 0;
+virtual void HideProperty(FName PropertyPath, const UStruct* ClassOutermost = NULL,
+    FName InstanceName = NAME_None) = 0;
 
-// Hide a specific property
-void HideProperty(const TSharedPtr<IPropertyHandle> PropertyHandle);
+virtual void ForceRefreshDetails() = 0;
 
-// Get the objects currently being customized
-void GetObjectsBeingCustomized(TArray<TWeakObjectPtr<UObject>>& OutObjects) const;
+virtual void RegisterInstancedCustomPropertyTypeLayout(FName PropertyTypeName,
+    FOnGetPropertyTypeCustomizationInstance PropertyTypeLayoutDelegate,
+    TSharedPtr<IPropertyTypeIdentifier> Identifier = nullptr) = 0;
 
-// Force rebuild of the entire detail layout
-void ForceRefreshDetails();
-
-// Add a property to its auto-detected category (preserves original category)
-IDetailPropertyRow& AddPropertyToCategory(TSharedPtr<IPropertyHandle> InPropertyHandle);
+virtual TSharedPtr<IDetailsView> GetDetailsViewSharedPtr() = 0;
 ```
 
----
-
-## Category Priority Reference
-
-`ECategoryPriority` controls sort order in the details panel (lower value = higher position):
-
-| Enum Value | Sort Position |
-|---|---|
-| `Variable` | Highest (top) |
-| `Transform` | Near top |
-| `Important` | High |
-| `TypeSpecific` | Middle |
-| `Default` | Standard |
-| `Uncommon` | Bottom |
+`ECategoryPriority::Type` (same header), highest first: `Variable`, `Transform`, `Important`, `TypeSpecific`, `Default`, `Uncommon`.
 
 ```cpp
-IDetailCategoryBuilder& CoreCat =
+IDetailCategoryBuilder& CoreCategory =
     DetailBuilder.EditCategory("Core", FText::GetEmpty(), ECategoryPriority::Important);
-IDetailCategoryBuilder& AdvancedCat =
+IDetailCategoryBuilder& AdvancedCategory =
     DetailBuilder.EditCategory("Advanced", FText::GetEmpty(), ECategoryPriority::Uncommon);
 ```
 
 ---
 
-## IDetailPropertyRow — Fluent Modifier API
-
-From `IDetailPropertyRow.h`. Methods return `IDetailPropertyRow&` for chaining:
+## Full class customization
 
 ```cpp
-IDetailCategoryBuilder& Category = DetailBuilder.EditCategory("Settings");
-IDetailPropertyRow& Row = Category.AddProperty(
-    DetailBuilder.GetProperty(GET_MEMBER_NAME_CHECKED(UMyClass, MyFloat)));
+// MyDataAssetCustomization.h
+#pragma once
+#include "IDetailCustomization.h"
+#include "Templates/SharedPointer.h"
 
-Row.DisplayName(FText::FromString("Speed"))
-   .ToolTip(FText::FromString("Movement speed in cm/s"))
-   .ShowPropertyButtons(false)  // hide reset-to-default arrow
-   .EditCondition(
-       TAttribute<bool>::Create([this]() { return bIsEnabled; }),
-       FOnBooleanValueChanged::CreateLambda([this](bool bNewValue)
-       {
-           bIsEnabled = bNewValue;
-       })
-   )
-   .IsEnabled(TAttribute<bool>::Create([]() { return true; }))
-   .Visibility(TAttribute<EVisibility>::Create([]()
-   {
-       return EVisibility::Visible;
-   }));
+class FMyDataAssetCustomization : public IDetailCustomization
+{
+public:
+    static TSharedRef<IDetailCustomization> MakeInstance();
+
+    virtual void CustomizeDetails(IDetailLayoutBuilder& DetailBuilder) override;
+    virtual void CustomizeDetails(const TSharedPtr<IDetailLayoutBuilder>& DetailBuilder) override;
+
+private:
+    TWeakPtr<IDetailLayoutBuilder> WeakBuilder;
+};
+```
+
+```cpp
+// MyDataAssetCustomization.cpp
+#include "MyDataAssetCustomization.h"
+#include "MyDataAsset.h"
+#include "DetailLayoutBuilder.h"
+#include "DetailCategoryBuilder.h"
+#include "DetailWidgetRow.h"
+#include "IDetailPropertyRow.h"
+#include "PropertyHandle.h"
+#include "Widgets/Input/SButton.h"
+#include "Widgets/Text/STextBlock.h"
+#include "Widgets/SBoxPanel.h"
+
+TSharedRef<IDetailCustomization> FMyDataAssetCustomization::MakeInstance()
+{
+    return MakeShared<FMyDataAssetCustomization>();
+}
+
+void FMyDataAssetCustomization::CustomizeDetails(const TSharedPtr<IDetailLayoutBuilder>& DetailBuilder)
+{
+    WeakBuilder = DetailBuilder;
+    CustomizeDetails(*DetailBuilder);
+}
+
+void FMyDataAssetCustomization::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder)
+{
+    TArray<TWeakObjectPtr<UObject>> Objects;
+    DetailBuilder.GetObjectsBeingCustomized(Objects);
+    if (Objects.Num() != 1)
+    {
+        return;
+    }
+
+    IDetailCategoryBuilder& Category =
+        DetailBuilder.EditCategory("Tuning", FText::GetEmpty(), ECategoryPriority::Important);
+
+    TSharedRef<IPropertyHandle> SpeedHandle =
+        DetailBuilder.GetProperty(GET_MEMBER_NAME_CHECKED(UMyDataAsset, Speed));
+    IDetailPropertyRow& SpeedRow = Category.AddProperty(SpeedHandle);
+    SpeedRow.DisplayName(FText::FromString("Speed"))
+            .ToolTip(FText::FromString("Movement speed in cm/s"));
+
+    DetailBuilder.HideProperty(
+        DetailBuilder.GetProperty(GET_MEMBER_NAME_CHECKED(UMyDataAsset, InternalCache)));
+
+    // Rebuild the layout when the value changes in a way that changes which rows exist.
+    TWeakPtr<IDetailLayoutBuilder> LocalBuilder = WeakBuilder;
+    SpeedHandle->SetOnPropertyValueChanged(FSimpleDelegate::CreateLambda([LocalBuilder]()
+    {
+        if (TSharedPtr<IDetailLayoutBuilder> Pinned = LocalBuilder.Pin())
+        {
+            Pinned->ForceRefreshDetails();
+        }
+    }));
+
+    Category.AddCustomRow(FText::FromString("Reset Speed"))
+    .NameContent()
+    [
+        SNew(STextBlock)
+        .Text(FText::FromString("Reset"))
+        .Font(IDetailLayoutBuilder::GetDetailFont())
+    ]
+    .ValueContent()
+    .MinDesiredWidth(125.f)
+    .MaxDesiredWidth(400.f)
+    [
+        SNew(SButton)
+        .Text(FText::FromString("Reset Speed"))
+        .OnClicked_Lambda([SpeedHandle]()
+        {
+            SpeedHandle->SetValue(600.f);
+            return FReply::Handled();
+        })
+    ];
+}
 ```
 
 ---
 
-## Custom Widget Row Patterns
+## IDetailCategoryBuilder and IDetailChildrenBuilder
 
-### Full Custom Widget Row
+`DetailCategoryBuilder.h`:
 
 ```cpp
-Category.AddCustomRow(FText::FromString("SearchFilter"))
-[
-    SNew(SHorizontalBox)
-    + SHorizontalBox::Slot()
-    .FillWidth(1.f)
-    .VAlign(VAlign_Center)
-    [
-        SNew(STextBlock)
-        .Text(FText::FromString("Custom Label"))
-        .Font(IDetailLayoutBuilder::GetDetailFont())
-    ]
-    + SHorizontalBox::Slot()
-    .AutoWidth()
-    .Padding(FMargin(4.f, 0.f))
-    [
-        SNew(SButton)
-        .Text(FText::FromString("Action"))
-        .OnClicked(FOnClicked::CreateLambda([]()
-        {
-            return FReply::Handled();
-        }))
-    ]
-];
+virtual IDetailCategoryBuilder& InitiallyCollapsed(bool bShouldBeInitiallyCollapsed) = 0;
+virtual IDetailCategoryBuilder& HeaderContent(TSharedRef<SWidget> InHeaderContent,
+    bool bWholeRowContent = false) = 0;
+virtual void SetSortOrder(int32 InSortOrder) = 0;
+
+virtual IDetailPropertyRow& AddProperty(FName PropertyPath, UClass* ClassOutermost = nullptr,
+    FName InstanceName = NAME_None,
+    EPropertyLocation::Type Location = EPropertyLocation::Default) = 0;
+virtual IDetailPropertyRow& AddProperty(TSharedPtr<IPropertyHandle> PropertyHandle,
+    EPropertyLocation::Type Location = EPropertyLocation::Default) = 0;
+
+virtual IDetailPropertyRow* AddExternalObjects(const TArray<UObject*>& Objects,
+    EPropertyLocation::Type Location = EPropertyLocation::Default,
+    const FAddPropertyParams& Params = FAddPropertyParams()) = 0;
+virtual IDetailPropertyRow* AddExternalStructure(TSharedPtr<FStructOnScope> StructData,
+    EPropertyLocation::Type Location = EPropertyLocation::Default) = 0;
+
+virtual FDetailWidgetRow& AddCustomRow(const FText& FilterString, bool bForAdvanced = false) = 0;
+virtual void AddCustomBuilder(TSharedRef<IDetailCustomNodeBuilder> InCustomBuilder,
+    bool bForAdvanced = false) = 0;
+virtual IDetailGroup& AddGroup(FName GroupName, const FText& LocalizedDisplayName,
+    bool bForAdvanced = false, bool bStartExpanded = false) = 0;
 ```
 
-### NameContent / ValueContent Split Row
-
-The detail panel uses a two-column layout. Use `NameContent()` and `ValueContent()` to align with standard property rows:
+`IDetailChildrenBuilder.h` (what `CustomizeChildren` receives):
 
 ```cpp
-Category.AddCustomRow(FText::FromString("MyCustomProp"))
-.NameContent()
-[
-    SNew(STextBlock)
-    .Text(FText::FromString("Custom Property"))
-    .Font(IDetailLayoutBuilder::GetDetailFont())
-]
-.ValueContent()
-.MinDesiredWidth(125.f)
-.MaxDesiredWidth(400.f)
-[
-    SNew(SEditableTextBox)
-    .Text_Lambda([]() { return FText::FromString("value"); })
-    .OnTextCommitted_Lambda([](const FText& NewText, ETextCommit::Type CommitType)
-    {
-        // handle commit
-    })
-];
+virtual IDetailChildrenBuilder& AddCustomBuilder(TSharedRef<IDetailCustomNodeBuilder> InCustomBuilder) = 0;
+virtual IDetailGroup& AddGroup(FName GroupName, const FText& LocalizedDisplayName,
+    const bool bStartExpanded = false) = 0;
+virtual FDetailWidgetRow& AddCustomRow(const FText& SearchString) = 0;
+virtual IDetailPropertyRow& AddProperty(TSharedRef<IPropertyHandle> PropertyHandle) = 0;
 ```
 
-### Override Default Property Widget While Keeping Children
+Note the argument difference: `IDetailCategoryBuilder::AddProperty` takes a `TSharedPtr`, `IDetailChildrenBuilder::AddProperty` takes a `TSharedRef`.
+
+---
+
+## IDetailPropertyRow — fluent modifiers
+
+From `IDetailPropertyRow.h`; each returns `IDetailPropertyRow&`:
 
 ```cpp
-TSharedRef<IPropertyHandle> Handle =
-    DetailBuilder.GetProperty(GET_MEMBER_NAME_CHECKED(UMyClass, MyProp));
+virtual IDetailPropertyRow& DisplayName(const FText& InDisplayName) = 0;
+virtual IDetailPropertyRow& ToolTip(const FText& InToolTip) = 0;
+virtual IDetailPropertyRow& ShowPropertyButtons(bool bShowPropertyButtons) = 0;
+virtual IDetailPropertyRow& EditCondition(TAttribute<bool> EditConditionValue,
+    FOnBooleanValueChanged OnEditConditionValueChanged,
+    ECustomEditConditionMode EditConditionMode = ECustomEditConditionMode::Override) = 0;
+virtual IDetailPropertyRow& EditConditionHides(bool bEditConditionHidesValue) = 0;
+virtual IDetailPropertyRow& IsEnabled(TAttribute<bool> InIsEnabled) = 0;
+virtual IDetailPropertyRow& ShouldAutoExpand(bool bForceExpansion = true) = 0;
+virtual IDetailPropertyRow& Visibility(TAttribute<EVisibility> Visibility) = 0;
+virtual IDetailPropertyRow& OverrideResetToDefault(const FResetToDefaultOverride& ResetToDefault) = 0;
+
+virtual void GetDefaultWidgets(TSharedPtr<SWidget>& OutNameWidget,
+    TSharedPtr<SWidget>& OutValueWidget, bool bAddWidgetDecoration = false) = 0;
+virtual FDetailWidgetRow& CustomWidget(bool bShowChildren = false) = 0;
+```
+
+Wrap the engine's own widgets instead of rebuilding them:
+
+```cpp
 IDetailPropertyRow& Row = Category.AddProperty(Handle);
 TSharedPtr<SWidget> DefaultNameWidget;
 TSharedPtr<SWidget> DefaultValueWidget;
@@ -169,69 +242,88 @@ Row.CustomWidget(/*bShowChildren=*/true)
     + SHorizontalBox::Slot().AutoWidth().Padding(4.f, 0.f)
     [
         SNew(SButton)
-        .Text(FText::FromString("..."))
+        .Text(FText::FromString("Pick"))
+        .OnClicked_Lambda([]() { return FReply::Handled(); })
     ]
 ];
 ```
 
 ---
 
-## IPropertyTypeCustomization — Struct Header Patterns
+## FDetailWidgetRow
 
-From `IPropertyTypeCustomization.h`. `CustomizeHeader` sets up the collapsed/inline row; `CustomizeChildren` sets up the expanded rows.
-
-### Compact Inline Display
-
-Show all struct fields inline in the header, no expansion needed:
+From `DetailWidgetRow.h`. The content accessors return `FDetailWidgetDecl&`; the modifiers return `FDetailWidgetRow&`:
 
 ```cpp
-void FMyVectorCustomization::CustomizeHeader(
-    TSharedRef<IPropertyHandle> PropertyHandle,
-    FDetailWidgetRow& HeaderRow,
-    IPropertyTypeCustomizationUtils& CustomizationUtils)
-{
-    // Get child handles for X, Y, Z
-    TSharedPtr<IPropertyHandle> XHandle = PropertyHandle->GetChildHandle(
-        GET_MEMBER_NAME_CHECKED(FMyVector, X));
-    TSharedPtr<IPropertyHandle> YHandle = PropertyHandle->GetChildHandle(
-        GET_MEMBER_NAME_CHECKED(FMyVector, Y));
+FDetailWidgetDecl& NameContent();
+FDetailWidgetDecl& ValueContent();
+FDetailWidgetDecl& WholeRowContent();
+FDetailWidgetDecl& ExtensionContent();
+FDetailWidgetDecl& ResetToDefaultContent();
 
-    HeaderRow
-    .NameContent()
-    [
-        PropertyHandle->CreatePropertyNameWidget()
-    ]
-    .ValueContent()
-    .MinDesiredWidth(200.f)
-    [
-        SNew(SHorizontalBox)
-        + SHorizontalBox::Slot().Padding(2.f)
-        [
-            XHandle->CreatePropertyValueWidget()
-        ]
-        + SHorizontalBox::Slot().Padding(2.f)
-        [
-            YHandle->CreatePropertyValueWidget()
-        ]
-    ];
-}
-
-void FMyVectorCustomization::CustomizeChildren(
-    TSharedRef<IPropertyHandle> PropertyHandle,
-    IDetailChildrenBuilder& ChildBuilder,
-    IPropertyTypeCustomizationUtils& CustomizationUtils)
-{
-    // Leave empty to suppress expanded child rows
-}
+FDetailWidgetRow& FilterString(const FText& InFilterString);
+FDetailWidgetRow& Visibility(const TAttribute<EVisibility>& InVisibility);   // sets VisibilityAttr
+FDetailWidgetRow& IsEnabled(const TAttribute<bool>& InIsEnabled);
+FDetailWidgetRow& IsValueEnabled(const TAttribute<bool>& InIsEnabled);
+FDetailWidgetRow& operator[](TSharedRef<SWidget> InWidget);                  // whole row
 ```
 
-### Summary Text in Header, Children in Expansion
+`FDetailWidgetDecl` supports `HAlign(EHorizontalAlignment)`, `VAlign(EVerticalAlignment)`, `MinDesiredWidth(TOptional<float>)`, `MaxDesiredWidth(TOptional<float>)` and `operator[]` for the widget itself. The row's own visibility is stored in the public `TAttribute<EVisibility> VisibilityAttr` member that `Visibility()` assigns.
+
+Whole-row layout, used for banners and full-width tools:
 
 ```cpp
-void FMyRangeCustomization::CustomizeHeader(
-    TSharedRef<IPropertyHandle> PropertyHandle,
-    FDetailWidgetRow& HeaderRow,
-    IPropertyTypeCustomizationUtils& CustomizationUtils)
+Category.AddCustomRow(FText::FromString("Bake"))
+.WholeRowContent()
+[
+    SNew(SHorizontalBox)
+    + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+    [
+        SNew(STextBlock)
+        .Text(FText::FromString("Baked data is out of date"))
+        .Font(IDetailLayoutBuilder::GetDetailFontBold())
+    ]
+    + SHorizontalBox::Slot().AutoWidth().Padding(FMargin(4.f, 0.f))
+    [
+        SNew(SButton)
+        .Text(FText::FromString("Bake Now"))
+        .OnClicked_Lambda([]() { return FReply::Handled(); })
+    ]
+];
+```
+
+---
+
+## IPropertyTypeCustomization
+
+`IPropertyTypeCustomization.h` — both are pure virtual, copy them verbatim:
+
+```cpp
+virtual void CustomizeHeader(TSharedRef<IPropertyHandle> PropertyHandle,
+    FDetailWidgetRow& HeaderRow, IPropertyTypeCustomizationUtils& CustomizationUtils) = 0;
+virtual void CustomizeChildren(TSharedRef<IPropertyHandle> PropertyHandle,
+    IDetailChildrenBuilder& ChildBuilder, IPropertyTypeCustomizationUtils& CustomizationUtils) = 0;
+virtual bool ShouldInlineKey() const;   // optional
+```
+
+`CustomizeHeader` draws the collapsed row; `CustomizeChildren` draws the expanded rows. If `CustomizeHeader` adds nothing, the children are inlined where the header would have been.
+
+```cpp
+// MyRangeCustomization.cpp
+#include "MyRangeCustomization.h"
+#include "MyRange.h"
+#include "DetailWidgetRow.h"
+#include "IDetailChildrenBuilder.h"
+#include "PropertyHandle.h"
+#include "Widgets/Text/STextBlock.h"
+
+TSharedRef<IPropertyTypeCustomization> FMyRangeCustomization::MakeInstance()
+{
+    return MakeShared<FMyRangeCustomization>();
+}
+
+void FMyRangeCustomization::CustomizeHeader(TSharedRef<IPropertyHandle> PropertyHandle,
+    FDetailWidgetRow& HeaderRow, IPropertyTypeCustomizationUtils& CustomizationUtils)
 {
     TSharedPtr<IPropertyHandle> MinHandle =
         PropertyHandle->GetChildHandle(GET_MEMBER_NAME_CHECKED(FMyRange, Min));
@@ -244,152 +336,250 @@ void FMyRangeCustomization::CustomizeHeader(
         PropertyHandle->CreatePropertyNameWidget()
     ]
     .ValueContent()
+    .MinDesiredWidth(200.f)
     [
         SNew(STextBlock)
         .Text_Lambda([MinHandle, MaxHandle]()
         {
-            float MinVal = 0.f, MaxVal = 0.f;
-            MinHandle->GetValue(MinVal);
-            MaxHandle->GetValue(MaxVal);
-            return FText::Format(
-                FText::FromString("[{0} .. {1}]"),
-                FText::AsNumber(MinVal),
-                FText::AsNumber(MaxVal));
+            float MinValue = 0.f;
+            float MaxValue = 0.f;
+            MinHandle->GetValue(MinValue);
+            MaxHandle->GetValue(MaxValue);
+            return FText::Format(FText::FromString("[{0} .. {1}]"),
+                FText::AsNumber(MinValue), FText::AsNumber(MaxValue));
         })
         .Font(IPropertyTypeCustomizationUtils::GetRegularFont())
     ];
 }
 
-void FMyRangeCustomization::CustomizeChildren(
-    TSharedRef<IPropertyHandle> PropertyHandle,
-    IDetailChildrenBuilder& ChildBuilder,
-    IPropertyTypeCustomizationUtils& CustomizationUtils)
+void FMyRangeCustomization::CustomizeChildren(TSharedRef<IPropertyHandle> PropertyHandle,
+    IDetailChildrenBuilder& ChildBuilder, IPropertyTypeCustomizationUtils& CustomizationUtils)
 {
     uint32 NumChildren = 0;
     PropertyHandle->GetNumChildren(NumChildren);
-    for (uint32 i = 0; i < NumChildren; ++i)
+    for (uint32 Index = 0; Index < NumChildren; ++Index)
     {
-        ChildBuilder.AddProperty(PropertyHandle->GetChildHandle(i).ToSharedRef());
+        ChildBuilder.AddProperty(PropertyHandle->GetChildHandle(Index).ToSharedRef());
     }
 }
 ```
 
+Leave `CustomizeChildren` empty to suppress the expanded rows entirely (compact inline struct display).
+
 ---
 
-## IPropertyHandle — Reading and Writing Values
+## IPropertyHandle
 
-`IPropertyHandle` provides type-safe access to property values across one or more selected objects:
+From `PropertyHandle.h`:
 
 ```cpp
-TSharedRef<IPropertyHandle> Handle =
-    DetailBuilder.GetProperty(GET_MEMBER_NAME_CHECKED(UMyClass, Speed));
+// Typed access. Overloads exist for float, double, bool, int8/16/32/64, uint8/16/32/64,
+// FString, FText, FName, FVector, FVector2D, FVector4, FQuat, FRotator, UObject*,
+// const UObject*, FAssetData, FProperty*, const FProperty*.
+virtual FPropertyAccess::Result GetValue(float& OutValue) const = 0;
+virtual FPropertyAccess::Result SetValue(const float& InValue,
+    EPropertyValueSetFlags::Type Flags = EPropertyValueSetFlags::DefaultFlags) = 0;
 
-// Read
+virtual FPropertyAccess::Result GetValueAsDisplayString(FString& OutValue,
+    EPropertyPortFlags PortFlags = PPF_PropertyWindow) const = 0;
+virtual FPropertyAccess::Result GetValueAsFormattedText(FText& OutValue) const = 0;
+virtual FPropertyAccess::Result SetValueFromFormattedString(const FString& InValue,
+    EPropertyValueSetFlags::Type Flags = EPropertyValueSetFlags::DefaultFlags) = 0;
+
+virtual void SetOnPropertyValueChanged(const FSimpleDelegate& InOnPropertyValueChanged) = 0;
+virtual void SetOnPropertyValueChangedWithData(
+    const TDelegate<void(const FPropertyChangedEvent&)>& InOnPropertyValueChanged) = 0;
+virtual void SetOnChildPropertyValueChanged(const FSimpleDelegate& InOnChildPropertyValueChanged) = 0;
+
+virtual void NotifyPreChange() = 0;
+virtual void NotifyPostChange(EPropertyChangeType::Type ChangeType) = 0;
+
+virtual TSharedPtr<IPropertyHandle> GetChildHandle(FName ChildName, bool bRecurse = true) const = 0;
+virtual TSharedPtr<IPropertyHandle> GetChildHandle(uint32 Index) const = 0;
+virtual FPropertyAccess::Result GetNumChildren(uint32& OutNumChildren) const = 0;
+
+typedef TFunctionRef<bool(void* /*RawData*/, const int32 /*DataIndex*/, const int32 /*NumDatas*/)>
+    EnumerateRawDataFuncRef;
+virtual void EnumerateRawData(const EnumerateRawDataFuncRef& InRawDataCallback) = 0;
+
+virtual TSharedRef<SWidget> CreatePropertyNameWidget(const FText& NameOverride = FText::GetEmpty(),
+    const FText& ToolTipOverride = FText::GetEmpty()) const = 0;
+virtual TSharedRef<SWidget> CreatePropertyValueWidget(bool bDisplayDefaultPropertyButtons = true) const = 0;
+```
+
+`FPropertyAccess::Result` (declared in `PropertyEditorModule.h`) is `MultipleValues`, `Fail` or `Success`. Always branch on `MultipleValues` when multiple objects can be selected:
+
+```cpp
 float SpeedValue = 0.f;
-FPropertyAccess::Result Result = Handle->GetValue(SpeedValue);
-if (Result == FPropertyAccess::MultipleValues)
+if (Handle->GetValue(SpeedValue) == FPropertyAccess::MultipleValues)
 {
-    // multiple objects with different values selected
+    // several selected objects disagree — show a blank or "Multiple Values" widget
 }
+```
 
-// Write — automatically handles transactions and PostEditChange
-Handle->SetValue(150.f);
+`SetValue` handles the transaction and `PostEditChange` for you. `EnumerateRawData` writes each selected object's value directly, so bracket it yourself:
 
-// Get as display string
-FString DisplayStr;
-Handle->GetValueAsDisplayString(DisplayStr);
-
-// Enumerate per-object values
+```cpp
+Handle->NotifyPreChange();
 Handle->EnumerateRawData([](void* RawData, const int32 DataIndex, const int32 NumDatas) -> bool
 {
-    float* SpeedPtr = static_cast<float*>(RawData);
-    *SpeedPtr = 100.f;
-    return true;  // continue iteration
+    *static_cast<float*>(RawData) = 100.f;
+    return true;   // continue enumeration
 });
-
-// Notify post-change
 Handle->NotifyPostChange(EPropertyChangeType::ValueSet);
 ```
+
+Common `EPropertyChangeType::Type` values (`UObject/UnrealType.h`): `Unspecified`, `ArrayAdd`, `ArrayRemove`, `ArrayClear`, `ValueSet`, `Duplicate`, `Interactive`, `ArrayMove`, `ToggleEditable`, `ResetToDefault`. `Interactive` is sent while dragging a slider and is followed by a `ValueSet`.
+
+---
+
+## PropertyCustomizationHelpers
+
+From `PropertyCustomizationHelpers.h`, namespace `PropertyCustomizationHelpers`:
+
+```cpp
+TSharedRef<SWidget> MakeAddButton(FSimpleDelegate OnAddClicked,
+    TAttribute<FText> OptionalToolTipText = FText(), TAttribute<bool> IsEnabled = true);
+TSharedRef<SWidget> MakeRemoveButton(FSimpleDelegate OnRemoveClicked,
+    TAttribute<FText> OptionalToolTipText = FText(), TAttribute<bool> IsEnabled = true);
+TSharedRef<SWidget> MakeClearButton(FSimpleDelegate OnClearClicked,
+    TAttribute<FText> OptionalToolTipText = FText(), TAttribute<bool> IsEnabled = true);
+TSharedRef<SWidget> MakeInsertDeleteDuplicateButton(FExecuteAction OnInsertClicked,
+    FExecuteAction OnDeleteClicked, FExecuteAction OnDuplicateClicked);
+TSharedRef<SWidget> MakeUseSelectedButton(FSimpleDelegate OnUseSelectedClicked,
+    TAttribute<FText> OptionalToolTipText = FText(), TAttribute<bool> IsEnabled = true,
+    const bool IsActor = false);
+TSharedRef<SWidget> MakeEditConfigHierarchyButton(FSimpleDelegate OnEditConfigClicked,
+    TAttribute<FText> OptionalToolTipText = FText(), TAttribute<bool> IsEnabled = true);
+TSharedRef<SWidget> MakePropertyComboBox(const FPropertyComboBoxArgs& InArgs);
+```
+
+Widget classes in the same header: `SObjectPropertyEntryBox`, `SClassPropertyEntryBox`, `SStructPropertyEntryBox`, `SMaterialSlotWidget`.
+
+```cpp
+Category.AddCustomRow(FText::FromString("Mesh"))
+.NameContent()
+[
+    MeshHandle->CreatePropertyNameWidget()
+]
+.ValueContent()
+.MinDesiredWidth(250.f)
+[
+    SNew(SObjectPropertyEntryBox)
+    .PropertyHandle(MeshHandle)
+    .AllowedClass(UStaticMesh::StaticClass())
+    .AllowClear(true)
+    .DisplayThumbnail(true)
+    .ThumbnailPool(CustomizationUtils.GetThumbnailPool())   // in CustomizeDetails: DetailBuilder.GetThumbnailPool() (DetailLayoutBuilder.h:288)
+];
+```
+
+`SObjectPropertyEntryBox` arguments include `ObjectPath`, `PropertyHandle`, `ThumbnailPool`, `AllowedClass`, `NewAssetFactories`, `AllowClear`, `AllowCreate`, `DisplayUseSelected`, `DisplayBrowse`, `EnableContentPicker`, `DisplayCompactSize`, `DisplayThumbnail`, and the events `OnShouldSetAsset`, `OnObjectChanged`, `OnShouldFilterAsset`, `OnIsEnabled`, `OnShouldFilterActor`.
 
 ---
 
 ## Fonts
 
-Always use `IDetailLayoutBuilder` or `IPropertyTypeCustomizationUtils` static helpers for fonts to stay visually consistent with the details panel:
-
 ```cpp
-FAppStyle::GetFontStyle(TEXT("PropertyWindow.NormalFont"))   // regular body
-FAppStyle::GetFontStyle(TEXT("PropertyWindow.BoldFont"))     // bold label
-FAppStyle::GetFontStyle(TEXT("PropertyWindow.ItalicFont"))   // italic/dimmed
+IDetailLayoutBuilder::GetDetailFont()         // FAppStyle "PropertyWindow.NormalFont"
+IDetailLayoutBuilder::GetDetailFontBold()     // FAppStyle "PropertyWindow.BoldFont"
+IDetailLayoutBuilder::GetDetailFontItalic()   // FAppStyle "PropertyWindow.ItalicFont"
 
-// Shorthand statics:
-IDetailLayoutBuilder::GetDetailFont()
-IDetailLayoutBuilder::GetDetailFontBold()
-IDetailLayoutBuilder::GetDetailFontItalic()
-IPropertyTypeCustomizationUtils::GetRegularFont()
-IPropertyTypeCustomizationUtils::GetBoldFont()
+IPropertyTypeCustomizationUtils::GetRegularFont()   // FAppStyle "PropertyWindow.NormalFont"
+IPropertyTypeCustomizationUtils::GetBoldFont()      // FAppStyle "PropertyWindow.BoldFont"
 ```
+
+Use these statics rather than hand-written `FAppStyle::GetFontStyle` calls so rows stay consistent with the rest of the details panel.
 
 ---
 
-## Registration Reference
+## Registration reference
 
-All registrations go in `StartupModule`; all unregistrations in `ShutdownModule`.
+From `PropertyEditorModule.h`:
 
 ```cpp
-// In StartupModule
+virtual void RegisterCustomClassLayout(FName ClassName,
+    FOnGetDetailCustomizationInstance DetailLayoutDelegate,
+    FRegisterCustomClassLayoutParams Params = FRegisterCustomClassLayoutParams());
+virtual void UnregisterCustomClassLayout(FName ClassName);
+
+virtual void RegisterCustomPropertyTypeLayout(FName PropertyTypeName,
+    FOnGetPropertyTypeCustomizationInstance PropertyTypeLayoutDelegate,
+    TSharedPtr<IPropertyTypeIdentifier> Identifier = nullptr);
+virtual void UnregisterCustomPropertyTypeLayout(FName PropertyTypeName,
+    TSharedPtr<IPropertyTypeIdentifier> InIdentifier = nullptr);
+
+virtual void NotifyCustomizationModuleChanged();
+```
+
+```cpp
+struct FRegisterCustomClassLayoutParams
+{
+    /* Optional order to register this class layout with. Registration order is used when not
+       specified. Lower values are added first */
+    TOptional<int32> OptionalOrder;
+};
+```
+
+Delegate types (`PropertyEditorDelegates.h`):
+
+```cpp
+DECLARE_DELEGATE_RetVal(TSharedRef<IDetailCustomization>, FOnGetDetailCustomizationInstance);
+DECLARE_DELEGATE_RetVal(TSharedRef<IPropertyTypeCustomization>, FOnGetPropertyTypeCustomizationInstance);
+```
+
+Registration and the matching unregistration, with the ordering parameter set:
+
+```cpp
+// StartupModule
 FPropertyEditorModule& PropertyModule =
     FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
 
-// Class customization
+FRegisterCustomClassLayoutParams LayoutParams;
+LayoutParams.OptionalOrder = 0;   // runs before layouts registered without an order
+
 PropertyModule.RegisterCustomClassLayout(
-    UMyClass::StaticClass()->GetFName(),
-    FOnGetDetailCustomizationInstance::CreateStatic(
-        &FMyClassCustomization::MakeInstance));
+    UMyDataAsset::StaticClass()->GetFName(),
+    FOnGetDetailCustomizationInstance::CreateStatic(&FMyDataAssetCustomization::MakeInstance),
+    LayoutParams);
 
-// Struct / property type customization
 PropertyModule.RegisterCustomPropertyTypeLayout(
-    FMyStruct::StaticStruct()->GetFName(),
-    FOnGetPropertyTypeCustomizationInstance::CreateStatic(
-        &FMyStructCustomization::MakeInstance));
+    FMyRange::StaticStruct()->GetFName(),
+    FOnGetPropertyTypeCustomizationInstance::CreateStatic(&FMyRangeCustomization::MakeInstance));
 
-// Notify the editor that customizations changed
 PropertyModule.NotifyCustomizationModuleChanged();
 
-// In ShutdownModule
+// ShutdownModule
 if (FModuleManager::Get().IsModuleLoaded("PropertyEditor"))
 {
-    FPropertyEditorModule& PM =
+    FPropertyEditorModule& ShutdownModuleRef =
         FModuleManager::GetModuleChecked<FPropertyEditorModule>("PropertyEditor");
-    PM.UnregisterCustomClassLayout(UMyClass::StaticClass()->GetFName());
-    PM.UnregisterCustomPropertyTypeLayout(FMyStruct::StaticStruct()->GetFName());
+    ShutdownModuleRef.UnregisterCustomClassLayout(UMyDataAsset::StaticClass()->GetFName());
+    ShutdownModuleRef.UnregisterCustomPropertyTypeLayout(FMyRange::StaticStruct()->GetFName());
+    ShutdownModuleRef.NotifyCustomizationModuleChanged();
 }
 ```
 
----
-
-## Instanced Property Type Layout (Scoped)
-
-Register a property type customization for a specific details panel instance only, not globally. Useful when you want different presentation in different contexts:
+Register a type customization for one details panel only, from inside `CustomizeDetails`:
 
 ```cpp
-void FMyClassCustomization::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder)
+void FMyDataAssetCustomization::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder)
 {
-    // Register a type customization only within this details panel
     DetailBuilder.RegisterInstancedCustomPropertyTypeLayout(
-        FMyStruct::StaticStruct()->GetFName(),
+        FMyRange::StaticStruct()->GetFName(),
         FOnGetPropertyTypeCustomizationInstance::CreateStatic(
-            &FMyStructInContextCustomization::MakeInstance));
+            &FMyRangeInContextCustomization::MakeInstance));
 }
 ```
 
 ---
 
-## Common Patterns Checklist
+## Checklist
 
-- Use `GET_MEMBER_NAME_CHECKED(ClassName, MemberName)` — compile-time property name validation
-- Always store `TWeakPtr<IDetailLayoutBuilder>` if calling `ForceRefreshDetails()` asynchronously
-- For `SNew` lambdas that reference `DetailBuilder`, capture by `TWeakPtr` to avoid dangling references
-- Use `IDetailCategoryBuilder::AddProperty` for standard rows, `AddCustomRow` for fully custom Slate rows
-- `bShowChildren = true` in `CustomWidget()` to show child properties while overriding the parent row's display
-- Call `PropertyModule.NotifyCustomizationModuleChanged()` after registrations so any open detail panels refresh
+- Use `GET_MEMBER_NAME_CHECKED(ClassName, MemberName)` so a renamed property is a compile error.
+- Override both `CustomizeDetails` overloads and store a `TWeakPtr<IDetailLayoutBuilder>` if you ever call `ForceRefreshDetails()`.
+- Capture handles and weak pointers in Slate lambdas, never `this` or a raw `IDetailLayoutBuilder&`.
+- `AddProperty` for standard rows, `AddCustomRow` for fully custom rows, `AddCustomBuilder` for dynamic lists driven by an `IDetailCustomNodeBuilder`.
+- `CustomWidget(/*bShowChildren=*/true)` keeps child rows while replacing the parent row's widgets.
+- Call `NotifyCustomizationModuleChanged()` after registering or unregistering so open panels rebuild.
+- Bracket direct writes through `EnumerateRawData` with `NotifyPreChange()` / `NotifyPostChange(EPropertyChangeType::ValueSet)`; `SetValue` already does this.

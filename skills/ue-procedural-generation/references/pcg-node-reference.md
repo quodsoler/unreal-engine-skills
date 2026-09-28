@@ -1,381 +1,437 @@
 # PCG Node Reference
 
-PCG nodes are categorized by their `EPCGSettingsType` enum value. Each node is a `UPCGSettings` subclass paired with a `FPCGElement` (or `IPCGElement`) that performs the actual work. Nodes connect through typed pins carrying `UPCGData`-derived objects.
+Target engine: **UE 5.8**. Plugin `PCG` at `Engine/Plugins/PCG`, module `PCG`, headers under `Source/PCG/Public`.
+
+A node is a `UPCGSettings` subclass (data, pins, editor identity) paired with an `IPCGElement` (the const, thread-safe execution body). Data travels between nodes as `UPCGData` subclasses wrapped in `FPCGTaggedData`.
 
 ---
 
-## Data Flow Model
+## Data flow model
 
-```
-[Actor/Landscape/Spline Input] --> [Sampler] --> [Filter/Density] --> [Spawner] --> [Output]
-                                        |
-                                  [UPCGPointData]
-                                  TArray<FPCGPoint>
-                                  Each point has:
-                                    FTransform Transform
-                                    float      Density   (0..1)
-                                    FVector    BoundsMin
-                                    FVector    BoundsMax
-                                    FVector4   Color
-                                    int32      Seed
-                                    int64      MetadataEntry
-                                    float      Steepness
+```cpp
+// PCGData.h:195
+struct FPCGTaggedData
+{
+    FPCGDataPtrWrapper Data;       // wraps TObjectPtr<const UPCGData>
+    TSet<FString>      Tags;
+    FName              Pin = NAME_None;
+    bool               bPinlessData = false;
+    bool               bIsUsedMultipleTimes = true;
+    int32              OriginalIndex = INDEX_NONE;
+};
 ```
 
-Data flows between nodes as `FPCGTaggedData` entries in an `FPCGDataCollection`. Each entry carries:
-- `Data` — pointer to `UPCGData` subclass
-- `Pin` — `FName` matching the target pin label
-- `Tags` — `TSet<FString>` for filtering
+`FPCGDataCollection` (`PCGData.h:236`) holds `TArray<FPCGTaggedData> TaggedData` and the lookup helpers:
+
+| Call | Returns |
+|---|---|
+| `GetAllInputs()` | `const TArray<FPCGTaggedData>&`, everything |
+| `GetInputs()` | `UE_DEPRECATED(5.6)` (`PCGData.h:241`) — use `GetAllSpatialInputs()` or `GetAllInputs()` |
+| `GetInputsByPin(const FName&)` | entries whose `Pin` matches |
+| `GetSpatialInputsByPin(const FName&)` | same, filtered to `UPCGSpatialData` |
+| `GetAllSpatialInputs()` | every spatial entry |
+| `GetTaggedInputs(const FString&)` | entries carrying a tag |
+| `GetParamsByPin(const FName&)` / `GetAllParams()` | `UPCGParamData` entries |
+| `GetSettings<T>()` | the settings object carried in the collection |
+
+Add data with `AddData(const FPCGTaggedData&, const FPCGCrc&)` or by appending to `Context->OutputData.TaggedData` directly.
 
 ---
 
-## Standard Pin Labels
+## Pin labels
 
-| Label constant | String value | Usage |
+`PCGPinConstants` (`PCGCommon.h:350`, values in `Private/PCGCommon.cpp:513`):
+
+| Constant | Value |
+|---|---|
+| `PCGPinConstants::DefaultInputLabel` | `"In"` |
+| `PCGPinConstants::DefaultOutputLabel` | `"Out"` |
+| `PCGPinConstants::DefaultParamsLabel` | `"Overrides"` |
+| `PCGPinConstants::DefaultExecutionDependencyLabel` | execution-order-only pin |
+| `PCGPinConstants::DefaultInFilterLabel` / `DefaultOutFilterLabel` | filter node in/out |
+
+`FPCGPinProperties` (`PCGPin.h:52`):
+
+```cpp
+explicit FPCGPinProperties(
+    const FName& InLabel,
+    FPCGDataTypeIdentifier InAllowedTypes = FPCGDataTypeIdentifier{EPCGDataType::Any},
+    bool bInAllowMultipleConnections = true,
+    bool bAllowMultipleData = true,
+    const FText& InTooltip = FText::GetEmpty());
+```
+
+Fields: `Label`, `Usage` (`EPCGPinUsage`), `AllowedTypes` (`FPCGDataTypeIdentifier`), `bAllowMultipleData`, `PinStatus` (`EPCGPinStatus::Normal | Required | Advanced | OverrideOrUserParam`), `bInvisiblePin`. Helpers: `SetRequiredPin()`, `SetAdvancedPin()`, `SetAllowMultipleConnections(bool)`, `AllowsMultipleConnections()`.
+
+`UPCGSettings::DefaultPointInputPinProperties()` and `DefaultPointOutputPinProperties()` give the standard single `In`/`Out` point pins.
+
+---
+
+## Settings categories
+
+`EPCGSettingsType` (`PCGSettings.h:58`) — returned from `GetType()` and used to colour and group nodes:
+
+`InputOutput`, `Spatial`, `Density`, `Blueprint`, `Metadata`, `Filter`, `Sampler`, `Spawner`, `Subgraph`, `Debug`, `Generic`, `Param`, `HierarchicalGeneration`, `ControlFlow`, `PointOps`, `GraphParameters`, `Reroute`, `GPU`, `DynamicMesh`, `DataLayers`, `Resource`.
+
+---
+
+## Node catalogue
+
+Class names below are the real `UPCGSettings` subclasses; use them with `UPCGGraph::AddNodeOfType(TSubclassOf<UPCGSettings>, UPCGSettings*&)`.
+
+### Input / output
+
+| Node | Settings class | Header |
 |---|---|---|
-| `PCGPinConstants::DefaultInputLabel` | `"In"` | Default input pin |
-| `PCGPinConstants::DefaultOutputLabel` | `"Out"` | Default output pin |
-| `PCGPinConstants::DefaultParamsLabel` | `"Overrides"` | Overridable parameter input (was `"Params"` before 5.6) |
+| Get Actor Data | `UPCGDataFromActorSettings` | `Elements/PCGDataFromActor.h` |
+| Get Actor Property | `UPCGGetActorPropertySettings` | `Elements/PCGGetActorProperty.h` |
+| Data Table Row To Attribute Set | `UPCGDataTableRowToParamDataSettings` | `Elements/PCGDataTableRowToParamData.h` |
+| Get Spline Control Points | `UPCGGetSplineControlPointsSettings` | `Elements/PCGGetSplineControlPoints.h` |
 
----
+`UPCGDataFromActorSettings` key fields: `ActorSelector` (`FPCGActorSelectorSettings` from `Elements/PCGActorSelector.h`), `Mode` (`EPCGGetDataFromActorMode`), `bAlwaysRequeryActors`, `ExpectedPins`.
 
-## Node Categories and Settings Types
+### Samplers (`EPCGSettingsType::Sampler`)
 
-### InputOutput (`EPCGSettingsType::InputOutput`)
+**Surface Sampler** — `UPCGSurfaceSamplerSettings` (`Elements/PCGSurfaceSampler.h`)
+`PointsPerSquaredMeter` (default 0.1), `PointExtents` (default `FVector(50)`), `Looseness` (default 1.0), `bUnbounded`, `bApplyDensityToPoints`, `PointSteepness`, `bUseLegacyGridCreationMethod`.
 
-**Get Actor Data** (`UPCGDataFromActorSettings`)
-- Collects spatial data from actors tagged with a PCG tag.
-- Produces: `UPCGSpatialData` (volume, surface, spline depending on actor components).
-- Key fields: `ActorSelector` (tag, class, or explicit reference), `bParseActor`.
+**Spline Sampler** — `UPCGSplineSamplerSettings` (`Elements/PCGSplineSampler.h`)
+`Dimension` (`EPCGSplineSamplingDimension::OnSpline`), `Mode` (`EPCGSplineSamplingMode::Subdivision`), `Fill`, `SubdivisionsPerSegment`, `DistanceIncrement`, `NumSamples`, `NumPlanarSubdivisions`, `NumHeightSubdivisions`, `StartOffset`, `EndOffset`, `bFitToCurve`, `InteriorSampleSpacing`, `InteriorBorderSampleSpacing`, `InteriorOrientation`, `bProjectOntoSurface`, plus opt-in outputs `bComputeTangents`, `bComputeCurvature`, `bComputeAlpha`, `bComputeDistance`, `bComputeInputKey`, `bComputeSegmentIndex`, `bComputeDirectionDelta`. Seeding: `SeedingMode` (`EPCGSplineSamplingSeedingMode`), `bSeedFromLocalPosition`, `bSeedFrom2DPosition`.
 
-**Get Landscape Data** (`UPCGLandscapeData`)
-- Wraps landscape heightfield as a surface for sampling.
-- Produces: `UPCGLandscapeData`.
+**Volume Sampler** — `UPCGVolumeSamplerSettings` (`Elements/PCGVolumeSampler.h`)
+`VoxelSize`, `bUnbounded`, `PointSteepness`.
 
-**Get Spline Data** (`UPCGSplineData`)
-- Wraps `USplineComponent` as PCG spline data.
-- Can be used as a surface boundary or point source.
-- Produces: `UPCGSplineData`, `UPCGSplineInteriorSurfaceData`.
+**Create Points Grid** — `UPCGCreatePointsGridSettings` (`Elements/PCGCreatePointsGrid.h`)
+`GridExtents`, `CellSize`, `PointSteepness`, `CoordinateSpace` (`EPCGCoordinateSpace`), `PointPosition` (`EPCGPointPosition`), `bSetPointsBounds`, `bCullPointsOutsideVolume`.
 
----
+**Create Points Sphere** — `UPCGCreatePointsSphereSettings` (`Elements/PCGCreatePointsSphere.h`)
+`SphereGeneration` (`EPCGSphereGeneration::Geodesic`), `PointOrientation`, `Origin`, `Radius`, `GeodesicSubdivisions`, `Theta`/`Phi`, `LatitudinalSegments`/`LongitudinalSegments`, `SampleCount`, `PoissonDistance`, `PoissonMaxAttempts`, `Jitter`, `PointLimit`.
 
-### Sampler (`EPCGSettingsType::Sampler`)
+Also available: `UPCGTextureSamplerSettings`, `UPCGSampleTextureSettings`, `UPCGWorldRayHitSettings`-family in `Elements/PCGWorldQuery.h` and `Elements/PCGWorldRaycast.h`.
 
-**Surface Sampler** (`UPCGSurfaceSamplerSettings`)
-- Scatters points on a surface (landscape, mesh, spline-bounded area).
-- Key fields:
-  - `PointsPerSquaredMeter` — density of scatter
-  - `PointExtents` — bounding box half-size per point
-  - `Looseness` — boundary tolerance (0 = strict inside)
-  - `bApplyDensityToPoints` — use surface density to reject points
-  - `Seed` — deterministic seed for scatter
-- Produces: `UPCGPointData`
+### Filters (`EPCGSettingsType::Filter`)
 
-**Spline Sampler** (`UPCGSplineSamplerSettings`)
-- Generates points along a spline or inside a spline boundary.
-- `Mode`: `Edge` (along spline), `Interior` (inside closed spline).
-- `Dimension`: `OnSpline` (1D), `OnHorizontalSurface` (2D), `OnVolume` (3D).
-- Key fields: `NumSegments`, `SubdivisionCount`, `Fill` mode.
-- Produces: `UPCGPointData`
+| Node | Settings class | Key fields |
+|---|---|---|
+| Density Filter | `UPCGDensityFilterSettings` | `LowerBound`, `UpperBound`, `bInvertFilter`, `bNormalizeOutputDensity` |
+| Attribute Filter | `UPCGAttributeFilteringSettings` | `Operator` (`EPCGAttributeFilterOperator`), `TargetAttribute`, `bUseConstantThreshold`, `ThresholdAttribute`, `AttributeTypes` |
+| Attribute Range Filter | `UPCGAttributeFilteringRangeSettings` | `bInclusive`, min/max threshold selectors |
+| Filter By Attribute | `UPCGFilterByAttributeSettings` | attribute-name based data filtering |
+| Filter By Tag | `UPCGFilterByTagSettings` | tag-based data filtering |
+| Filter By Type | `UPCGFilterByTypeSettings` | data-type based filtering |
+| Filter By Index | `UPCGFilterByIndexSettings` / `UPCGFilterElementsByIndexSettings` | index expressions |
+| Cull Points Outside Actor Bounds | `UPCGCullPointsOutsideActorBoundsSettings` | no required configuration |
 
-**Volume Sampler** (`UPCGVolumeSamplerSettings`)
-- Samples points in 3D space within a volume.
-- Key fields: `VoxelSize`.
-- Produces: `UPCGPointData`
+Attribute filters and the Filter By Attribute/Tag/Type/Index nodes emit on `PCGPinConstants::DefaultInFilterLabel` and `DefaultOutFilterLabel` (Density Filter has a single `Out` pin, `Elements/PCGDensityFilter.h:25`); the data-filter base is `UPCGFilterDataBaseSettings` (`Elements/PCGFilterDataBase.h`).
 
-**Point Grid** (`UPCGCreatePointsGridSettings`)
-- Creates a regular grid of points.
-- Key fields: `CellSize`, `NumCells`, `Center`.
-- Produces: `UPCGPointData`
+### Density and attribute math
 
-**Point Sphere** (`UPCGCreatePointsSphereSettings`)
-- Creates points on or inside a sphere.
-- Key fields: `NumPoints`, `Radius`, `bFillSphere`.
-- Produces: `UPCGPointData`
+| Node | Settings class | Key fields |
+|---|---|---|
+| Attribute Noise | `UPCGAttributeNoiseSettings` | `InputSource`, `OutputTarget`, `Mode` (`EPCGAttributeNoiseMode`), `NoiseMin`, `NoiseMax`, `bInvertSource`, `bClampResult`, `bHasCustomSeedSource`, `CustomSeedSource` |
+| Density Remap | `UPCGDensityRemapSettings` — `UE_DEPRECATED(5.5)` (`Elements/PCGDensityRemapElement.h:11`), use Attribute Remap | `InRangeMin`, `InRangeMax`, `OutRangeMin`, `OutRangeMax`, `bExcludeValuesOutsideInputRange` |
+| Attribute Remap | `UPCGAttributeRemapSettings` | `Elements/Metadata/PCGAttributeRemap.h`; same `InRangeMin`…`OutRangeMax` fields on any attribute |
+| Blur | `UPCGBlurSettings` | `InputSource`, `OutputTarget`, `NumIterations`, `SearchDistance`, `BlurMode` (`EPCGBlurElementMode`), `bUseCustomStandardDeviation`, `CustomStandardDeviation` |
+| Spatial Noise | `UPCGSpatialNoiseSettings` | `Elements/PCGSpatialNoise.h`, type `EPCGSettingsType::Spatial` |
+| Normal To Density | `UPCGNormalToDensitySettings` | `Elements/PCGNormalToDensity.h` |
 
----
+### Spawners (`EPCGSettingsType::Spawner`)
 
-### Filter (`EPCGSettingsType::Filter`)
+**Static Mesh Spawner** — `UPCGStaticMeshSpawnerSettings` (`Elements/PCGStaticMeshSpawner.h`)
 
-**Density Filter** (`UPCGDensityFilterSettings`)
-- Removes points below a density threshold with optional random culling.
-- Key fields: `LowerBound`, `UpperBound`, `bInvertFilter`, `Seed`.
+```cpp
+TSubclassOf<UPCGMeshSelectorBase>       MeshSelectorType;
+TObjectPtr<UPCGMeshSelectorBase>        MeshSelectorParameters;
+TSubclassOf<UPCGInstanceDataPackerBase> InstanceDataPackerType;
+TObjectPtr<UPCGInstanceDataPackerBase>  InstanceDataPackerParameters;
+TArray<FPCGObjectPropertyOverrideDescription> StaticMeshComponentPropertyOverrides;
+FName OutAttributeName;
+bool  bApplyMeshBoundsToPoints;
+bool  bAllowDescriptorChanges;
+bool  bAllowMergeDifferentDataInSameInstancedComponents;
+bool  bSynchronousLoad;
+bool  bSetupCullingCells;
+TSoftObjectPtr<AActor> TargetActor;
+TArray<FName> PostProcessFunctionNames;
+```
 
-**Attribute Filter** (`UPCGAttributeFilterSettings`)
-- Filters points by metadata attribute comparison.
-- Key fields: `TargetAttribute`, `Operator` (`==`, `!=`, `<`, `>`, `<=`, `>=`), `ConstantValue` or `OtherAttributeSource`.
+Mesh selectors (`MeshSelectors/`): `UPCGMeshSelectorWeighted`, `UPCGMeshSelectorWeightedByCategory`, `UPCGMeshSelectorByAttribute`, `UPCGMeshSelectorPrimitiveData`. `UPCGMeshSelectorWeighted::MeshEntries` is a `TArray<FPCGMeshSelectorWeightedEntry>`, each holding a `FPCGSoftISMComponentDescriptor Descriptor` and an `int Weight`.
 
-**Bounds Check** (`UPCGCullPointsOutsideActorBoundsSettings`)
-- Removes points outside the owning actor's bounding box.
-- No required configuration beyond the node itself.
+Instance data packers (`InstanceDataPackers/`): `UPCGInstanceDataPackerByAttribute`, `UPCGInstanceDataPackerByRegex` — these fill the per-instance custom float channels read by materials.
 
-**Point Filter** (generic `UPCGFilterByAttributeSettings`)
-- Keeps or removes points based on arbitrary attribute predicate.
+**Spawn Actor** — `UPCGSpawnActorSettings` (`Elements/PCGSpawnActor.h`)
+`TemplateActor`, `Option` (`EPCGSpawnActorOption::CollapseActors`), `GenerationTrigger` (`EPCGSpawnActorGenerationTrigger`), `AttachOptions` (`EPCGAttachOptions`), `RootActor`, `bSpawnByAttribute` + `SpawnAttribute`, `bInheritActorTags`, `TagsToAddOnActors`, `PostSpawnFunctionNames`, `SpawnedActorPropertyOverrideDescriptions`, `bForceDisableActorParsing`.
 
----
+**Create Spline** — `UPCGCreateSplineSettings` (`Elements/PCGCreateSpline.h`)
+`Mode` (`EPCGCreateSplineMode::CreateDataOnly`), `bClosedLoop`, `bLinear`, `bApplyCustomTangents` + `ArriveTangentAttribute`/`LeaveTangentAttribute`, `bUseInterpTypeAttribute` + `InterpTypeAttribute`, `TargetActor`, `TagsToAddOnComponents`.
 
-### Density (`EPCGSettingsType::Density`)
-
-**Density Noise** (`UPCGAttributeNoiseSettings` applied to density)
-- Modulates point density using Perlin noise or other noise modes.
-- Key fields: `NoiseMode` (`Perlin`, `Value`, etc.), `Frequency`, `Seed`, `InvertSourceDensity`.
-
-**Density Remap** (`UPCGAttributeRemapSettings`)
-- Remaps a numeric attribute from one range to another.
-- Key fields: `SourceAttribute`, `InRange`, `OutRange`, `ClampOutput`.
-
-**Blur** (`UPCGBlurSettings`)
-- Blurs point attributes by averaging neighbor values.
-- Key fields: `Iterations`, `KernelSize`.
-
----
-
-### Spawner (`EPCGSettingsType::Spawner`)
-
-**Static Mesh Spawner** (`UPCGStaticMeshSpawnerSettings`)
-- Takes `UPCGPointData` and spawns `UHierarchicalInstancedStaticMeshComponent` instances.
-- Key fields:
-  - `MeshEntries` — weighted list of `FSoftObjectPath` mesh assets
-  - `bOverrideDescriptors` — override ISM component properties per mesh
-  - `InstancePackingMode` — `StaticMesh`, `Actor`, or `ISM`
-- Uses `FPCGProceduralISMComponentDescriptor` (USTRUCT) for per-mesh ISM settings.
-
-**Actor Spawner** (`UPCGSpawnActorSettings`)
-- Spawns `AActor` subclasses at point positions.
-- Key fields: `TemplateActor`, `SpawnMode` (bOverlapExisting, etc.), `PostSpawnFunction`.
-
-**Create Spline** (`UPCGCreateSplineSettings`)
-- Creates a `USplineComponent` from input point positions.
-- Key fields: `bCreateFromInputPositions`, `SplineType`.
-
----
+Related: `UPCGSpawnSplineSettings`, `UPCGSpawnSplineMeshSettings` (`Elements/PCGSpawnSpline.h`, `Elements/PCGSpawnSplineMesh.h` with `FPCGSplineMeshParams`), `UPCGSkinnedMeshSpawnerSettings`.
 
 ### Metadata (`EPCGSettingsType::Metadata`)
 
-**Create Attribute** (`UPCGCreateAttributeSettings`)
-- Adds a named metadata attribute to all points.
-- Key fields: `OutputAttributeName`, `Type` (Float, Int, Vector, etc.), `DefaultValue`.
+| Node | Settings class | Key fields |
+|---|---|---|
+| Add Attribute | `UPCGAddAttributeSettings` | `InputSource`, `OutputTarget`, `bCopyAllAttributes`, `bCopyAllDomains`, `MetadataDomainsMapping` |
+| Create Attribute Set | `UPCGCreateAttributeSetSettings` | `AttributeTypes` (`FPCGMetadataTypesConstantStruct`), `OutputTarget` |
+| Copy Attributes | `UPCGCopyAttributesSettings` | `Elements/PCGCopyAttributes.h` (the `PCGMetadataElement.h` alias `UPCGMetadataOperationSettings` is `UE_DEPRECATED(5.5)`) |
+| Attribute Cast | `UPCGAttributeCastSettings` | target type conversion |
+| Maths Op | `UPCGMetadataMathsSettings` | `Operation` (`EPCGMetadataMathsOperation`), `InputSource1..3`, `bForceRoundingOpToInt`, `bForceOpToDouble` |
+| Compare / Boolean / Bitwise | `UPCGMetadataCompareSettings`, `UPCGMetadataBooleanSettings`, `UPCGMetadataBitwiseSettings` | `Elements/Metadata/` |
+| Break / Make Transform | `UPCGMetadataBreakTransformSettings`, `UPCGMetadataMakeTransformSettings` | transform decomposition |
+| Break / Make Vector, Make Rotator | `UPCGMetadataBreakVectorSettings`, `UPCGMetadataMakeVectorSettings`, `UPCGMetadataMakeRotatorSettings` | component packing |
+| Rename / Delete / Hash attribute | `UPCGMetadataRenameSettings`, `UPCGDeleteAttributesSettings`, `UPCGHashAttributeSettings` | attribute housekeeping |
+| Partition | `UPCGMetadataPartitionSettings` | split data by attribute value |
 
-**Copy Attributes** (`UPCGCopyAttributesSettings`)
-- Copies one or more attributes from source data to output.
-- Key fields: `SourceAttributeNames`, `DestinationAttributeNames`.
+`EPCGMetadataMathsOperation` (`Elements/Metadata/PCGMetadataMathsOpElement.h:10`) — unary: `Sign`, `Frac`, `Truncate`, `Round`, `Sqrt`, `Abs`, `Floor`, `Ceil`, `OneMinus`, `Inc`, `Dec`, `Negate`; binary: `Add`, `Subtract`, `Multiply`, `Divide`, `Max`, `Min`, `Pow`, `ClampMin`, `ClampMax`, `Modulo`, `Set`; ternary: `Clamp`, `Lerp`, `MulAdd`, `AddModulo`.
 
-**Attribute Noise** (`UPCGAttributeNoiseSettings`)
-- Applies noise to any float/vector attribute.
-- Key fields: `TargetAttribute`, `NoiseMode`, `Frequency`, `Amplitude`, `Seed`.
+Attribute selection uses `FPCGAttributePropertyInputSelector` / `FPCGAttributePropertyOutputSelector` (`Metadata/PCGAttributePropertySelector.h`), which address either a native point property or a named metadata attribute.
 
-**Attribute Remap** (`UPCGAttributeRemapSettings`)
-- Remaps attribute values between ranges with optional curves.
+### Control flow (`EPCGSettingsType::ControlFlow`)
 
-**Attribute Cast** (`UPCGAttributeCastSettings`)
-- Casts attribute type (e.g., float to int, FVector to FVector2D).
+| Node | Settings class | Key fields |
+|---|---|---|
+| Branch | `UPCGBranchSettings` | `bOutputToB` |
+| Switch | `UPCGSwitchSettings` | `SelectionMode` (`EPCGControlFlowSelectionMode::Integer`), `IntegerSelection`, `IntOptions`, `StringSelection`, `StringOptions`, `EnumSelection` |
+| Boolean Select | `UPCGBooleanSelectSettings` | picks between two data inputs |
+| Quality Branch | `UPCGQualityBranchSettings` | branches on scalability level |
+| Wait | `UPCGWaitSettings` | forces ordering on upstream tasks |
+| Loop / Subgraph | `UPCGLoopSettings`, `UPCGSubgraphSettings` | `SubgraphInstance` (`UPCGGraphInstance`), `SubgraphOverride` |
 
-**Break Transform** (`UPCGMetadataBreakTransformSettings`)
-- Decomposes `FTransform` attribute into Translation, Rotation, Scale attributes.
+### Point ops (`EPCGSettingsType::PointOps`)
 
-**Make Transform** (`UPCGMetadataMakeTransformSettings`)
-- Composes Translation, Rotation, Scale attributes into `FTransform`.
+| Node | Settings class | Key fields |
+|---|---|---|
+| Copy Points | `UPCGCopyPointsSettings` | `RotationInheritance`/`ScaleInheritance`/`ColorInheritance`/`SeedInheritance` (`EPCGCopyPointsInheritanceMode`), `AttributeInheritance`, `TagInheritance`, `bCopyEachSourceOnEveryTarget`, `bMatchBasedOnAttribute` + `MatchAttribute` |
+| Combine Points | `UPCGCombinePointsSettings` | merge point datasets |
+| Collapse Points | `UPCGCollapsePointsSettings` | merge nearby points |
+| Attract | `UPCGAttractSettings` | `Mode` (`EPCGAttractMode::Closest`), `Distance`, `Weight`, `bRemoveUnattractedPoints`, `SourceAndTargetAttributeMapping`, `bOutputAttractIndex` |
+| Bounds Modifier | `UPCGBoundsModifierSettings` | `Mode` (`EPCGBoundsModifierMode::Scale`), `BoundsMin`, `BoundsMax`, `bAffectSteepness`, `Steepness` |
+| Apply Scale To Bounds | `UPCGApplyScaleToBoundsSettings` | folds point scale into bounds |
+| Transform Points | `UPCGTransformPointsSettings` | offsets, rotation and scale ranges |
+| Align Points | `UPCGAlignPointsSettings` | orient points to a direction or attribute |
+| Self Pruning | `UPCGSelfPruningSettings` | overlap-based thinning |
+| Point Neighborhood | `UPCGPointNeighborhoodSettings` | neighbour queries |
 
-**Math Operations** (`UPCGMetadataMathsOpElementSettings`)
-- Float/vector math: Add, Subtract, Multiply, Divide, Min, Max, Abs, Clamp, etc.
-- Key fields: `Operation`, `InputA`, `InputB` (attributes or constants).
+### Grammar (`Elements/Grammar/`)
 
----
+`UPCGSplineToSegmentSettings`, `UPCGSubdivideSplineSettings`, `UPCGSubdivideSegmentSettings`, `UPCGSelectGrammarSettings`, `UPCGDuplicateCrossSectionsSettings` — spline-driven modular assembly (fences, buildings, road furniture).
 
-### ControlFlow (`EPCGSettingsType::ControlFlow`)
+### Blueprint nodes (`EPCGSettingsType::Blueprint`)
 
-**Branch** (`UPCGBranchSettings`)
-- Routes data to one of two output pins based on a bool attribute or parameter.
-- Pins: `In`, `OutTrue`, `OutFalse`.
-
-**Switch** (`UPCGSwitchSettings`)
-- Routes data to N output pins based on an int or enum attribute.
-
-**Boolean Select** (`UPCGBooleanSelectSettings`)
-- Selects between two data inputs based on a bool parameter.
-
-**Wait** (`UPCGWaitSettings`)
-- Waits for upstream tasks to complete before forwarding data.
-- Used to enforce ordering in asynchronous graphs.
-
-**Quality Branch** (`UPCGQualityBranchSettings`)
-- Branches based on current scalability/quality level.
-
----
-
-### Subgraph (`EPCGSettingsType::Subgraph`)
-
-**Subgraph** (`UPCGSubgraphSettings`)
-- Executes a nested `UPCGGraph` as a subgraph node.
-- Key fields: `SubgraphGraph` (asset reference), parameter overrides via `FPCGOverrideInstancedPropertyBag`.
-- Subgraph pins match the subgraph's own input/output node pins.
-
----
-
-### PointOps (`EPCGSettingsType::PointOps`)
-
-**Copy Points** (`UPCGCopyPointsSettings`)
-- Copies points from one dataset to positions defined by another (source into target).
-- Key fields: `CopyMode` (FixedRotation, InheritRotation, etc.).
-
-**Combine Points** (`UPCGCombinePointsSettings`)
-- Merges two point datasets into one output.
-
-**Collapse** (`UPCGCollapseSettings`)
-- Merges nearby points into single representatives.
-- Key fields: `CollapseRadius`.
-
-**Attract** (`UPCGAttractSettings`)
-- Displaces points toward or away from attractor points.
-- Key fields: `Weight`, `Radius`, `FalloffType`.
-
-**Bounds Modifier** (`UPCGBoundsModifierSettings`)
-- Adjusts `BoundsMin`/`BoundsMax` per point.
-- Key fields: `BoundsMode` (Set, Add, Scale), `Bounds`.
-
-**Apply Scale to Bounds** (`UPCGApplyScaleToBoundsSettings`)
-- Applies point scale to its bounds for accurate spatial queries.
-
----
-
-### Grammar (`EPCGSettingsType::Generic` — Grammar namespace)
-
-**Spline to Segment** (`UPCGSplineToSegmentSettings`)
-- Converts a spline into discrete linear segments (points at control points).
-
-**Subdivide Spline** (`UPCGSubdivideSplineSettings`)
-- Inserts additional control points along a spline at regular intervals.
-
-**Subdivide Segment** (`UPCGSubdivideSegmentSettings`)
-- Subdivides linear segments into smaller sub-segments.
-
-**Select Grammar** (`UPCGSelectGrammarSettings`)
-- Applies L-system–style grammar rules to select/transform points.
-
-**Duplicate Cross Sections** (`UPCGDuplicateCrossSectionsSettings`)
-- Duplicates points at cross-section intervals along a spline.
-
----
-
-### Blueprint Custom Nodes (`EPCGSettingsType::Blueprint`)
-
-Derive from `UPCGBlueprintBaseElement`. Key configuration:
+Derive from `UPCGBlueprintBaseElement` (`Elements/Blueprint/PCGBlueprintBaseElement.h`); the point-processing conveniences are `UPCGBlueprintPointProcessorElement` and `UPCGBlueprintPointProcessorSimpleElement`.
 
 ```cpp
-UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "Settings|Input & Output")
-TArray<FPCGPinProperties> CustomInputPins;
-
-UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "Settings|Input & Output")
-TArray<FPCGPinProperties> CustomOutputPins;
-
-UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = Settings)
-bool bIsCacheable = false;       // false if node creates actors/components
-
-UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = Settings)
-bool bRequiresGameThread = true; // true for actor spawn, component add
-```
-
-The `Execute` function signature:
-```cpp
+// PCGBlueprintBaseElement.h:47
 UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "PCG|Execution")
 void Execute(const FPCGDataCollection& Input, FPCGDataCollection& Output);
 ```
 
----
-
-## Graph Parameter System
-
-Graph-level parameters (`FInstancedPropertyBag UserParameters` on `UPCGGraph`) allow exposing typed parameters to instances and Blueprints.
-
-```cpp
-// Read a parameter by name (typed template)
-TValueOrError<float, EPropertyBagResult> Result =
-    Graph->GetGraphParameter<float>(TEXT("SpawnRadius"));
-if (Result.HasValue())
-{
-    float Radius = Result.GetValue();
-}
-
-// Write a parameter
-Graph->SetGraphParameter<float>(TEXT("SpawnRadius"), 250.f);
-
-// For instances, overrides are tracked per-property:
-GraphInstance->UpdatePropertyOverride(Property, /*bMarkAsOverridden=*/true);
-GraphInstance->ResetPropertyToDefault(Property);
-bool bOverridden = GraphInstance->IsPropertyOverridden(Property);
-```
-
-Parameter change events (`EPCGGraphParameterEvent`):
-`GraphChanged`, `GraphPostLoad`, `Added`, `RemovedUnused`, `RemovedUsed`, `PropertyMoved`, `PropertyRenamed`, `PropertyTypeModified`, `ValueModifiedLocally`, `ValueModifiedByParent`, `MultiplePropertiesAdded`, `UndoRedo`, `CategoryChanged`.
-
----
-
-## PCGComponent Generation Modes
-
-From `EPCGComponentGenerationTrigger`:
-
-| Value | Behavior |
+| Member | Purpose |
 |---|---|
-| `GenerateOnLoad` | Generates once when component registers (BeginPlay or editor load) |
-| `GenerateOnDemand` | Only generates when `Generate()` or `GenerateLocal()` called explicitly |
-| `GenerateAtRuntime` | Managed by `UPCGSubsystem` runtime scheduler; budget-limited per frame |
-
-Input source (`EPCGComponentInput`):
-- `Actor` — uses the owning actor's bounds and components
-- `Landscape` — uses the landscape as the primary spatial input
-- `Other` — custom `UPCGData` provided programmatically
-
-Dirty flags (`EPCGComponentDirtyFlag`): `Actor`, `Landscape`, `Input`, `Data`, `All`.
-Call `NotifyPropertiesChangedFromBlueprint()` to mark dirty and trigger conditional regeneration.
+| `bIsCacheable` (default `false`) | set `true` only when output depends purely on inputs and seed |
+| `bComputeFullDataCrc` (default `false`) | deep CRC so downstream nodes can still hit the cache |
+| `bRequiresGameThread` (default `true`) | set `false` when the node touches no components or actors |
+| `CustomInputPins` / `CustomOutputPins` | extra `FPCGPinProperties` |
+| `bHasDefaultInPin` | keep or drop the standard `In` pin |
+| `GetContextHandle()` | `FPCGBlueprintContextHandle` for the seed helpers |
+| `GetSeedWithContext(Handle)` / `GetRandomStreamWithContext(Handle)` | deterministic per-node randomness |
+| `NodeTitleOverride()`, `NodeColorOverride()`, `NodeTypeOverride()`, `IsCacheableOverride()`, `DynamicPinTypesOverride()` | BlueprintNativeEvent customisation hooks |
 
 ---
 
-## Hierarchical Generation (HiGen)
+## Element execution contract
 
-Enable on `UPCGGraph`:
 ```cpp
-bool bUseHierarchicalGeneration = true;
-EPCGHiGenGrid HiGenGridSize = EPCGHiGenGrid::Grid256; // default grid cell size
-uint32 HiGenExponential = 0; // shifts grid sizes up by this exponent
-bool bUse2DGrid = true;      // 2D grid (XY plane) vs 3D volumetric
+// PCGElement.h
+virtual FPCGContext* Initialize(const FPCGInitializeElementParams& InParams);   // :145
+virtual bool CanExecuteOnlyOnMainThread(FPCGContext* Context) const;            // :151
+virtual bool IsCacheable(const UPCGSettings* InSettings) const;                 // :157
+virtual bool PrepareDataInternal(FPCGContext* Context) const;                   // :214
+virtual bool ExecuteInternal(FPCGContext* Context) const = 0;                   // :216
+virtual void PostExecuteInternal(FPCGContext* Context) const;                   // :220
+virtual void AbortInternal(FPCGContext* Context) const;                         // :222
+virtual bool IsPassthrough(const UPCGSettings* InSettings) const;               // :227
+virtual EPCGElementExecutionLoopMode ExecutionLoopMode(const UPCGSettings* Settings) const; // :233
+virtual FPCGContext* CreateContext();                                           // :242
+virtual bool SupportsGPUResidentData(FPCGContext* InContext) const;             // :245
+virtual bool SupportsBasePointDataInputs(FPCGContext* InContext) const;         // :248
 ```
 
-Grid sizes available: `Grid16`, `Grid32`, `Grid64`, `Grid128`, `Grid256`, `Grid512`, `Grid1024`, `Grid2048`, `GridUnbounded`.
+`FPCGInitializeElementParams` (`PCGElement.h:106`) carries `const FPCGDataCollection* InputData`, `TWeakInterfacePtr<IPCGGraphExecutionSource> ExecutionSource`, `const UPCGNode* Node`.
 
-Nodes run at the minimum of all incoming data grid sizes. Use `Get Grid Size` nodes to force execution at a specific resolution.
+`EPCGElementExecutionLoopMode` (`PCGElement.h:73`): `NotALoop`, `SinglePrimaryPin`, `MatchingPrimaryPins`, `PrimaryPinAndBroadcastablePins`.
 
----
+`ExecuteInternal` returning `false` means "not finished" — PCG will call it again next frame. Use that with `FPCGContext::ShouldStop()` for time-sliced work, or use `FPCGAsync::AsyncProcessingRangeEx` / `AsyncProcessingOneToOneRangeEx` (`Helpers/PCGAsync.h`).
 
-## ISM Descriptor (PCG Spawner)
-
-`FPCGProceduralISMComponentDescriptor` (USTRUCT from `Components/PCGProceduralISMComponentDescriptor.h`) controls per-mesh ISM properties when spawned by the Static Mesh Spawner node:
-
-Key settings mirrored from `UInstancedStaticMeshComponent`:
-- `StaticMesh` — mesh asset
-- `OverrideMaterials` — material slots
-- `InstanceStartCullDistance` / `InstanceEndCullDistance`
-- `InstanceLODDistanceScale`
-- `bUseGpuLodSelection`
-- `NumCustomDataFloats` — per-instance float channels
-- Collision preset, body instance settings
+For an element that needs extra per-execution state, derive a struct from `FPCGContext` and inherit from `IPCGElementWithCustomContext<FMyContext>` (`PCGElement.h:265`).
 
 ---
 
-## Compute (GPU) Nodes
+## Point data API
 
-PCG supports GPU-accelerated nodes via `UPCGComputeKernel` (UE 5.4+). These nodes implement `EPCGSettingsType::GPU` and execute HLSL kernels on the GPU point buffer. Useful for mass transforms, noise sampling, or attribute operations at millions of points.
+`UPCGBasePointData` (`Data/PCGBasePointData.h:62`) is abstract. `UPCGPointArrayData` stores properties as parallel arrays; `UPCGPointData` stores `TArray<FPCGPoint>`.
 
-Key classes: `UPCGComputeKernel`, `UPCGComputeSource`, `FPCGDataBinding`, `FPCGDataDescription`.
+```cpp
+int32 GetNumPoints() const;
+void  SetNumPoints(int32 InNumPoints, bool bInitializeValues = true);
+void  AllocateProperties(EPCGPointNativeProperties Properties);
+void  FreeProperties(EPCGPointNativeProperties Properties);
+EPCGPointNativeProperties GetAllocatedProperties(bool bWithInheritance = true) const;
+void  CopyUnallocatedPropertiesFrom(const UPCGBasePointData* InPointData);
+void  CopyPropertiesTo(UPCGBasePointData* To, int32 ReadStartIndex, int32 WriteStartIndex,
+                       int32 Count, EPCGPointNativeProperties Properties) const;
+void  MoveRange(int32 RangeStartIndex, int32 MoveToIndex, int32 NumElements);
+void  SetExtents(const FVector& InExtents);
+const PCGPointOctree::FPointOctree& GetPointOctree() const;
+```
 
-GPU nodes are identified by returning `EPCGSettingsType::GPU` from `GetType()` (override in your settings class) and must reference a `UPCGComputeKernel`-derived kernel asset with matching data binding descriptors.
+Value ranges (`Utils/PCGValueRange.h`, wrappers at `Data/PCGBasePointData.h:658,696`):
+
+```cpp
+FConstPCGPointValueRanges Read(InputPoints);
+// TransformRange, DensityRange, SteepnessRange, BoundsMinRange, BoundsMaxRange,
+// ColorRange, SeedRange, MetadataEntryRange
+FPCGPointValueRanges Write(OutputPoints, /*bAllocate=*/true);
+Write.SetFromValueRanges(WriteIndex, Read, ReadIndex);
+Write.SetFromPoint(WriteIndex, SomePoint);   // interop with FPCGPoint
+FPCGPoint Point = Read.GetPoint(ReadIndex);  // interop the other way
+```
+
+`FPCGPoint` (`PCGPoint.h`) remains the per-point value type: `Transform`, `Density`, `BoundsMin`, `BoundsMax`, `Color`, `Steepness`, `Seed`, `MetadataEntry`.
+
+Creating output data inside an element:
+
+```cpp
+UPCGBasePointData* Out = FPCGContext::NewPointData_AnyThread(Context);
+Out->InitializeFromDataWithParams(FPCGInitializeFromDataParams(In));
+```
+
+`FPCGInitializeFromDataParams` (`Data/PCGSpatialData.h:34`) exposes `bInheritSpatialData`, metadata inheritance and attribute-filtering switches — set `bInheritSpatialData = false` when the output point count differs from the input.
 
 ---
 
-## Determinism Checklist
+## Metadata and attributes
 
-For reproducible procedural results:
-1. Set a fixed `Seed` on the `UPCGComponent` (or use actor position as seed input).
-2. Use `GetSeedWithContext` in custom Blueprint nodes rather than `FMath::Rand`.
-3. Ensure custom nodes set `bIsCacheable = true` when outputs depend only on inputs + seed.
-4. For multiplayer: use `Generate(bForce)` (NetMulticast) not `GenerateLocal`.
-5. Sort input point arrays before processing — order from `GetActorPCGData` is not guaranteed to be stable across platforms.
+`UPCGMetadata` (`Metadata/PCGMetadata.h`):
+
+```cpp
+template<typename T>
+FPCGMetadataAttribute<T>* CreateAttribute(FPCGAttributeIdentifier AttributeName, const T& DefaultValue,
+                                          bool bAllowsInterpolation, bool bOverrideParent);
+template<typename T>
+FPCGMetadataAttribute<T>* FindOrCreateAttribute(FPCGAttributeIdentifier AttributeName, const T& DefaultValue = T{},
+                                                bool bAllowsInterpolation = true, bool bOverrideParent = true,
+                                                bool bOverwriteIfTypeMismatch = true);
+FPCGMetadataAttributeBase*       GetMutableAttribute(FPCGAttributeIdentifier AttributeName);
+const FPCGMetadataAttributeBase* GetConstAttribute(FPCGAttributeIdentifier AttributeName) const;
+bool  HasAttribute(FPCGAttributeIdentifier AttributeName) const;
+void  DeleteAttribute(FPCGAttributeIdentifier AttributeName);
+int64 AddEntry(int64 ParentEntryKey = -1);
+int64 AddEntryPlaceholder();
+```
+
+`AddEntryPlaceholder()` plus a single batched commit is the multithreaded-safe way to add entries; `AddEntry` reorders indices and must not run concurrently.
+
+Generic reading and writing goes through accessors (`Metadata/Accessors/PCGAttributeAccessorHelpers.h`):
+
+```cpp
+TUniquePtr<const IPCGAttributeAccessor> Accessor =
+    PCGAttributeAccessorHelpers::CreateConstAccessor(Data, Selector);
+TUniquePtr<const IPCGAttributeAccessorKeys> Keys =
+    PCGAttributeAccessorHelpers::CreateConstKeys(Data, Selector);
+```
+
+`CreateAccessorWithAttributeCreation(const FPCGCreateAccessorWithAttributeCreationParams&)` creates the attribute on demand when writing.
+
+`UPCGParamData` (`PCGParamData.h`) is the attribute-set data type; its default metadata domain is `PCGMetadataDomainID::Elements`, and `FindOrAddMetadataKey(FName)` maps a name to an entry key.
+
+---
+
+## Graph parameters
+
+`UPCGGraph::UserParameters` is an `FInstancedPropertyBag`. Read and write through `UPCGGraphInterface`:
+
+```cpp
+template<typename T> TValueOrError<T, EPropertyBagResult> GetGraphParameter(const FName PropertyName) const;
+template<typename T> EPropertyBagResult SetGraphParameter(const FName PropertyName, const T& Value);
+EPropertyBagResult SetGraphParameter(const FName PropertyName, const uint64 Value, const UEnum* Enum);
+bool UpdateSetGraphParameter(const FName PropertyName, TFunctionRef<bool(FPropertyBagSetRef&)> Callback);
+```
+
+Per-instance overrides on `UPCGGraphInstance` use `FPCGOverrideInstancedPropertyBag` (`PCGGraph.h:82`):
+
+```cpp
+bool UpdatePropertyOverride(const FProperty* InProperty, bool bMarkAsOverridden, const FInstancedPropertyBag* ParentUserParameters);
+bool ResetPropertyToDefault(const FProperty* InProperty, const FInstancedPropertyBag* ParentUserParameters);
+bool IsPropertyOverridden(const FProperty* InProperty) const;
+```
+
+`EPCGGraphParameterEvent` (`PCGGraph.h:39`): `GraphChanged`, `GraphPostLoad`, `Added`, `RemovedUnused`, `RemovedUsed`, `PropertyMoved`, `PropertyRenamed`, `PropertyTypeModified`, `ValueModifiedLocally`, `ValueModifiedByParent`, `MultiplePropertiesAdded`, `UndoRedo`, `CategoryChanged`, `MetadataModified`, `None`.
+
+Node-level overrides come in on the `Overrides` pin: mark a `UPROPERTY` with `meta = (PCG_Overridable)` and PCG wires it automatically.
+
+---
+
+## Component generation
+
+`EPCGComponentGenerationTrigger` (`PCGComponent.h:77`):
+
+| Value | Behaviour |
+|---|---|
+| `GenerateOnLoad` | generates when the component is loaded into the level |
+| `GenerateOnDemand` | generates only when requested (`Generate` / `GenerateLocal`) |
+| `GenerateAtRuntime` | generates when the Runtime Generation Scheduler says so |
+
+`EPCGComponentInput` (`PCGComponent.h:67`): `Actor`, `Landscape`, `Other`.
+`EPCGComponentDirtyFlag` (`PCGComponent.h:85`, bitflags): `None`, `Actor`, `Landscape`, `Input`, `Data`, `All`.
+
+Runtime generation extras on `UPCGComponent`: `SetSchedulingPolicyClass(TSubclassOf<UPCGSchedulingPolicyBase>)`, `GetGenerationRadii()`, `GetGenerationRadiusFromGrid(uint32)`, `GetCleanupRadiusFromGrid(uint32)`, `UseActorComponentlessGeneration()`, `AreProceduralInstancesInUse()`.
+
+Managed output: `AddToManagedResources(UPCGManagedResource*)`, `AddComponentsToManagedResources(const TArray<UActorComponent*>&)`, `AddActorsToManagedResources(const TArray<AActor*>&)`, and `ClearPCGLink(UClass* TemplateActor)` to hand generated content to a standalone actor.
+
+---
+
+## Hierarchical generation
+
+On `UPCGGraph`:
+
+```cpp
+bool           bUseHierarchicalGeneration = false;
+EPCGHiGenGrid  HiGenGridSize = EPCGHiGenGrid::Grid256;
+double         HiGenGridSizeMultiplier = 1.0;
+bool           bUse2DGrid = true;
+```
+
+`EPCGHiGenGrid` (`PCGCommon.h:520`) values: `Grid4`, `Grid8`, `Grid16`, `Grid32`, `Grid64`, `Grid128`, `Grid256`, `Grid512`, `Grid1024`, `Grid2048` (the editor display name is the grid size in centimetres, i.e. the enum value × 100), plus `Uninitialized`, `Unbounded` and larger hidden grids. `UPCGHiGenGridSizeSettings` (`Elements/PCGHiGenGridSize.h`) forces a subtree to execute at a chosen resolution; a node runs at the smallest grid among its inputs.
+
+Grid descriptors are `FPCGGridDescriptor` (`Grid/PCGGridDescriptor.h`); partition actors live in `Grid/PCGPartitionActor.h`.
+
+---
+
+## GPU nodes (`EPCGSettingsType::GPU`)
+
+`UPCGSettings` exposes `bExecuteOnGPU` with `ShouldExecuteOnGPU()` and `SetExecuteOnGPU(bool)`; a settings class opts into the checkbox by overriding `DisplayExecuteOnGPUSetting()`.
+
+```cpp
+// PCGSettings.h:656 (the overload without InNode at :653 is UE_DEPRECATED(5.8))
+virtual void CreateKernels(FPCGGPUCompilationContext& InOutContext, UObject* InObjectOuter,
+                           const UPCGNode* InNode, TArray<UPCGComputeKernel*>& OutKernels,
+                           TArray<FPCGKernelEdge>& OutEdges) const;
+```
+
+Kernel classes derive from `UPCGComputeKernel` (`Compute/PCGComputeKernel.h:101`) and implement `ComputeThreadCount(const UPCGDataBinding*)`, `ComputeOutputBindingDataDesc(...)`, `IsKernelDataValid(const UPCGDataBinding*, FPCGContext*)` and `GetKernelAttributeKeys(TArray<FPCGKernelAttributeKey>&)`. Shader text is supplied by `UPCGComputeSource` (`Compute/PCGComputeSource.h`).
+
+The runtime data plumbing is `UPCGDataBinding` (`Compute/PCGDataBinding.h:78`) and `FPCGDataCollectionDesc` (`Compute/PCGDataDescription.h:249`), with GPU pin descriptions in `Compute/PCGPinPropertiesGPU.h`. Shipped GPU kernels include `UPCGStaticMeshSpawnerKernel`, `UPCGCopyPointsKernel` and `UPCGMetadataPartitionKernel`.
+
+`UPCGDownloadFromGPUSettings` (`Elements/PCGDownloadFromGPU.h`) reads GPU-resident data back to the CPU; an element that can consume GPU-resident data directly overrides `IPCGElement::SupportsGPUResidentData`.
+
+---
+
+## Determinism checklist
+
+1. Set `UPCGComponent::Seed` explicitly; the default is `42` and every node derives from it plus its own settings seed.
+2. Inside an element, take randomness from `FPCGContext::GetSeed()` or from the per-point seed (`ReadRanges.SeedRange[Index]`), never from `FMath::Rand`.
+3. In Blueprint nodes use `GetRandomStreamWithContext(GetContextHandle())`.
+4. `IsCacheable` may only return `true` when output depends solely on inputs plus seed — otherwise the cache will serve stale artifacts.
+5. Sort gathered inputs before consuming them; actor-gathering order is not guaranteed stable across runs or platforms.
+6. Replicate the seed and use `Generate(bool bForce)` for multiplayer; `GenerateLocal` is not a network function.

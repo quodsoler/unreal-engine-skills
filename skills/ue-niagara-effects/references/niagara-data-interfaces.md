@@ -1,13 +1,18 @@
 # Niagara Data Interfaces — Built-In Reference
 
-Data interfaces (DIs) extend Niagara scripts with external data sources that cannot be represented
-as simple scalar/vector parameters. Each DI is a `UObject` subclass derived from
-`UNiagaraDataInterface` (`NiagaraDataInterface.h`) or, for the base type, from
-`UNiagaraDataInterfaceBase` (`NiagaraCore/NiagaraDataInterfaceBase.h`).
+Data interfaces (DIs) extend Niagara scripts with external data sources that cannot be expressed as
+scalar or vector parameters. They derive from `UNiagaraDataInterface`
+(`Classes/NiagaraDataInterface.h`), which itself derives from `UNiagaraDataInterfaceBase` in the
+`NiagaraCore` module.
 
-DIs appear in the Niagara editor as `User.*` parameters of DI type and are bound at runtime from
-C++ using `UNiagaraFunctionLibrary` helpers or `SetVariableObject`. All DI classes listed here are
-found under `Engine/Plugins/FX/Niagara/Source/Niagara/`.
+DIs surface in the Niagara editor as `User.*` parameters of DI type and are bound at runtime with
+`UNiagaraFunctionLibrary` helpers or `SetVariableObject`. All paths below are relative to
+`Engine/Plugins/FX/Niagara/Source/Niagara/`.
+
+**Include reachability**: `Public/` and `Classes/` headers are includable from game modules.
+`Internal/` and `Private/` headers are not — you can still bind those DIs through
+`UNiagaraFunctionLibrary` and `SetVariableObject`, but you cannot include the class or cast to it
+from a game module.
 
 ---
 
@@ -15,393 +20,259 @@ found under `Engine/Plugins/FX/Niagara/Source/Niagara/`.
 
 ### UNiagaraDataInterfaceSkeletalMesh
 **Header**: `Classes/NiagaraDataInterfaceSkeletalMesh.h`
-**Module**: `Niagara`
 **Sim target**: CPU + GPU (partial)
 
-Samples positions, normals, UV coordinates, and bone transforms from a live
-`USkeletalMeshComponent`. The mesh is skinned at the moment of sampling — particles can follow
-bones or spawn from surface regions.
+Samples positions, normals, UVs and bone transforms from a live `USkeletalMeshComponent`, skinned at
+the moment of sampling.
 
-**Runtime binding from C++**:
 ```cpp
-// Preferred: bind by component reference.
+#include "NiagaraFunctionLibrary.h"
+
+// Bind by component. The name argument is const FString&.
 UNiagaraFunctionLibrary::OverrideSystemUserVariableSkeletalMeshComponent(
-    NiagaraComp, TEXT("User.SourceMesh"), SkeletalMeshComp
-);
+    NiagaraComp, TEXT("User.SourceMesh"), SkeletalMeshComp);
 
-// Restrict to specific bones (destructive modification of DI instance data).
+// Destructive filters — they modify the DI instance data.
 UNiagaraFunctionLibrary::SetSkeletalMeshDataInterfaceFilteredBones(
-    NiagaraComp, TEXT("User.SourceMesh"), { FName("spine_01"), FName("head") }
-);
+    NiagaraComp, TEXT("User.SourceMesh"), { FName("spine_01"), FName("head") });
 
-// Restrict to sampling regions defined in the SkeletalMesh asset's LOD settings.
 UNiagaraFunctionLibrary::SetSkeletalMeshDataInterfaceSamplingRegions(
-    NiagaraComp, TEXT("User.SourceMesh"), { FName("UpperBody") }
-);
+    NiagaraComp, TEXT("User.SourceMesh"), { FName("UpperBody") });
 
-// Restrict to named sockets only.
 UNiagaraFunctionLibrary::SetSkeletalMeshDataInterfaceFilteredSockets(
-    NiagaraComp, TEXT("User.SourceMesh"), { FName("foot_l_socket") }
-);
+    NiagaraComp, TEXT("User.SourceMesh"), { FName("foot_l_socket") });
 
-// Direct access for advanced mutation.
+// Typed access, or the dedicated getter.
 UNiagaraDataInterfaceSkeletalMesh* SkelDI =
-    UNiagaraFunctionLibrary::GetDataInterface<UNiagaraDataInterfaceSkeletalMesh>(
-        NiagaraComp, FName("User.SourceMesh")
-    );
+    UNiagaraFunctionLibrary::GetSkeletalMeshDataInterface(NiagaraComp, TEXT("User.SourceMesh"));
 ```
 
-**Key properties** (set in Niagara editor or via direct DI mutation):
-- `SourceMode` — `Default`, `Source`, `AttachParent`, `DefaultMesh`, `MeshParameterBinding`
-- `SoftSourceActor` — soft actor reference; the DI resolves its `USkeletalMeshComponent`
-- `FilteredBones`, `FilteredSockets`, `SamplingRegions` — sampling restrictions
-- `bRequireCurrentFrameData` — whether to wait for skinning to complete this frame
+**Key properties**:
+- `SourceMode` (`ENDISkeletalMesh_SourceMode`): `Default`, `Source`, `AttachParent`, `DefaultMeshOnly`, `ChildrenOnly`
+- `SoftSourceActor` — `TSoftObjectPtr<AActor>`; the DI resolves its skeletal mesh component
+- `FilteredBones`, `FilteredSockets`, `SamplingRegions` — `TArray<FName>` sampling restrictions
+- `bRequireCurrentFrameData` — wait for this frame's skinning before sampling (default true)
 
 **Notes**:
-- Requires `bAllowCPUAccess` on the `USkeletalMesh` asset for CPU sampling.
-- Pre-skinned vertex positions (`bUsesPreSkinnedVerts`) require `bCacheSampledData` on the
-  mesh's LOD settings.
-- Not all functions work on GPU sim; check Niagara editor warnings.
+- CPU sampling needs `bAllowCPUAccess` on the skeletal mesh asset.
+- Pre-skinned vertex sampling is driven by `bUsesPreSkinnedVerts` on the DI's usage flags; it forces
+  the bone matrices to be gathered.
+- Not every function has a GPU implementation; the editor reports the unsupported ones.
 
 ---
 
 ### UNiagaraDataInterfaceStaticMesh
-**Header**: `Internal/DataInterface/NiagaraDataInterfaceStaticMesh.h`
-**Module**: `Niagara`
+**Header**: `Internal/DataInterface/NiagaraDataInterfaceStaticMesh.h` (module-internal)
 **Sim target**: CPU + GPU (partial)
 
-Samples vertex positions, normals, UV coordinates, and socket transforms from a static mesh.
-Supports per-section filtering and instanced static mesh instance selection.
+Samples vertices, triangles, UVs and sockets from a static mesh, with section filtering and
+instanced-static-mesh instance selection.
 
-**Runtime binding from C++**:
 ```cpp
-// Bind by component.
 UNiagaraFunctionLibrary::OverrideSystemUserVariableStaticMeshComponent(
-    NiagaraComp, TEXT("User.ScatterMesh"), StaticMeshComp
-);
+    NiagaraComp, TEXT("User.ScatterMesh"), StaticMeshComp);
 
-// Bind by raw asset.
 UNiagaraFunctionLibrary::OverrideSystemUserVariableStaticMesh(
-    NiagaraComp, TEXT("User.ScatterMesh"), MyStaticMesh
-);
-
-// Set which ISM instance to read from.
-UNiagaraDataInterfaceStaticMesh::SetNiagaraStaticMeshDIInstanceIndex(
-    NiagaraComp, FName("User.ScatterMesh"), InstanceIndex
-);
+    NiagaraComp, TEXT("User.ScatterMesh"), ScatterMesh);
 ```
 
-**Key properties**:
-- `SourceMode` — `ENDIStaticMesh_SourceMode::Default/Source/AttachParent/DefaultMeshOnly/MeshParameterBinding`
-- `DefaultMesh` — fallback `UStaticMesh*` used when no runtime override is bound
-- `SectionFilter.AllowedMaterialSlots` — restricts triangle sampling to specific material slots
-- `LODIndex` — which LOD to sample; negative index counts back from highest LOD
-- `bCaptureTransformsPerFrame` — update mesh-to-world transform each tick (default true)
-- `bAllowSamplingFromStreamingLODs` — allows sampling from streaming LODs
+`UNiagaraDataInterfaceStaticMesh::SetNiagaraStaticMeshDIInstanceIndex(UNiagaraComponent*, const FName UserParameterName, int32 NewInstanceIndex)`
+selects which ISM instance to read from. It is `NIAGARA_API`, but its header is under `Internal/`,
+so from a game module it is only reachable through Blueprint.
 
-**Notes**:
-- Requires `bAllowCPUAccess` on the static mesh asset for CPU sampling.
-- Set `bAllowSamplingFromStreamingLODs=false` on mobile to avoid streaming stalls.
+**Key properties**:
+- `SourceMode` (`ENDIStaticMesh_SourceMode`): `Default`, `Source`, `AttachParent`, `DefaultMeshOnly`, `MeshParameterBinding`
+- `DefaultMesh` — fallback `UStaticMesh*`
+- `SectionFilter.AllowedMaterialSlots` — `TArray<int32>` restricting triangle sampling
+- `LODIndex` (default 0) and `LODIndexUserParameter`
+- `bCaptureTransformsPerFrame` (default true), `bAllowSamplingFromStreamingLODs` (default false)
+
+CPU sampling needs `bAllowCPUAccess` on the static mesh asset.
 
 ---
 
 ## Curve DIs
 
-All curve DIs derive from `UNiagaraDataInterfaceCurveBase` and provide a `SampleCurve(time)` function
-to Niagara scripts. Internally they build a LUT (look-up table) at load time for GPU sampling.
+All curve DIs derive from `UNiagaraDataInterfaceCurveBase` and bake a LUT; with `bUseLUT` (default
+true, `Private/NiagaraDataInterfaceCurveBase.cpp:154`) both CPU and GPU sample the LUT, so runtime key
+edits have no effect in cooked builds unless `bUseLUT` is off.
 
 ### UNiagaraDataInterfaceCurve
-**Header**: `Classes/NiagaraDataInterfaceCurve.h`
-**Niagara type**: "Curve for Floats"
-**Output**: `float`
+**Header**: `Classes/NiagaraDataInterfaceCurve.h` — output `float`
 
 ```cpp
-// Mutate keys at runtime (rebuilds LUT).
 UNiagaraDataInterfaceCurve* CurveDI =
     UNiagaraFunctionLibrary::GetDataInterface<UNiagaraDataInterfaceCurve>(
-        NiagaraComp, FName("User.SpeedCurve")
-    );
+        NiagaraComp, FName("User.SpeedCurve"));
+
 if (CurveDI)
 {
     CurveDI->Curve.Reset();
-    CurveDI->Curve.AddKey(0.f, 0.f);
-    CurveDI->Curve.AddKey(0.5f, 1.f);
-    CurveDI->Curve.AddKey(1.f, 0.f);
-    // UNiagaraDataInterface derives from UObject, not UActorComponent —
-    // MarkRenderStateDirty() does not exist on this hierarchy.
-    // UpdateLUT() rebuilds the GPU look-up table (WITH_EDITORONLY_DATA only).
+    CurveDI->Curve.AddKey(0.0f, 0.0f);
+    CurveDI->Curve.AddKey(0.5f, 1.0f);
+    CurveDI->Curve.AddKey(1.0f, 0.0f);
+    // UpdateLUT() rebuilds the look-up table and is editor-only data.
+    // MarkRenderStateDirty() does not exist here: UNiagaraDataInterface is a UObject.
 #if WITH_EDITORONLY_DATA
     CurveDI->UpdateLUT();
 #endif
 }
 ```
 
-### UNiagaraDataInterfaceVectorCurve
-**Header**: `Classes/NiagaraDataInterfaceVectorCurve.h`
-**Niagara type**: "Curve for Vectors"
-**Output**: `FVector` (XYZ channels via three `FRichCurve`)
-
-```cpp
-UNiagaraDataInterfaceVectorCurve* VecCurveDI =
-    UNiagaraFunctionLibrary::GetDataInterface<UNiagaraDataInterfaceVectorCurve>(
-        NiagaraComp, FName("User.VelocityCurve")
-    );
-// Properties: XCurve, YCurve, ZCurve (each FRichCurve).
-```
-
-### UNiagaraDataInterfaceColorCurve
-**Header**: `Classes/NiagaraDataInterfaceColorCurve.h`
-**Niagara type**: "Curve for Colors"
-**Output**: `FLinearColor` (RGBA channels via four `FRichCurve`)
-
-### UNiagaraDataInterfaceVector2DCurve
-**Header**: `Classes/NiagaraDataInterfaceVector2DCurve.h`
-**Niagara type**: "Curve for Vector 2Ds"
-**Output**: `FVector2D`
-
-### UNiagaraDataInterfaceVector4Curve
-**Header**: `Classes/NiagaraDataInterfaceVector4Curve.h`
-**Niagara type**: "Curve for Vector 4s"
-**Output**: `FVector4`
+- `UNiagaraDataInterfaceVectorCurve` — `Classes/NiagaraDataInterfaceVectorCurve.h`, `XCurve`/`YCurve`/`ZCurve`
+- `UNiagaraDataInterfaceColorCurve` — `Classes/NiagaraDataInterfaceColorCurve.h`, RGBA rich curves
+- `UNiagaraDataInterfaceVector2DCurve` — `Classes/NiagaraDataInterfaceVector2DCurve.h`
+- `UNiagaraDataInterfaceVector4Curve` — `Classes/NiagaraDataInterfaceVector4Curve.h`
 
 ---
 
 ## Array DIs
 
-Array DIs hold a `TArray` of typed data that Niagara scripts index into at runtime. They are the
-primary mechanism for pushing per-frame C++ arrays into GPU/CPU simulations.
-
-All array DIs derive from `UNiagaraDataInterfaceArray` (`Classes/NiagaraDataInterfaceArray.h`).
+Array DIs hold a typed `TArray` that scripts index into — the primary channel for per-frame C++ data.
+Base class `UNiagaraDataInterfaceArray` (`Classes/NiagaraDataInterfaceArray.h`).
 
 | DI Class | Element Type | Header |
 |---|---|---|
 | `UNiagaraDataInterfaceArrayFloat` | `float` | `Classes/NiagaraDataInterfaceArrayFloat.h` |
-| `UNiagaraDataInterfaceArrayFloat2` | `FVector2f` (internal) / `FVector2D` (API) | same |
-| `UNiagaraDataInterfaceArrayFloat3` | `FVector3f` (internal) / `FVector` (API) | same |
-| `UNiagaraDataInterfaceArrayFloat4` | `FVector4f` (internal) / `FVector4` (API) | same |
+| `UNiagaraDataInterfaceArrayFloat2` | `FVector2f` internal / `FVector2D` API | same |
+| `UNiagaraDataInterfaceArrayFloat3` | `FVector3f` internal / `FVector` API | same |
+| `UNiagaraDataInterfaceArrayFloat4` | `FVector4f` internal / `FVector4` API | same |
 | `UNiagaraDataInterfaceArrayPosition` | `FNiagaraPosition` | same |
 | `UNiagaraDataInterfaceArrayColor` | `FLinearColor` | same |
-| `UNiagaraDataInterfaceArrayQuat` | `FQuat4f` (internal) / `FQuat` (API) | same |
-| `UNiagaraDataInterfaceArrayMatrix` | `FMatrix44f` (internal) / `FMatrix` (API) | same |
+| `UNiagaraDataInterfaceArrayQuat` | `FQuat4f` internal / `FQuat` API | same |
+| `UNiagaraDataInterfaceArrayMatrix` | `FMatrix44f` internal / `FMatrix` API | same |
 | `UNiagaraDataInterfaceArrayInt32` | `int32` | `Classes/NiagaraDataInterfaceArrayInt.h` |
 
-**Runtime population from C++** (see also `niagara-parameter-types.md` for full method list):
 ```cpp
 #include "NiagaraDataInterfaceArrayFunctionLibrary.h"
 
 TArray<FVector> PositionArray = BuildPositions();
 UNiagaraDataInterfaceArrayFunctionLibrary::SetNiagaraArrayVector(
-    NiagaraComp, FName("User.SpawnPositions"), PositionArray
-);
+    NiagaraComp, FName("User.SpawnPositions"), PositionArray);
 ```
 
-**Direct property access** (avoids function library overhead for large arrays):
+Do not write the DI's `UPROPERTY` array (`FloatData` etc.) directly at runtime: scripts read the
+DI proxy, which only `SetArrayData` updates — that is what the library does
+(`Private/NiagaraDataInterfaceArrayFunctionLibrary.cpp:38`). For large arrays use the
+non-UFUNCTION `TConstArrayView` overloads, which skip the `TArray` copy and LWC conversion:
+
 ```cpp
-UNiagaraDataInterfaceArrayFloat* FloatArrayDI =
-    UNiagaraFunctionLibrary::GetDataInterface<UNiagaraDataInterfaceArrayFloat>(
-        NiagaraComp, FName("User.HeatData")
-    );
-if (FloatArrayDI)
-{
-    FloatArrayDI->FloatData = MoveTemp(NewFloatData);
-    // UNiagaraDataInterface derives from UObject, not UActorComponent —
-    // MarkRenderStateDirty() does not exist on this hierarchy.
-    // The engine re-uploads array data automatically on the next simulation tick.
-}
+TArray<FVector3f> Positions = BuildPositionsFloat();
+UNiagaraDataInterfaceArrayFunctionLibrary::SetNiagaraArrayVector(
+    NiagaraComp, FName("User.SpawnPositions"), TConstArrayView<FVector3f>(Positions));
 ```
+
+The LWC variants keep a public LWC array plus a float mirror: Float2/3/4 use `FloatData` /
+`InternalFloatData`, Quat uses `QuatData` / `InternalQuatData`, Matrix uses `MatrixData` /
+`InternalMatrixData` (`Classes/NiagaraDataInterfaceArrayFloat.h`).
 
 ---
 
-## Texture DIs
+## Texture and Render Target DIs
 
-### UNiagaraDataInterfaceTexture
-**Header**: `Classes/NiagaraDataInterfaceTexture.h`
-**Sim target**: CPU + GPU
-
-Samples from a `UTexture2D` or `UTextureRenderTarget2D`. Provides `SampleTexture2D(UV)`.
-
-```cpp
-UNiagaraFunctionLibrary::SetTextureObject(NiagaraComp, TEXT("User.FlowTexture"), MyTexture2D);
-// or via SetVariableTexture:
-NiagaraComp->SetVariableTexture(FName("User.FlowTexture"), MyTexture);
-```
-
-### UNiagaraDataInterface2DArrayTexture
-**Header**: `Classes/NiagaraDataInterface2DArrayTexture.h`
-**Sim target**: GPU only
-
-Samples from a `UTexture2DArray`.
+| DI Class | Header | Sim target |
+|---|---|---|
+| `UNiagaraDataInterfaceTexture` | `Classes/NiagaraDataInterfaceTexture.h` | GPU |
+| `UNiagaraDataInterface2DArrayTexture` | `Classes/NiagaraDataInterface2DArrayTexture.h` | GPU |
+| `UNiagaraDataInterfaceVolumeTexture` | `Classes/NiagaraDataInterfaceVolumeTexture.h` | GPU |
+| `UNiagaraDataInterfaceCubeTexture` | `Classes/NiagaraDataInterfaceCubeTexture.h` | GPU |
+| `UNiagaraDataInterfaceRenderTarget2D` | `Classes/NiagaraDataInterfaceRenderTarget2D.h` | GPU read/write |
+| `UNiagaraDataInterfaceRenderTarget2DArray` | `Classes/NiagaraDataInterfaceRenderTarget2DArray.h` | GPU read/write |
 
 ```cpp
-UNiagaraFunctionLibrary::SetTexture2DArrayObject(NiagaraComp, TEXT("User.TexArray"), MyTexArray);
+UNiagaraFunctionLibrary::SetTextureObject(NiagaraComp, TEXT("User.FlowTexture"), FlowTexture);
+UNiagaraFunctionLibrary::SetTexture2DArrayObject(NiagaraComp, TEXT("User.TexArray"), TexArray);
+UNiagaraFunctionLibrary::SetVolumeTextureObject(NiagaraComp, TEXT("User.DensityVol"), VolumeTexture);
+
+// Or through the component, for a Texture-typed User parameter.
+NiagaraComp->SetVariableTexture(FName("User.FlowTexture"), FlowTexture);
 ```
 
-### UNiagaraDataInterfaceVolumeTexture
-**Header**: `Classes/NiagaraDataInterfaceVolumeTexture.h`
-**Sim target**: GPU only
-
-Samples from a `UVolumeTexture`.
-
-```cpp
-UNiagaraFunctionLibrary::SetVolumeTextureObject(NiagaraComp, TEXT("User.DensityVol"), MyVolumeTexture);
-```
-
-### UNiagaraDataInterfaceCubeTexture
-**Header**: `Classes/NiagaraDataInterfaceCubeTexture.h`
-**Sim target**: GPU only
-
-Samples from a `UTextureCube`.
-
-### UNiagaraDataInterfaceRenderTarget2D
-**Header**: `Classes/NiagaraDataInterfaceRenderTarget2D.h`
-**Sim target**: GPU (read/write)
-
-Read-write GPU render target. Used for simulation caching and fluid-like effects.
+The scene-capture DI lives in `Private/`, so configure it through the public helper:
+`UNiagaraFunctionLibrary::SetSceneCapture2DDataInterfaceManagedMode(NiagaraComp, DIName, ManagedCaptureSource, ManagedTextureSize, ManagedTextureFormat, ManagedProjectionType, ManagedFOVAngle, ManagedOrthoWidth, bManagedCaptureEveryFrame, bManagedCaptureOnMovement, ShowOnlyActors, ManagedLODDistanceFactor)`.
+It is destructive: it modifies the DI instance.
 
 ---
 
-## Noise DIs
+## Noise, Grid and Simulation DIs
 
-### UNiagaraDataInterfaceCurlNoise
-**Header**: `Classes/NiagaraDataInterfaceCurlNoise.h`
-**Sim target**: CPU + GPU
+| DI Class | Header | Sim target |
+|---|---|---|
+| `UNiagaraDataInterfaceCurlNoise` | `Classes/NiagaraDataInterfaceCurlNoise.h` | CPU + GPU |
+| `UNiagaraDataInterfaceGrid2DCollection` | `Classes/NiagaraDataInterfaceGrid2DCollection.h` | GPU |
+| `UNiagaraDataInterfaceGrid2DCollectionReader` | `Classes/NiagaraDataInterfaceGrid2DCollectionReader.h` | GPU |
+| `UNiagaraDataInterfaceGrid3DCollection` | `Classes/NiagaraDataInterfaceGrid3DCollection.h` | GPU |
+| `UNiagaraDataInterfaceNeighborGrid3D` | `Classes/NiagaraDataInterfaceNeighborGrid3D.h` | GPU |
 
-Provides 3D curl noise for divergence-free velocity fields. No runtime parameters — configure
-`ModificationMode` and `NoiseStrength` in the Niagara editor.
-
----
-
-## Simulation / Grid DIs
-
-### UNiagaraDataInterfaceGrid2DCollection
-**Header**: `Classes/NiagaraDataInterfaceGrid2DCollection.h`
-**Sim target**: GPU only
-
-2D grid of simulation data (textures). Used for fluid simulation and cellular automata effects.
-Requires GPU sim mode. Not configurable from C++ directly — set up in Niagara editor.
-
-### UNiagaraDataInterfaceGrid3DCollection
-**Header**: `Classes/NiagaraDataInterfaceGrid3DCollection.h`
-**Sim target**: GPU only
-
-3D volumetric grid. Used for Niagara Fluids and volumetric simulations.
-
-### UNiagaraDataInterfaceNeighborGrid3D
-**Header**: `Classes/NiagaraDataInterfaceNeighborGrid3D.h`
-**Sim target**: GPU only
-
-Spatial hash grid for neighbor queries between particles.
+Grid DIs are configured in the Niagara editor, not from C++. `Grid2DCollectionReader` lets one
+emitter read another emitter's grid.
 
 ---
 
-## Collision DIs
+## Collision and Physics DIs
 
 ### UNiagaraDataInterfaceCollisionQuery
 **Header**: `Classes/NiagaraDataInterfaceCollisionQuery.h`
-**Sim target**: CPU (sync) + GPU (async via HWRT)
+**Sim target**: CPU (synchronous traces) + GPU (depth buffer and global distance field)
 
-Allows Niagara particles to perform physics collision traces. CPU mode executes synchronous line
-traces; GPU mode uses hardware ray tracing (HWRT) when available.
+Hardware-ray-traced GPU collision goes through `UNiagaraDataInterfaceAsyncGpuTrace` (below); these
+library helpers manage its HWRT collision groups:
 
-For GPU HWRT, manage collision groups from C++:
 ```cpp
-// Assign a collision group to a primitive so GPU particles can filter against it.
-UNiagaraFunctionLibrary::SetComponentNiagaraGPURayTracedCollisionGroup(
-    this, MyPrimitiveComp, CollisionGroupIndex
-);
+// Acquire a collision group, tag primitives into it, release when done.
+const int32 GroupIdx = UNiagaraFunctionLibrary::AcquireNiagaraGPURayTracedCollisionGroup(this);
 
-// Acquire a free collision group index.
-int32 GroupIdx = UNiagaraFunctionLibrary::AcquireNiagaraGPURayTracedCollisionGroup(this);
-// ... assign and use ...
+UNiagaraFunctionLibrary::SetComponentNiagaraGPURayTracedCollisionGroup(this, TargetPrimitive, GroupIdx);
+UNiagaraFunctionLibrary::SetActorNiagaraGPURayTracedCollisionGroup(this, TargetActor, GroupIdx);
+
 UNiagaraFunctionLibrary::ReleaseNiagaraGPURayTracedCollisionGroup(this, GroupIdx);
 ```
 
-### UNiagaraDataInterfaceAsyncGpuTrace
-**Header**: `Classes/NiagaraDataInterfaceAsyncGpuTrace.h`
-**Sim target**: GPU only (HWRT)
-
-Asynchronous GPU-side ray traces. Results are available in the following frame.
+| DI Class | Header | Notes |
+|---|---|---|
+| `UNiagaraDataInterfaceAsyncGpuTrace` | `Classes/NiagaraDataInterfaceAsyncGpuTrace.h` | GPU ray traces; results land the following frame |
+| `UNiagaraDataInterfacePhysicsAsset` | `Public/NiagaraDataInterfacePhysicsAsset.h` | Physics asset body transforms |
+| `UNiagaraDataInterfaceRigidMeshCollisionQuery` | `Public/NiagaraDataInterfaceRigidMeshCollisionQuery.h` | SDF collision against rigid meshes |
 
 ---
 
 ## Audio DIs
 
-### UNiagaraDataInterfaceAudio
-**Header**: `Classes/NiagaraDataInterfaceAudio.h`
+There is no abstract audio DI base class in 5.8. The three concrete classes are:
 
-Abstract base for audio-driven data interfaces.
-
-### UNiagaraDataInterfaceAudioOscilloscope
-**Header**: `Classes/NiagaraDataInterfaceAudioOscilloscope.h`
-
-Samples audio waveform (time-domain) data into the particle simulation.
-
-### UNiagaraDataInterfaceAudioSpectrum
-**Header**: `Classes/NiagaraDataInterfaceAudioSpectrum.h`
-
-Samples FFT frequency spectrum data. Drive particle effects from audio amplitude.
-
-### UNiagaraDataInterfaceAudioPlayer
-**Header**: `Classes/NiagaraDataInterfaceAudioPlayer.h`
-
-Triggers audio events from within a Niagara simulation (e.g., play a sound per particle spawn).
+| DI Class | Header | Purpose |
+|---|---|---|
+| `UNiagaraDataInterfaceAudioOscilloscope` | `Classes/NiagaraDataInterfaceAudioOscilloscope.h` | Time-domain waveform from a `USoundSubmix* Submix` |
+| `UNiagaraDataInterfaceAudioSpectrum` | `Classes/NiagaraDataInterfaceAudioSpectrum.h` | FFT spectrum from a `USoundSubmix* Submix` |
+| `UNiagaraDataInterfaceAudioPlayer` | `Classes/NiagaraDataInterfaceAudioPlayer.h` | Plays sounds from inside a simulation; settings on `UNiagaraDataInterfaceAudioPlayerSettings` |
 
 ---
 
-## Physics DIs
+## Scene and Actor DIs
 
-### UNiagaraDataInterfacePhysicsAsset
-**Header**: `Public/NiagaraDataInterfacePhysicsAsset.h`
-
-Exposes physics asset body transforms for collision or constraint effects.
-
-### UNiagaraDataInterfaceRigidMeshCollisionQuery
-**Header**: `Public/NiagaraDataInterfaceRigidMeshCollisionQuery.h`
-
-Provides signed-distance-field (SDF)-based collision queries against rigid body meshes.
-
----
-
-## Camera DI
-
-### UNiagaraDataInterfaceCamera
-**Header**: `Classes/NiagaraDataInterfaceCamera.h`
-**Sim target**: CPU + GPU (partial)
-
-Exposes camera position, rotation, field of view, and depth buffer data to the simulation.
-On GPU, depth buffer sampling is available when a scene depth texture is accessible.
+| DI Class | Header | Notes |
+|---|---|---|
+| `UNiagaraDataInterfaceCamera` | `Classes/NiagaraDataInterfaceCamera.h` | Camera transform, FOV, depth buffer access |
+| `UNiagaraDataInterfaceSpline` | `Classes/NiagaraDataInterfaceSpline.h` | Positions, tangents and up vectors along a `USplineComponent` |
+| `UNiagaraDataInterfaceLandscape` | `Classes/NiagaraDataInterfaceLandscape.h` | Height, normal and layer weights from a landscape |
+| `UNiagaraDataInterfaceOcclusion` | `Classes/NiagaraDataInterfaceOcclusion.h` | Renderer occlusion results |
+| `UNiagaraDataInterfaceParticleRead` | `Classes/NiagaraDataInterfaceParticleRead.h` | Read another emitter's particle attributes |
+| `UNiagaraDataInterfaceActorComponent` | `Internal/DataInterface/NiagaraDataInterfaceActorComponent.h` | An actor component's transform and velocity |
+| `UNiagaraDataInterfaceMaterialInstanceDynamic` | `Private/NiagaraDataInterfaceMaterialInstanceDynamic.h` | Read scalars and vectors from a `UMaterialInstanceDynamic` |
+| `UNiagaraDataInterfaceMaterialParameterCollection` | `Private/NiagaraDataInterfaceMaterialParameterCollection.h` | Read a `UMaterialParameterCollection` |
 
 ---
 
-## Spline DI
+## Data Channel DIs
 
-### UNiagaraDataInterfaceSpline
-**Header**: `Classes/NiagaraDataInterfaceSpline.h`
-**Sim target**: CPU
+**Headers**: `Internal/DataInterface/NiagaraDataInterfaceDataChannelRead.h` and
+`Internal/DataInterface/NiagaraDataInterfaceDataChannelWrite.h`
 
-Samples positions, tangents, and curvature along a `USplineComponent`. Particles can follow
-or distribute along splines.
-
----
-
-## Particle Read DI
-
-### UNiagaraDataInterfaceParticleRead
-**Header**: `Classes/NiagaraDataInterfaceParticleRead.h`
-**Sim target**: CPU
-
-Allows one emitter to read particle attributes from another emitter within the same system.
-Useful for spawning secondary effects at the positions of particles in a primary emitter.
-
----
-
-## Data Channel DIs (UE 5.4+)
-
-### UNiagaraDataInterfaceDataChannelRead / Write
-**Headers**: `Internal/DataInterface/NiagaraDataInterfaceDataChannelRead.h` and `...Write.h`
-
-Data Channels allow multiple Niagara systems to share data across system boundaries at runtime,
-without direct C++ coupling. Writers push data into a named channel; readers consume it.
+These are the Niagara-script side of Niagara Data Channels: an emitter reads elements published to a
+`UNiagaraDataChannelAsset`, or writes elements other systems and game code consume. The C++/Blueprint
+side is `UNiagaraDataChannelLibrary` (`Public/NiagaraDataChannelFunctionLibrary.h`) plus
+`UNiagaraDataChannelWriter` / `UNiagaraDataChannelReader` (`Public/NiagaraDataChannelAccessor.h`) —
+see the Niagara Data Channels section of the main skill.
 
 ---
 
@@ -409,68 +280,120 @@ without direct C++ coupling. Writers push data into a named channel; readers con
 
 ### UNiagaraDataInterfaceExport
 **Header**: `Classes/NiagaraDataInterfaceExport.h`
-**Sim target**: CPU
+**Sim target**: CPU + GPU
 
-Allows Niagara to export particle attributes back to C++ via an interface callback. Implement
-`INiagaraParticleCallbackHandler` on your UObject to receive per-particle data:
+Pushes particle data back out to a `UObject` each tick. The receiving object is named by the DI's
+`CallbackHandlerParameter` (`FNiagaraUserParameterBinding`) and must implement
+`INiagaraParticleCallbackHandler`.
+
+`ReceiveParticleData` is declared `UFUNCTION(BlueprintCallable, BlueprintNativeEvent)`, so the C++
+override is `ReceiveParticleData_Implementation`. Overriding `ReceiveParticleData` itself does not
+satisfy the interface and the callback never fires.
 
 ```cpp
-// Your class must implement INiagaraParticleCallbackHandler.
-#include "NiagaraDataInterfaceExport.h"
+// MyParticleReceiver.h
+#pragma once
 
-class UMyParticleCallbackHandler : public UObject, public INiagaraParticleCallbackHandler
+#include "CoreMinimal.h"
+#include "NiagaraDataInterfaceExport.h"
+#include "UObject/Object.h"
+#include "MyParticleReceiver.generated.h"
+
+class UNiagaraSystem;
+
+UCLASS(BlueprintType)
+class MYGAME_API UMyParticleReceiver : public UObject, public INiagaraParticleCallbackHandler
 {
     GENERATED_BODY()
+
 public:
-    virtual void ReceiveParticleData(
+    virtual void ReceiveParticleData_Implementation(
         const TArray<FBasicParticleData>& Data,
         UNiagaraSystem* NiagaraSystem,
         const FVector& SimulationPositionOffset) override;
 };
 ```
 
----
+```cpp
+// MyParticleReceiver.cpp
+#include "MyParticleReceiver.h"
 
-## Landscape DI
+#include "NiagaraSystem.h"
 
-### UNiagaraDataInterfaceLandscape
-**Header**: `Classes/NiagaraDataInterfaceLandscape.h`
-**Sim target**: CPU
+void UMyParticleReceiver::ReceiveParticleData_Implementation(
+    const TArray<FBasicParticleData>& Data,
+    UNiagaraSystem* NiagaraSystem,
+    const FVector& SimulationPositionOffset)
+{
+    for (const FBasicParticleData& Particle : Data)
+    {
+        const FVector WorldPosition = Particle.Position + SimulationPositionOffset;
+        ProcessImpact(WorldPosition, Particle.Velocity, Particle.Size);
+    }
+}
+```
 
-Samples height, normal, and material weight data from an `ALandscape` actor.
+Bind the receiver at runtime with `NiagaraComp->SetVariableObject(FName("User.ExportTarget"), Receiver);`
+using whatever `User.` parameter the DI's `CallbackHandlerParameter` points at.
 
----
-
-## Occlusion DI
-
-### UNiagaraDataInterfaceOcclusion
-**Header**: `Classes/NiagaraDataInterfaceOcclusion.h`
-
-Queries occlusion state from the renderer's occlusion query results.
-
----
-
-## Actor / Component DI
-
-### UNiagaraDataInterfaceActorComponent
-**Header**: `Internal/DataInterface/NiagaraDataInterfaceActorComponent.h`
-
-Exposes an actor's component transforms and velocity to Niagara scripts. Useful for binding
-a target actor's transform without requiring a full skeletal or static mesh DI.
+`FBasicParticleData` carries `Position`, `Size` and `Velocity`. For GPU simulations the DI reserves a
+buffer sized by `ENDIExport_GPUAllocationMode` — `FixedSize` uses `GPUAllocationFixedSize`,
+`PerParticle` multiplies the emitter particle count by `GPUAllocationPerParticleSize`.
 
 ---
 
-## Material / MPC DIs
+## Writing a Custom Data Interface
 
-### NiagaraDataInterfaceMaterialInstanceDynamic
-**Header**: `Private/NiagaraDataInterfaceMaterialInstanceDynamic.h`
+Subclass `UNiagaraDataInterface`. The function list is editor-only data, so the override is
+`GetFunctionsInternal(TArray<FNiagaraFunctionSignature>&) const` guarded by `WITH_EDITORONLY_DATA` —
+matching the base declaration exactly.
 
-Allows Niagara to read scalar and vector parameters from a `UMaterialInstanceDynamic`.
+```cpp
+// MyTerrainDataInterface.h
+#pragma once
 
-### NiagaraDataInterfaceMaterialParameterCollection
-**Header**: `Private/NiagaraDataInterfaceMaterialParameterCollection.h`
+#include "CoreMinimal.h"
+#include "NiagaraDataInterface.h"
+#include "MyTerrainDataInterface.generated.h"
 
-Reads values from a `UMaterialParameterCollection` asset.
+class FNiagaraSystemInstance;
+
+UCLASS(EditInlineNew, Category = "Terrain", meta = (DisplayName = "My Terrain Query"))
+class MYGAME_API UMyTerrainDataInterface : public UNiagaraDataInterface
+{
+    GENERATED_BODY()
+
+public:
+    virtual void GetVMExternalFunction(const FVMExternalFunctionBindingInfo& BindingInfo, void* InstanceData, FVMExternalFunction& OutFunc) override;
+
+    virtual int32 PerInstanceDataSize() const override;
+    virtual bool InitPerInstanceData(void* PerInstanceData, FNiagaraSystemInstance* SystemInstance) override;
+    virtual void DestroyPerInstanceData(void* PerInstanceData, FNiagaraSystemInstance* SystemInstance) override;
+    virtual bool PerInstanceTick(void* PerInstanceData, FNiagaraSystemInstance* SystemInstance, float DeltaSeconds) override;
+
+    virtual bool Equals(const UNiagaraDataInterface* Other) const override;
+
+    /** GPU path: fill DataForRenderThread for the matching FNiagaraDataInterfaceProxy. */
+    virtual void ProvidePerInstanceDataForRenderThread(void* DataForRenderThread, void* PerInstanceData, const FNiagaraSystemInstanceID& SystemInstance) override;
+    virtual int32 PerInstanceDataPassedToRenderThreadSize() const override;
+
+protected:
+    virtual bool CopyToInternal(UNiagaraDataInterface* Destination) const override;
+
+#if WITH_EDITORONLY_DATA
+    virtual void GetFunctionsInternal(TArray<FNiagaraFunctionSignature>& OutFunctions) const override;
+#endif
+};
+```
+
+Rules that trip people up:
+
+- `GetFunctionsInternal` is `const` and lives under `#if WITH_EDITORONLY_DATA`. Callers use the
+  non-virtual `GetFunctionSignatures(TArray<FNiagaraFunctionSignature>&) const`.
+- `Equals` and `CopyToInternal` must both account for every new `UPROPERTY`, or duplicated systems
+  and editor copies silently lose settings.
+- `PerInstanceDataPassedToRenderThreadSize()` must return a 16-byte-aligned size.
+- Add `"NiagaraCore"` to the module's `PublicDependencyModuleNames` alongside `"Niagara"`.
 
 ---
 
@@ -480,12 +403,13 @@ Reads values from a `UMaterialParameterCollection` asset.
 |---|---|
 | Spawn particles on a character mesh | `UNiagaraDataInterfaceSkeletalMesh` |
 | Scatter particles on a static prop | `UNiagaraDataInterfaceStaticMesh` |
-| Drive emitter rate with an animation curve | `UNiagaraDataInterfaceCurve` |
-| Push a gameplay position list (e.g., AI waypoints) | `UNiagaraDataInterfaceArrayFloat3` (Vector Array) |
+| Drive emitter rate with an authored curve | `UNiagaraDataInterfaceCurve` |
+| Push a gameplay position list | `UNiagaraDataInterfaceArrayPosition` |
 | Particles collide with world geometry | `UNiagaraDataInterfaceCollisionQuery` |
 | Audio-reactive effects | `UNiagaraDataInterfaceAudioSpectrum` |
 | Particles follow a spline path | `UNiagaraDataInterfaceSpline` |
-| Camera-relative VFX (e.g., lens flares) | `UNiagaraDataInterfaceCamera` |
-| Export particle positions to C++ for gameplay | `UNiagaraDataInterfaceExport` |
-| Share data between two independent VFX systems | `UNiagaraDataInterfaceDataChannelRead/Write` |
-| Volumetric / fluid simulation | `UNiagaraDataInterfaceGrid3DCollection` |
+| Camera-relative VFX | `UNiagaraDataInterfaceCamera` |
+| Export particle positions to gameplay code | `UNiagaraDataInterfaceExport` |
+| Send gameplay events into Niagara | Niagara Data Channels (`UNiagaraDataChannelLibrary`) |
+| Share data between independent systems | Niagara Data Channels |
+| Volumetric or fluid simulation | `UNiagaraDataInterfaceGrid3DCollection` |

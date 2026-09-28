@@ -1,164 +1,292 @@
 # Experience System Reference
 
-The experience system pattern (pioneered by Lyra) composes game modes from multiple Game Feature
-plugins at runtime. Instead of a monolithic `AGameMode` subclass per game type, you define
-lightweight data assets that list which features to activate.
+> **Lyra sample, not engine.** The "experience system" is a pattern implemented in Epic's Lyra
+> sample project. `ULyraExperienceDefinition`, `ULyraExperienceManagerComponent`,
+> `ULyraPawnData` and Lyra's own action subclasses (for example
+> `UGameFeatureAction_AddInputContextMapping`) exist **only in Lyra**, not in any UE 5.8 engine
+> header. Do not `#include` them, do not reference them from a project that has not copied them,
+> and do not tell a user they ship with the engine. Everything below is a template for classes
+> **you write in your own module**, named `UMy*` here.
+
+The engine pieces this pattern builds on, all real UE 5.8 API:
+
+| Engine type | Module | Role |
+|---|---|---|
+| `UGameFeaturesSubsystem` | `GameFeatures` | Loads, activates and deactivates feature plugins. |
+| `UGameFeatureData` | `GameFeatures` | Per-plugin data asset holding the action list. |
+| `UGameFeatureAction` | `GameFeatures` | Base class for work done on activation/deactivation. |
+| `UGameFrameworkComponentManager` | `ModularGameplay` | Injects components into registered actors. |
+| `UGameStateComponent` | `ModularGameplay` | Base for a component living on `AGameStateBase`. |
+| `UPrimaryDataAsset`, `UAssetManager` | `Engine` | Primary asset definition and async loading. |
+
+Both `GameFeatures` and `ModularGameplay` are Beta in 5.8.
 
 ---
 
-## Experience Definition Asset
+## Why compose a game mode from features
+
+A monolithic `AGameMode` subclass per game type duplicates shared systems. Instead, define a
+lightweight primary data asset per mode that lists which Game Feature plugins to activate, and let
+each plugin bring its own components, input, abilities and UI.
+
+```
+B_MyDeathmatch (UMyExperienceDefinition)
+├── GameFeaturesToEnable:
+│   ├── "MyShooterCore"      → health, weapons, HUD, hit detection
+│   ├── "MyDeathmatchRules"  → score tracking, kill feed, respawn timer
+│   └── "MyTeamSystem"       → team assignment, team colors, team HUD
+├── Actions:
+│   └── UGameFeatureAction_AddComponents: UMyScoreComponent → AGameStateBase
+└── DefaultPawnData: BP_MyShooterCharacter
+```
+
+Switching to another mode replaces `MyDeathmatchRules` with a different rules plugin while keeping
+the shared ones. (Lyra ships the same idea under the names `ULyraExperienceDefinition`,
+`B_ShooterCore` and so on — Lyra sample, not engine.)
+
+---
+
+## Experience definition asset
+
+`UGameFeatureAction` is an engine class, so an experience asset can carry a list of actions that run
+without a dedicated plugin. `GameFeaturesToEnable` holds plugin **names**; the manager resolves each
+one to a URL with `UGameFeaturesSubsystem::GetPluginURLByName` before loading it.
 
 ```cpp
-// UExperienceDefinition — a primary data asset listing features to compose
+// MyExperienceDefinition.h
 #pragma once
-#include "Engine/DataAsset.h"
-#include "ExperienceDefinition.generated.h"
 
-UCLASS()
-class UExperienceDefinition : public UPrimaryDataAsset
+#include "Engine/DataAsset.h"
+#include "MyExperienceDefinition.generated.h"
+
+class UGameFeatureAction;
+class UMyPawnData;
+
+UCLASS(BlueprintType, Const)
+class MYGAME_API UMyExperienceDefinition : public UPrimaryDataAsset
 {
     GENERATED_BODY()
+
 public:
-    // Game Feature plugins to activate for this experience
+    /** Names of the Game Feature plugins this experience turns on */
     UPROPERTY(EditDefaultsOnly, Category = "Experience")
     TArray<FString> GameFeaturesToEnable;
 
-    // Actions to execute directly (without a full Game Feature plugin)
+    /** Actions run directly for this experience, without a dedicated plugin */
     UPROPERTY(EditDefaultsOnly, Instanced, Category = "Experience")
     TArray<TObjectPtr<UGameFeatureAction>> Actions;
 
-    // Default pawn data for this experience
+    /** Pawn configuration this experience hands to the GameMode */
     UPROPERTY(EditDefaultsOnly, Category = "Experience")
-    TObjectPtr<UPawnData> DefaultPawnData;
+    TObjectPtr<const UMyPawnData> DefaultPawnData;
 
-    virtual FPrimaryAssetId GetPrimaryAssetId() const override
-    {
-        return FPrimaryAssetId(FPrimaryAssetType("Experience"),
-            GetFName());
-    }
+    virtual FPrimaryAssetId GetPrimaryAssetId() const override;
 };
 ```
 
-Example experience assets:
-- **B_Deathmatch**: Enables `ShooterCore` + `DeathmatchRules`
-- **B_ControlPoint**: Enables `ShooterCore` + `ControlPointRules`
-- **B_FrontEnd**: Enables `FrontEndUI` only (no gameplay features)
+```cpp
+// MyExperienceDefinition.cpp
+#include "MyExperienceDefinition.h"
 
-Each experience shares common features (e.g., `ShooterCore` for weapons, health, HUD) and
-adds mode-specific rules as separate Game Feature plugins.
+FPrimaryAssetId UMyExperienceDefinition::GetPrimaryAssetId() const
+{
+    return FPrimaryAssetId(FPrimaryAssetType(TEXT("MyExperience")), GetFName());
+}
+```
+
+Register `MyExperience` as a primary asset type in Project Settings → Asset Manager, or through a
+`UGameFeatureData`'s `PrimaryAssetTypesToScan` when the experiences live inside a feature plugin.
+See `ue-data-assets-tables`.
 
 ---
 
-## Experience Manager Component
+## Experience manager component
 
-A `UGameStateComponent` on `AGameStateBase` orchestrates experience loading:
+A `UGameStateComponent` (engine class, `ModularGameplay`) on the game state is the natural owner:
+the game state exists on server and clients. The component replicates the chosen experience, and
+both sides run the same loading flow when it arrives.
 
 ```cpp
+// MyExperienceManagerComponent.h
 #pragma once
-#include "Components/GameStateComponent.h"
-#include "ExperienceManagerComponent.generated.h"
 
-DECLARE_MULTICAST_DELEGATE_OneParam(FOnExperienceLoaded, const UExperienceDefinition*);
+#include "Components/GameStateComponent.h"
+#include "MyExperienceManagerComponent.generated.h"
+
+class UMyExperienceDefinition;
+namespace UE::GameFeatures { struct FResult; }
+
+DECLARE_MULTICAST_DELEGATE_OneParam(FMyOnExperienceLoaded, const UMyExperienceDefinition*);
 
 UCLASS()
-class UExperienceManagerComponent : public UGameStateComponent
+class MYGAME_API UMyExperienceManagerComponent : public UGameStateComponent
 {
     GENERATED_BODY()
+
 public:
-    // Call from GameMode::InitGame to start loading
+    UMyExperienceManagerComponent(const FObjectInitializer& ObjectInitializer);
+
+    /** Server only: called from the GameMode once the experience id is known */
     void SetCurrentExperience(FPrimaryAssetId ExperienceId);
 
-    // Check if experience is fully loaded and active
     bool IsExperienceLoaded() const { return bExperienceLoaded; }
 
-    // Bind to get notified when experience is ready — fires immediately if already loaded
-    void CallOrRegister_OnExperienceLoaded(FOnExperienceLoaded::FDelegate&& Delegate);
+    const UMyExperienceDefinition* GetCurrentExperience() const { return CurrentExperience; }
 
-    const UExperienceDefinition* GetCurrentExperience() const { return CurrentExperience; }
+    /** Fires immediately when the experience is already loaded, otherwise on load */
+    void CallOrRegister_OnExperienceLoaded(FMyOnExperienceLoaded::FDelegate&& Delegate);
 
-    FOnExperienceLoaded OnExperienceLoaded;
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 private:
-    void OnExperienceLoadComplete();
+    void OnExperienceAssetLoaded();
+    void StartExperienceLoad();
     void OnGameFeaturePluginLoadComplete(const UE::GameFeatures::FResult& Result);
+    void BroadcastExperienceLoaded();
 
-    UPROPERTY()
-    TObjectPtr<const UExperienceDefinition> CurrentExperience;
+    UFUNCTION()
+    void OnRep_CurrentExperience();
 
-    int32 NumGameFeaturePluginsLoading = 0;
+    UPROPERTY(ReplicatedUsing = OnRep_CurrentExperience)
+    TObjectPtr<const UMyExperienceDefinition> CurrentExperience;
+
+    FMyOnExperienceLoaded OnExperienceLoaded;
+    FPrimaryAssetId PendingExperienceId;
+    int32 NumFeaturePluginsLoading = 0;
     bool bExperienceLoaded = false;
 };
 ```
 
 ---
 
-## Experience Loading Flow
+## Loading flow
 
 ```cpp
-// 1. GameMode selects and starts loading the experience
-void AMyGameMode::InitGame(const FString& MapName, const FString& Options,
-    FString& ErrorMessage)
+// MyExperienceManagerComponent.cpp
+#include "MyExperienceManagerComponent.h"
+#include "MyExperienceDefinition.h"
+#include "Engine/AssetManager.h"
+#include "Engine/Engine.h"
+#include "GameFeatureAction.h"
+#include "GameFeaturesSubsystem.h"
+#include "Net/UnrealNetwork.h"
+
+UMyExperienceManagerComponent::UMyExperienceManagerComponent(const FObjectInitializer& ObjectInitializer)
+    : Super(ObjectInitializer)
 {
-    Super::InitGame(MapName, Options, ErrorMessage);
-
-    // Determine experience from map, URL options, or default
-    FPrimaryAssetId ExperienceId = FPrimaryAssetId(
-        FPrimaryAssetType("Experience"), FName("B_Deathmatch"));
-
-    // Get the experience manager on GameState
-    UExperienceManagerComponent* ExpMgr =
-        GameState->FindComponentByClass<UExperienceManagerComponent>();
-    ExpMgr->SetCurrentExperience(ExperienceId);
+    SetIsReplicatedByDefault(true);
 }
 
-// 2. ExperienceManagerComponent loads the definition, then activates features
-void UExperienceManagerComponent::SetCurrentExperience(FPrimaryAssetId ExperienceId)
+void UMyExperienceManagerComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
-    // Async load the experience data asset
-    UAssetManager::Get().LoadPrimaryAsset(ExperienceId,
-        TArray<FName>(),
-        FStreamableDelegate::CreateUObject(this,
-            &UExperienceManagerComponent::OnExperienceLoadComplete));
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME(UMyExperienceManagerComponent, CurrentExperience);
 }
 
-void UExperienceManagerComponent::OnExperienceLoadComplete()
+void UMyExperienceManagerComponent::SetCurrentExperience(FPrimaryAssetId ExperienceId)
 {
-    // Asset loaded — now activate each Game Feature plugin
-    CurrentExperience = Cast<UExperienceDefinition>(
-        UAssetManager::Get().GetPrimaryAssetObject(ExperienceId));
+    PendingExperienceId = ExperienceId;
 
-    UGameFeaturesSubsystem& GFS = UGameFeaturesSubsystem::Get();
-    NumGameFeaturePluginsLoading = CurrentExperience->GameFeaturesToEnable.Num();
+    UAssetManager::Get().LoadPrimaryAsset(ExperienceId, TArray<FName>(),
+        FStreamableDelegate::CreateUObject(
+            this, &UMyExperienceManagerComponent::OnExperienceAssetLoaded));
+}
 
-    for (const FString& PluginURL : CurrentExperience->GameFeaturesToEnable)
+void UMyExperienceManagerComponent::OnExperienceAssetLoaded()
+{
+    CurrentExperience = Cast<UMyExperienceDefinition>(
+        UAssetManager::Get().GetPrimaryAssetObject(PendingExperienceId));
+    if (!CurrentExperience)
     {
+        UE_LOG(LogMyGame, Error, TEXT("Experience asset failed to load"));
+        return;
+    }
+
+    // Setting CurrentExperience replicates it; clients continue in OnRep_CurrentExperience.
+    StartExperienceLoad();
+}
+
+void UMyExperienceManagerComponent::OnRep_CurrentExperience()
+{
+    if (CurrentExperience)
+    {
+        StartExperienceLoad();
+    }
+}
+
+void UMyExperienceManagerComponent::StartExperienceLoad()
+{
+    UGameFeaturesSubsystem& GFS = UGameFeaturesSubsystem::Get();
+    NumFeaturePluginsLoading = CurrentExperience->GameFeaturesToEnable.Num();
+
+    if (NumFeaturePluginsLoading == 0)
+    {
+        BroadcastExperienceLoaded();
+        return;
+    }
+
+    for (const FString& PluginName : CurrentExperience->GameFeaturesToEnable)
+    {
+        FString PluginURL;
+        if (!GFS.GetPluginURLByName(PluginName, PluginURL))
+        {
+            UE_LOG(LogMyGame, Error, TEXT("Unknown game feature plugin %s"), *PluginName);
+            --NumFeaturePluginsLoading;
+            continue;
+        }
+
         GFS.LoadAndActivateGameFeaturePlugin(PluginURL,
             FGameFeaturePluginLoadComplete::CreateUObject(
-                this, &UExperienceManagerComponent::OnGameFeaturePluginLoadComplete));
+                this, &UMyExperienceManagerComponent::OnGameFeaturePluginLoadComplete));
     }
 
-    // If no plugins to load, mark ready immediately
-    if (NumGameFeaturePluginsLoading == 0)
+    if (NumFeaturePluginsLoading == 0)
     {
-        bExperienceLoaded = true;
-        OnExperienceLoaded.Broadcast(CurrentExperience);
+        BroadcastExperienceLoaded();
     }
 }
 
-void UExperienceManagerComponent::OnGameFeaturePluginLoadComplete(
+void UMyExperienceManagerComponent::OnGameFeaturePluginLoadComplete(
     const UE::GameFeatures::FResult& Result)
 {
-    NumGameFeaturePluginsLoading--;
-    if (NumGameFeaturePluginsLoading == 0)
+    if (Result.HasError())
     {
-        bExperienceLoaded = true;
-        OnExperienceLoaded.Broadcast(CurrentExperience);
+        UE_LOG(LogMyGame, Error, TEXT("Feature plugin failed: %s"), *Result.GetError());
+    }
+
+    --NumFeaturePluginsLoading;
+    if (NumFeaturePluginsLoading == 0)
+    {
+        BroadcastExperienceLoaded();
     }
 }
 
-// 3. CallOrRegister pattern — fires immediately if already loaded
-void UExperienceManagerComponent::CallOrRegister_OnExperienceLoaded(
-    FOnExperienceLoaded::FDelegate&& Delegate)
+void UMyExperienceManagerComponent::BroadcastExperienceLoaded()
+{
+    // Run the experience's own actions, limited to this world so other PIE instances are untouched.
+    FGameFeatureActivatingContext Context;
+    if (const FWorldContext* WorldContext = GEngine->GetWorldContextFromWorld(GetWorld()))
+    {
+        Context.SetRequiredWorldContextHandle(WorldContext->ContextHandle);
+    }
+    for (UGameFeatureAction* Action : CurrentExperience->Actions)
+    {
+        if (Action)
+        {
+            Action->OnGameFeatureRegistering();
+            Action->OnGameFeatureLoading();
+            Action->OnGameFeatureActivating(Context);
+        }
+    }
+
+    bExperienceLoaded = true;
+    OnExperienceLoaded.Broadcast(CurrentExperience);
+    OnExperienceLoaded.Clear();
+}
+
+void UMyExperienceManagerComponent::CallOrRegister_OnExperienceLoaded(
+    FMyOnExperienceLoaded::FDelegate&& Delegate)
 {
     if (bExperienceLoaded)
     {
@@ -169,54 +297,81 @@ void UExperienceManagerComponent::CallOrRegister_OnExperienceLoaded(
         OnExperienceLoaded.Add(MoveTemp(Delegate));
     }
 }
+
+void UMyExperienceManagerComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (bExperienceLoaded && CurrentExperience)
+    {
+        // Undo the actions in the same world; no action here pauses deactivation.
+        FGameFeatureDeactivatingContext Context(TEXT(""), [](FStringView) {});
+        if (const FWorldContext* WorldContext = GEngine->GetWorldContextFromWorld(GetWorld()))
+        {
+            Context.SetRequiredWorldContextHandle(WorldContext->ContextHandle);
+        }
+        for (UGameFeatureAction* Action : CurrentExperience->Actions)
+        {
+            if (Action)
+            {
+                Action->OnGameFeatureDeactivating(Context);
+                Action->OnGameFeatureUnregistering();
+            }
+        }
+    }
+
+    Super::EndPlay(EndPlayReason);
+}
+```
+
+The GameMode picks the experience and hands it over. `AGameModeBase::InitGame` runs before the game
+state exists, so resolve the id there and push it to the component once `InitGameState` has run:
+
+```cpp
+void AMyGameMode::InitGameState()
+{
+    Super::InitGameState();
+
+    const FPrimaryAssetId ExperienceId(FPrimaryAssetType(TEXT("MyExperience")),
+        FName(TEXT("B_MyDeathmatch")));
+
+    if (UMyExperienceManagerComponent* ExperienceManager =
+        GameState->FindComponentByClass<UMyExperienceManagerComponent>())
+    {
+        ExperienceManager->SetCurrentExperience(ExperienceId);
+    }
+}
 ```
 
 ---
 
-## Consuming the Experience
+## Consuming the experience
 
-Systems that depend on the experience being ready use `CallOrRegister_OnExperienceLoaded`
-instead of assuming features are available at `BeginPlay`:
+Anything that depends on feature-provided components must wait rather than assume they exist at
+`BeginPlay`:
 
 ```cpp
 void UMyPawnComponent::BeginPlay()
 {
     Super::BeginPlay();
 
-    AGameStateBase* GS = GetWorld()->GetGameState<AGameStateBase>();
-    if (UExperienceManagerComponent* ExpMgr =
-        GS->FindComponentByClass<UExperienceManagerComponent>())
+    if (AGameStateBase* GameStateBase = GetWorld()->GetGameState())
     {
-        ExpMgr->CallOrRegister_OnExperienceLoaded(
-            FOnExperienceLoaded::FDelegate::CreateUObject(
-                this, &UMyPawnComponent::OnExperienceReady));
+        if (UMyExperienceManagerComponent* ExperienceManager =
+            GameStateBase->FindComponentByClass<UMyExperienceManagerComponent>())
+        {
+            ExperienceManager->CallOrRegister_OnExperienceLoaded(
+                FMyOnExperienceLoaded::FDelegate::CreateUObject(
+                    this, &UMyPawnComponent::OnExperienceReady));
+        }
     }
 }
 
-void UMyPawnComponent::OnExperienceReady(const UExperienceDefinition* Experience)
+void UMyPawnComponent::OnExperienceReady(const UMyExperienceDefinition* Experience)
 {
-    // All features active — safe to look up injected components, configure abilities, etc.
-    // Experience->DefaultPawnData contains pawn configuration for this mode
+    // All feature plugins are active: injected components exist and can be configured.
 }
 ```
 
----
-
-## Feature Composition Example
-
-A Deathmatch experience composed from modular features:
-
-```
-B_Deathmatch (UExperienceDefinition)
-├── GameFeaturesToEnable:
-│   ├── "ShooterCore"        → Health, weapons, HUD, hit detection
-│   ├── "DeathmatchRules"    → Score tracking, kill feed, respawn timer
-│   └── "TeamSystem"         → Team assignment, team colors, team HUD
-├── Actions:
-│   └── AddComponents: DeathmatchScoreComponent → AGameState
-└── DefaultPawnData: BP_ShooterCharacter
-```
-
-Switching to Control Point mode replaces `DeathmatchRules` with `ControlPointRules` while
-keeping `ShooterCore` and `TeamSystem`. This avoids duplicating shared gameplay code and
-allows features to be developed and tested independently.
+For per-actor ordering inside one experience, prefer the engine's init-state system
+(`UGameFrameworkComponentManager::ChangeFeatureInitState` and
+`IGameFrameworkInitStateInterface`) over experience-level waiting; see the Init State System section
+of this skill.

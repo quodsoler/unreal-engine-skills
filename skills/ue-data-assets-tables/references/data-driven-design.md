@@ -1,37 +1,39 @@
 # Data-Driven Design in Unreal Engine
 
-Patterns for structuring game data using `UDataAsset`, `UPrimaryDataAsset`, and `UDataTable` so designers control gameplay values without C++ changes.
+Patterns for structuring game data with `UDataAsset`, `UPrimaryDataAsset`, `UDataTable` and `UDeveloperSettings` so designers control gameplay values without C++ changes. Target engine: **UE 5.8**.
 
 ---
 
 ## Core Principle
 
-Data-driven design separates **what** (values, configurations, relationships) from **how** (C++ logic). C++ defines the schema; designers populate instances in the editor or spreadsheets.
+C++ defines the schema; designers populate instances in the editor or in spreadsheets.
 
 | Layer | Owner | Tool |
 |---|---|---|
 | Data schema | Programmer | C++ `USTRUCT` / `UCLASS` |
 | Data values | Designer | Data Asset editor, CSV/JSON |
-| Data loading | Programmer | Asset Manager, soft refs |
+| Data loading | Programmer | Asset Manager, soft references |
 | Data consumption | Programmer | `FindRow`, `GetPrimaryAssetObject` |
 
 ---
 
-## Pattern A: Item / Ability Definitions (UPrimaryDataAsset)
+## Pattern A: Item / Ability Definitions (`UPrimaryDataAsset`)
 
-Best when each item has unique properties, may need Blueprint extension, and should integrate with the Asset Manager for selective loading.
-
-### Schema
+Best when each entry has unique properties, may need Blueprint extension, and should integrate with the Asset Manager for selective loading.
 
 ```cpp
-// ItemDefinition.h
+// MyItemDefinition.h
 #pragma once
+
+#include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
-#include "GameplayTagContainer.h"
-#include "ItemDefinition.generated.h"
+#include "MyItemDefinition.generated.h"
+
+class UStaticMesh;
+class UTexture2D;   // TSoftObjectPtr<T> needs T declared; neither DataAsset.h nor CoreMinimal.h declares them
 
 UENUM(BlueprintType)
-enum class EItemRarity : uint8
+enum class EMyItemRarity : uint8
 {
     Common,
     Uncommon,
@@ -40,11 +42,11 @@ enum class EItemRarity : uint8
 };
 
 UCLASS(BlueprintType)
-class MYGAME_API UItemDefinition : public UPrimaryDataAsset
+class MYGAME_API UMyItemDefinition : public UPrimaryDataAsset
 {
     GENERATED_BODY()
+
 public:
-    // Identity
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Item")
     FText DisplayName;
 
@@ -52,121 +54,115 @@ public:
     FText Description;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Item")
-    EItemRarity Rarity = EItemRarity::Common;
+    EMyItemRarity Rarity = EMyItemRarity::Common;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Item",
-              AssetRegistrySearchable)
-    FGameplayTagContainer ItemTags;
+    /** Searchable so the Asset Registry can filter categories without loading. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Item", AssetRegistrySearchable)
+    FName ItemCategory;
 
-    // Stats
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats")
     float BaseDamage = 0.f;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats")
     int32 MaxStack = 1;
 
-    // UI bundle: loaded in inventory screen.
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Art",
-              meta = (AssetBundles = "UI"))
+    /** UI bundle: loaded for the inventory screen. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Art", meta = (AssetBundles = "UI"))
     TSoftObjectPtr<UTexture2D> Icon;
 
-    // Game bundle: loaded in the world.
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Art",
-              meta = (AssetBundles = "Game"))
+    /** Game bundle: loaded when the item can appear in the world. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Art", meta = (AssetBundles = "Game"))
     TSoftObjectPtr<UStaticMesh> WorldMesh;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Spawning",
-              meta = (AssetBundles = "Game"))
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Spawning", meta = (AssetBundles = "Game"))
     TSoftClassPtr<AActor> DroppedActorClass;
 };
 ```
 
-### DefaultGame.ini Registration
+### Registration
 
 ```ini
+; DefaultGame.ini
 [/Script/Engine.AssetManagerSettings]
-+PrimaryAssetTypesToScan=(
-    PrimaryAssetType="ItemDefinition",
-    AssetBaseClass=/Script/MyGame.ItemDefinition,
-    bHasBlueprintClasses=False,
-    bIsEditorOnly=False,
-    Directories=((Path="/Game/Data/Items")),
-    Rules=(Priority=1,ChunkId=-1,bApplyRecursively=True,CookRule=AlwaysCook))
++PrimaryAssetTypesToScan=(PrimaryAssetType="MyItemDefinition",AssetBaseClass="/Script/MyGame.MyItemDefinition",bHasBlueprintClasses=False,bIsEditorOnly=False,Directories=((Path="/Game/Data/Items")),Rules=(Priority=1,ChunkId=-1,bApplyRecursively=True,CookRule=AlwaysCook))
 ```
 
-### Discovery and Loading
+Set `bHasBlueprintClasses=True` and point `Directories` at the Blueprint folder when designers author Data Only Blueprints instead of Data Asset instances; the scanned objects are then `UClass` objects and you read them with `GetPrimaryAssetObjectClass<UMyItemDefinition>()`.
+
+### Discovery and loading
 
 ```cpp
-// Get all item IDs (no assets loaded yet).
+UAssetManager& AM = UAssetManager::Get();
+
+// Ids only; nothing is loaded yet.
 TArray<FPrimaryAssetId> AllItemIds;
-UAssetManager::Get().GetPrimaryAssetIdList(
-    FPrimaryAssetType(TEXT("ItemDefinition")), AllItemIds);
+AM.GetPrimaryAssetIdList(FPrimaryAssetType(TEXT("MyItemDefinition")), AllItemIds);
 
-// Filter by tag using Asset Registry (no load).
+// Filter without loading, using the AssetRegistrySearchable tag.
 IAssetRegistry& AR = IAssetRegistry::GetChecked();
+FARFilter Filter;
+Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/MyGame"), TEXT("MyItemDefinition")));
+Filter.bRecursiveClasses = true;
+Filter.TagsAndValues.Add(FName(TEXT("ItemCategory")), TOptional<FString>(TEXT("Melee")));
+
 TArray<FAssetData> MeleeAssets;
-AR.GetAssetsByClass(
-    FTopLevelAssetPath(TEXT("/Script/MyGame"), TEXT("ItemDefinition")),
-    MeleeAssets, true);
+AR.GetAssets(Filter, MeleeAssets);
 
-// Load UI bundle for inventory.
-UAssetManager::Get().LoadPrimaryAssetsWithType(
-    FPrimaryAssetType(TEXT("ItemDefinition")),
-    { TEXT("UI") });
+// Load the UI bundle for the whole type.
+AM.LoadPrimaryAssetsWithType(
+    FPrimaryAssetType(TEXT("MyItemDefinition")),
+    TArray<FName>{ TEXT("UI") });
 
-// After callback: retrieve a specific item.
-FPrimaryAssetId SwordId(TEXT("ItemDefinition"), TEXT("DA_Sword"));
-UItemDefinition* Sword =
-    UAssetManager::Get().GetPrimaryAssetObject<UItemDefinition>(SwordId);
+// After the callback, resolve one definition.
+const FPrimaryAssetId SwordId(FPrimaryAssetType(TEXT("MyItemDefinition")), FName(TEXT("DA_Sword")));
+UMyItemDefinition* Sword = AM.GetPrimaryAssetObject<UMyItemDefinition>(SwordId);
 ```
 
 ---
 
-## Pattern B: Stat Tables (UDataTable)
+## Pattern B: Stat Tables (`UDataTable`)
 
-Best for large, flat, designer-authored datasets where all rows share the same shape: XP curves, damage falloff, NPC dialogue, loot drop weights.
-
-### Row Struct
+Best for large, flat, designer-authored datasets where every row has the same shape: XP curves, damage falloff, dialogue, loot weights.
 
 ```cpp
-// XPTableRow.h
+// MyXPTableRow.h
 #pragma once
+
+#include "CoreMinimal.h"
 #include "Engine/DataTable.h"
-#include "XPTableRow.generated.h"
+#include "MyXPTableRow.generated.h"
 
 USTRUCT(BlueprintType)
-struct FXPTableRow : public FTableRowBase
+struct FMyXPTableRow : public FTableRowBase
 {
     GENERATED_BODY()
 
-    /** Player level. Also used as the row name in the DataTable. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    /** Player level. Also used as part of the row name. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Progression")
     int32 Level = 1;
 
     /** XP required to reach this level from the previous one. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Progression")
     int32 XPRequired = 0;
 
     /** Stat multiplier applied at this level. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Progression")
     float StatMultiplier = 1.f;
 
-    // Validate row after import.
-    virtual void OnPostDataImport(const UDataTable* InDataTable,
-                                  const FName InRowName,
-                                  TArray<FString>& OutCollectedImportProblems) override
+    virtual void OnPostDataImport(const UDataTable* InDataTable, const FName InRowName, TArray<FString>& OutCollectedImportProblems) override
     {
         if (XPRequired < 0)
         {
             OutCollectedImportProblems.Add(
-                FString::Printf(TEXT("Row '%s': XPRequired cannot be negative."),
-                                *InRowName.ToString()));
+                FString::Printf(TEXT("Row '%s': XPRequired cannot be negative."), *InRowName.ToString()));
         }
     }
 };
 ```
 
-### CSV Format
+`FTableRowBase` also declares `OnDataTableChanged(const UDataTable*, const FName)` — called for every row whenever the table is edited or `HandleDataTableChanged()` runs — and, inside `#if WITH_EDITOR`, `IsDataValid(FDataValidationContext&) const`.
+
+### CSV format
 
 ```csv
 ---,Level,XPRequired,StatMultiplier
@@ -176,45 +172,55 @@ Level_3,3,250,1.10
 Level_4,4,500,1.15
 ```
 
-The first column (`---` or `Name`) is the row name. Import via: DataTable asset > Import > select CSV.
+The first column (`---` or `Name`) is the row name. Import through the DataTable asset's Reimport button, or call `CreateTableFromCSVString` at runtime once `RowStruct` is set.
 
-### Runtime Lookup
+### Runtime lookup
 
 ```cpp
-// Stored as a hard reference because it is small and always needed.
+// MyLevelingComponent.h — member
 UPROPERTY(EditDefaultsOnly, Category = "Data")
 TObjectPtr<UDataTable> XPTable;
+```
 
-FXPTableRow* ULevelingComponent::GetRowForLevel(int32 Level) const
+```cpp
+const FMyXPTableRow* UMyLevelingComponent::GetRowForLevel(int32 Level) const
 {
-    if (!XPTable) { return nullptr; }
-    FName RowName = FName(*FString::Printf(TEXT("Level_%d"), Level));
-    return XPTable->FindRow<FXPTableRow>(RowName, TEXT("GetRowForLevel"));
+    if (!XPTable)
+    {
+        return nullptr;
+    }
+    const FName RowName = FName(*FString::Printf(TEXT("Level_%d"), Level));
+    return XPTable->FindRow<FMyXPTableRow>(RowName, TEXT("GetRowForLevel"));
 }
 
-int32 ULevelingComponent::GetXPToNextLevel(int32 CurrentLevel) const
+int32 UMyLevelingComponent::GetXPToNextLevel(int32 CurrentLevel) const
 {
-    const FXPTableRow* Row = GetRowForLevel(CurrentLevel + 1);
+    const FMyXPTableRow* Row = GetRowForLevel(CurrentLevel + 1);
     return Row ? Row->XPRequired : 0;
 }
 ```
 
+The table is a hard `TObjectPtr` here because it is small and always needed. Use `TSoftObjectPtr<UDataTable>` when the table only matters in one mode or level.
+
 ---
 
-## Pattern C: Config Objects (UDataAsset — Not Primary)
+## Pattern C: Config Objects (plain `UDataAsset`)
 
-Use plain `UDataAsset` (not Primary) for global configuration that is always loaded with the referencing class, is not addressable by ID, and does not need Asset Manager integration.
+Use plain `UDataAsset` for configuration that is always loaded with whoever references it, is not addressable by id, and needs no Asset Manager integration.
 
 ```cpp
-// GameBalanceConfig.h
+// MyGameBalanceConfig.h
 #pragma once
+
+#include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
-#include "GameBalanceConfig.generated.h"
+#include "MyGameBalanceConfig.generated.h"
 
 UCLASS(BlueprintType)
-class MYGAME_API UGameBalanceConfig : public UDataAsset
+class MYGAME_API UMyGameBalanceConfig : public UDataAsset
 {
     GENERATED_BODY()
+
 public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Economy")
     int32 StartingGold = 100;
@@ -224,155 +230,218 @@ public:
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat")
     float GlobalDamageScale = 1.f;
-
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat")
-    float CritMultiplier = 2.f;
 };
 ```
 
-Reference from GameMode or GameInstance with a hard `TObjectPtr`:
-
-```cpp
-UPROPERTY(EditDefaultsOnly, Category = "Config")
-TObjectPtr<UGameBalanceConfig> BalanceConfig;
-```
+Reference it from the GameMode or GameInstance with a hard `TObjectPtr<UMyGameBalanceConfig>`.
 
 ---
 
-## Pattern D: Hybrid — DataAsset with DataTable Reference
+## Pattern D: Hybrid — Data Asset plus Data Table
 
-An item definition holds a soft reference to a DataTable for per-tier stat scaling, while the DataAsset handles identity and art.
+An item definition owns identity and art; a soft-referenced table carries per-tier scaling.
 
 ```cpp
-UCLASS(BlueprintType)
-class MYGAME_API UWeaponDefinition : public UPrimaryDataAsset
+// MyWeaponScalingRow.h
+USTRUCT(BlueprintType)
+struct FMyWeaponScalingRow : public FTableRowBase
 {
     GENERATED_BODY()
-public:
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Weapon")
-    FText WeaponName;
 
-    // Reference to a scaling table — loaded on demand.
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats",
-              meta = (AssetBundles = "Game"))
-    TSoftObjectPtr<UDataTable> ScalingTable;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scaling")
+    float Damage = 0.f;
 
-    float GetDamageAtTier(int32 Tier) const
-    {
-        // ScalingTable must already be loaded (via bundle).
-        UDataTable* Table = ScalingTable.Get();
-        if (!Table) { return 0.f; }
-
-        FName RowName = FName(*FString::Printf(TEXT("Tier_%d"), Tier));
-        const FWeaponScalingRow* Row =
-            Table->FindRow<FWeaponScalingRow>(RowName, TEXT("GetDamageAtTier"));
-        return Row ? Row->Damage : 0.f;
-    }
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scaling")
+    float CritChance = 0.f;
 };
+```
+
+```cpp
+// Inside UMyWeaponDefinition : public UPrimaryDataAsset
+UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats", meta = (AssetBundles = "Game"))
+TSoftObjectPtr<UDataTable> ScalingTable;
+
+float UMyWeaponDefinition::GetDamageAtTier(int32 Tier) const
+{
+    // The Game bundle must already be loaded.
+    UDataTable* Table = ScalingTable.Get();
+    if (!Table)
+    {
+        return 0.f;
+    }
+
+    const FName RowName = FName(*FString::Printf(TEXT("Tier_%d"), Tier));
+    const FMyWeaponScalingRow* Row = Table->FindRow<FMyWeaponScalingRow>(RowName, TEXT("GetDamageAtTier"));
+    return Row ? Row->Damage : 0.f;
+}
 ```
 
 ---
 
 ## Pattern E: Subsystem as Data Gateway
 
-A `UGameInstanceSubsystem` caches loaded data assets after initial scan, providing a central access point that avoids repeated Asset Manager calls throughout the codebase.
+A `UGameInstanceSubsystem` scans once and caches, so the rest of the codebase never touches the Asset Manager directly.
 
 ```cpp
-// ItemSubsystem.h
+// MyItemSubsystem.h
 #pragma once
+
+#include "CoreMinimal.h"
+#include "Engine/StreamableManager.h"
 #include "Subsystems/GameInstanceSubsystem.h"
-#include "ItemSubsystem.generated.h"
+#include "MyItemSubsystem.generated.h"
+
+class UMyItemDefinition;
 
 UCLASS()
-class MYGAME_API UItemSubsystem : public UGameInstanceSubsystem
+class MYGAME_API UMyItemSubsystem : public UGameInstanceSubsystem
 {
     GENERATED_BODY()
+
 public:
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
+    virtual void Deinitialize() override;
 
-    UItemDefinition* GetItemById(const FPrimaryAssetId& Id) const;
-    TArray<UItemDefinition*> GetItemsByTag(FGameplayTag Tag) const;
+    UMyItemDefinition* GetItemById(const FPrimaryAssetId& Id) const;
 
 private:
     void OnItemsLoaded();
 
-    TMap<FPrimaryAssetId, TObjectPtr<UItemDefinition>> ItemCache;
+    UPROPERTY()
+    TMap<FPrimaryAssetId, TObjectPtr<UMyItemDefinition>> ItemCache;
+
     TSharedPtr<FStreamableHandle> LoadHandle;
 };
 ```
 
 ```cpp
-// ItemSubsystem.cpp
-void UItemSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+// MyItemSubsystem.cpp
+#include "MyItemSubsystem.h"
+
+#include "Engine/AssetManager.h"
+#include "MyItemDefinition.h"
+
+void UMyItemSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
 
     UAssetManager& AM = UAssetManager::Get();
     TArray<FPrimaryAssetId> ItemIds;
-    AM.GetPrimaryAssetIdList(FPrimaryAssetType(TEXT("ItemDefinition")), ItemIds);
+    AM.GetPrimaryAssetIdList(FPrimaryAssetType(TEXT("MyItemDefinition")), ItemIds);
 
     LoadHandle = AM.LoadPrimaryAssets(
         ItemIds,
-        { TEXT("UI") },
-        FStreamableDelegate::CreateUObject(this, &UItemSubsystem::OnItemsLoaded));
+        TArray<FName>{ TEXT("UI") },
+        FStreamableDelegate::CreateUObject(this, &UMyItemSubsystem::OnItemsLoaded));
 }
 
-void UItemSubsystem::OnItemsLoaded()
+void UMyItemSubsystem::Deinitialize()
+{
+    LoadHandle.Reset();
+    ItemCache.Reset();
+
+    Super::Deinitialize();
+}
+
+void UMyItemSubsystem::OnItemsLoaded()
 {
     UAssetManager& AM = UAssetManager::Get();
+
     TArray<UObject*> LoadedObjects;
-    AM.GetPrimaryAssetObjectList(FPrimaryAssetType(TEXT("ItemDefinition")), LoadedObjects);
+    AM.GetPrimaryAssetObjectList(FPrimaryAssetType(TEXT("MyItemDefinition")), LoadedObjects);
 
     for (UObject* Obj : LoadedObjects)
     {
-        if (UItemDefinition* Item = Cast<UItemDefinition>(Obj))
+        if (UMyItemDefinition* Item = Cast<UMyItemDefinition>(Obj))
         {
             ItemCache.Add(Item->GetPrimaryAssetId(), Item);
         }
     }
 }
 
-UItemDefinition* UItemSubsystem::GetItemById(const FPrimaryAssetId& Id) const
+UMyItemDefinition* UMyItemSubsystem::GetItemById(const FPrimaryAssetId& Id) const
 {
-    const TObjectPtr<UItemDefinition>* Found = ItemCache.Find(Id);
+    const TObjectPtr<UMyItemDefinition>* Found = ItemCache.Find(Id);
     return Found ? Found->Get() : nullptr;
 }
+```
 
-TArray<UItemDefinition*> UItemSubsystem::GetItemsByTag(FGameplayTag Tag) const
+Primary assets stay resident until `UnloadPrimaryAssets`, so the cached pointers remain valid; the `UPROPERTY()` on `ItemCache` keeps them visible to the garbage collector regardless.
+
+---
+
+## Pattern F: Project Settings (`UDeveloperSettings`)
+
+For a handful of global, programmer-owned tunables that belong in Project Settings rather than in a content asset.
+
+```cpp
+// MyGameSettings.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Engine/DeveloperSettings.h"
+#include "MyGameSettings.generated.h"
+
+class UDataTable;
+
+UCLASS(config = Game, defaultconfig, meta = (DisplayName = "My Game"))
+class MYGAME_API UMyGameSettings : public UDeveloperSettings
 {
-    TArray<UItemDefinition*> Results;
-    for (const auto& Pair : ItemCache)
-    {
-        if (Pair.Value && Pair.Value->ItemTags.HasTag(Tag))
-        {
-            Results.Add(Pair.Value);
-        }
-    }
-    return Results;
+    GENERATED_BODY()
+
+public:
+    UPROPERTY(config, EditAnywhere, Category = "Economy")
+    int32 StartingGold = 100;
+
+    UPROPERTY(config, EditAnywhere, Category = "Data")
+    TSoftObjectPtr<UDataTable> ItemTable;
+
+    virtual FName GetCategoryName() const override;
+};
+```
+
+```cpp
+// MyGameSettings.cpp
+#include "MyGameSettings.h"
+
+FName UMyGameSettings::GetCategoryName() const
+{
+    return FName(TEXT("Game"));
 }
 ```
+
+```cpp
+const UMyGameSettings* Settings = GetDefault<UMyGameSettings>();
+const int32 Gold = Settings->StartingGold;
+```
+
+`config = Game` plus `defaultconfig` writes `DefaultGame.ini` under `[/Script/MyGame.MyGameSettings]`. The Build.cs dependency is `DeveloperSettings`.
 
 ---
 
 ## When to Use Each Approach
 
-| Scenario | Recommended Approach |
+| Scenario | Approach |
 |---|---|
-| Per-item configs, ~10–500 items, designers use editor | `UPrimaryDataAsset` + Asset Manager |
-| Large flat tables, designers use Excel/Sheets | `UDataTable` + CSV import |
-| Global game settings, always in memory | `UDataAsset` (plain), hard reference |
-| Server-only data (drop rates, economy) | `UDataTable` with `bStripFromClientBuilds=true` |
-| Items with stat scaling per tier | Hybrid: PrimaryDataAsset + soft ref to DataTable |
-| Runtime-generated content | `UDataTable::AddRow`, or dynamic `FPrimaryAssetId` via `AddDynamicAsset` |
-| Querying without loading | `IAssetRegistry::GetAssetsByClass` + `FAssetData` |
+| Per-item configs, designers work in the editor | `UPrimaryDataAsset` + Asset Manager |
+| Large flat tables, designers work in a spreadsheet | `UDataTable` + CSV import |
+| Global settings, always in memory | plain `UDataAsset`, hard reference |
+| Global settings owned by programmers | `UDeveloperSettings` |
+| Base rows plus DLC or platform overrides | `UCompositeDataTable` |
+| Server-only data (drop rates, economy) | `UDataTable` with `bStripFromClientBuilds` |
+| Items with per-tier scaling | Data asset + soft reference to a `UDataTable` |
+| Runtime-generated content | `UDataTable::AddRow`, or `UAssetManager::AddDynamicAsset` |
+| Querying without loading | `IAssetRegistry::GetAssets` + `FAssetData` |
+| One id resolved across several sources | `UDataRegistrySubsystem` (Beta in 5.8) |
 
 ---
 
 ## Designer Workflow Checklist
 
-1. **C++ schema merged**: Row struct or DataAsset class is compiled and visible in the editor.
-2. **Asset registered**: `DefaultGame.ini` has the correct `PrimaryAssetTypesToScan` entry (for PrimaryDataAssets).
-3. **Editor asset created**: Data Asset instances or DataTable created in Content Browser under the scanned path.
-4. **Data populated**: Fields filled in the editor or CSV imported.
-5. **Cook verified**: Launch a development cook and confirm assets appear in the cooked output. Check for "Asset not in cook" warnings in the log.
-6. **Bundle states tested**: Verify UI bundle loads in menus and Game bundle loads during gameplay without performance spikes.
+1. **Schema compiled**: the row struct or data asset class is visible in the editor.
+2. **Type registered**: `DefaultGame.ini` has the matching `PrimaryAssetTypesToScan` entry, or `ScanPathsForPrimaryAssets` runs at startup.
+3. **Assets created**: instances live under one of the scanned `Directories`.
+4. **Data populated**: fields filled in the editor, or CSV/JSON imported.
+5. **Cook verified**: run a development cook and confirm the assets appear in the output; check the log for assets excluded by their `EPrimaryAssetCookRule`.
+6. **Bundle states tested**: the UI bundle loads in menus and the Game bundle loads on gameplay entry without a hitch.
+7. **Memory checked**: no `TObjectPtr` to heavy content on a definition that ships in every build.

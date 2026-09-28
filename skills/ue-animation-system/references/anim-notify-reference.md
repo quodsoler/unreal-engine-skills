@@ -1,8 +1,10 @@
-# Anim Notify Reference
+# Anim Notify Reference (UE 5.8)
 
 Source headers:
 - `Engine/Source/Runtime/Engine/Classes/Animation/AnimNotifies/AnimNotify.h`
 - `Engine/Source/Runtime/Engine/Classes/Animation/AnimNotifies/AnimNotifyState.h`
+- `Engine/Source/Runtime/Engine/Public/Animation/AnimTypes.h` (`FAnimNotifyEvent`)
+- `Engine/Source/Runtime/Engine/Public/Animation/AnimNotifyQueue.h` (`FAnimNotifyEventReference`, `FAnimNotifyQueue`)
 
 ---
 
@@ -10,396 +12,416 @@ Source headers:
 
 ```
 UObject
-  ├── UAnimNotify              (point-in-time event)
-  └── UAnimNotifyState         (duration event: Begin / Tick / End)
+  ├── UAnimNotify          point-in-time event      (AnimNotify.h:51)
+  └── UAnimNotifyState     duration event           (AnimNotifyState.h:34)
 ```
 
-### UAnimNotify — Key Virtual Methods
+Both are `UCLASS(abstract, editinlinenew, Blueprintable, const, ...)`, so a notify
+object is shared by every instance playing the animation. Keep no per-character
+state on the notify itself; read what you need from `MeshComp`.
+
+### UAnimNotify — virtuals
 
 ```cpp
-// UE5 signature (always override this one; UE4 signature is deprecated)
-virtual void Notify(
-    USkeletalMeshComponent* MeshComp,
-    UAnimSequenceBase* Animation,
+// AnimNotify.h:85-86
+virtual void Notify(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation,
     const FAnimNotifyEventReference& EventReference);
-
-// Fires synchronously during Montage_Advance (only when bIsNativeBranchingPoint = true)
 virtual void BranchingPointNotify(FBranchingPointNotifyPayload& BranchingPointPayload);
-
-// Display name shown in the editor timeline
-virtual FString GetNotifyName_Implementation() const;
 ```
 
-### UAnimNotifyState — Key Virtual Methods
+```cpp
+// BlueprintNativeEvent declarations (AnimNotify.h:59, :95)
+FString GetNotifyName() const;                 // override GetNotifyName_Implementation
+float GetDefaultTriggerWeightThreshold() const; // override ..._Implementation
+```
+
+`Received_Notify(USkeletalMeshComponent*, UAnimSequenceBase*, const FAnimNotifyEventReference&) const`
+(`AnimNotify.h:62`) is a `BlueprintImplementableEvent`. It is the Blueprint entry
+point only — implement it in a Blueprint notify, never override it in C++.
+
+### UAnimNotifyState — virtuals
 
 ```cpp
-// UE5 signatures
-virtual void NotifyBegin(USkeletalMeshComponent* MeshComp,
-    UAnimSequenceBase* Animation, float TotalDuration,
+// AnimNotifyState.h:74-80
+virtual void NotifyBegin(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation,
+    float TotalDuration, const FAnimNotifyEventReference& EventReference);
+virtual void NotifyTick(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation,
+    float FrameDeltaTime, const FAnimNotifyEventReference& EventReference);
+virtual void NotifyEnd(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation,
     const FAnimNotifyEventReference& EventReference);
 
-virtual void NotifyTick(USkeletalMeshComponent* MeshComp,
-    UAnimSequenceBase* Animation, float FrameDeltaTime,
-    const FAnimNotifyEventReference& EventReference);
-
-virtual void NotifyEnd(USkeletalMeshComponent* MeshComp,
-    UAnimSequenceBase* Animation,
-    const FAnimNotifyEventReference& EventReference);
-
-// Branching point variants (synchronous during Montage_Advance)
-virtual void BranchingPointNotifyBegin(FBranchingPointNotifyPayload& Payload);
-virtual void BranchingPointNotifyTick(FBranchingPointNotifyPayload& Payload, float DeltaTime);
-virtual void BranchingPointNotifyEnd(FBranchingPointNotifyPayload& Payload);
+virtual void BranchingPointNotifyBegin(FBranchingPointNotifyPayload& BranchingPointPayload);
+virtual void BranchingPointNotifyTick(FBranchingPointNotifyPayload& BranchingPointPayload,
+    float FrameDeltaTime);
+virtual void BranchingPointNotifyEnd(FBranchingPointNotifyPayload& BranchingPointPayload);
 ```
 
----
+Blueprint entry points (`AnimNotifyState.h:45-51`): `Received_NotifyBegin`,
+`Received_NotifyTick`, `Received_NotifyEnd` — same rule, Blueprint only.
 
-## Built-In Notifies (Engine-Provided)
-
-### UAnimNotify_PlaySound
-
-**Header**: `AnimNotify_PlaySound.h`
-
-Plays a `USoundBase` at a socket location when the notify fires.
-
-Key properties:
-```cpp
-UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
-TObjectPtr<USoundBase> Sound;
-
-UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
-float VolumeMultiplier = 1.f;
-
-UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
-float PitchMultiplier = 1.f;
-
-UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
-uint32 bFollow : 1;   // if true, sound component follows the socket
-
-UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify",
-    meta=(EditCondition="bFollow"))
-FName AttachName;     // socket or bone to attach to
-```
-
-Use for: footsteps, impacts, voice barks, weapon sounds.
+`GetNotifyName() const` is a `BlueprintNativeEvent` here too (`AnimNotifyState.h:42`).
 
 ---
 
-### UAnimNotify_PlayParticleEffect
+## FAnimNotifyEvent and FAnimNotifyEventReference
 
-**Header**: `AnimNotify_PlayParticleEffect.h`
+`FAnimNotifyEvent : public FAnimLinkableElement` (`Public/Animation/AnimTypes.h:276`)
+is the placed event on the timeline. Fields you will actually read:
 
-Spawns a `UParticleSystem` at a socket location.
+| Field | Type | Meaning |
+|---|---|---|
+| `NotifyName` | `FName` | Name shown on the track; what `OnPlayMontageNotifyBegin` passes you |
+| `Notify` | `TObjectPtr<UAnimNotify>` | Instanced point-in-time notify object, or null |
+| `NotifyStateClass` | `TObjectPtr<UAnimNotifyState>` | Instanced duration notify object, or null |
+| `Duration` | `float` | Length of a notify state; 0 for a point notify |
+| `TriggerWeightThreshold` | `float` | Minimum blend weight required to fire |
+| `NotifyTriggerChance` | `float` | 0–1 probability the notify fires |
+| `MontageTickType` | `TEnumAsByte<EMontageNotifyTickType::Type>` | `Queued` or `BranchingPoint` |
 
-Key properties:
-```cpp
-UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
-TObjectPtr<UParticleSystem> PSTemplate;
+Accessors (`AnimTypes.h:408-418`): `GetTriggerTime()`, `GetEndTriggerTime()`,
+`GetDuration()`, `SetDuration(float)`, `IsBranchingPoint()`.
 
-UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
-FName SocketName;
-
-UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
-FVector LocationOffset;
-
-UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
-FRotator RotationOffset;
-
-UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
-bool bAttached;   // false = spawned at socket, not parented
-```
-
-Use for: muzzle flashes, hit sparks, ability cast effects.
+`FAnimNotifyEventReference` (`Public/Animation/AnimNotifyQueue.h:21`) wraps the event
+plus its source object and optional mirror table. Use `GetNotify()` (`:40`) to reach
+the `const FAnimNotifyEvent*`; it can be null, so check it.
 
 ---
 
-### UAnimNotifyState_TimedParticleEffect
+## Timing: queued vs branching point
 
-**Header**: `AnimNotifyState_TimedParticleEffect.h`
+`EMontageNotifyTickType::Type` (`Public/Animation/AnimTypes.h:86-95`):
 
-Activates a looping `UParticleSystem` for the duration of the notify state.
-Deactivates (or destroys) on end.
+| Value | Fires | Header note |
+|---|---|---|
+| `Queued` | at the end of the evaluation phase | faster; "not suitable for changing sections or montage position" |
+| `BranchingPoint` | as encountered during montage advance | slower; "suitable for changing sections or montage position" |
 
-Key properties:
-```cpp
-UPROPERTY(EditAnywhere, Category=ParticleSystem)
-TObjectPtr<UParticleSystem> PSTemplate;
+Per-event this is the `MontageTickType` field, set in the montage editor. A native
+notify can force the branching-point path for every placement by setting
+`bIsNativeBranchingPoint = true` in its constructor (`AnimNotify.h:123`,
+`AnimNotifyState.h:108`) and overriding the `BranchingPointNotify*` functions.
 
-UPROPERTY(EditAnywhere, Category=ParticleSystem)
-FName SocketName;
-
-UPROPERTY(EditAnywhere, Category=ParticleSystem)
-FVector LocationOffset;
-
-UPROPERTY(EditAnywhere, Category=ParticleSystem)
-FRotator RotationOffset;
-
-UPROPERTY(EditAnywhere, Category=ParticleSystem,
-    meta=(DisplayName="Destroy Immediately"))
-bool bDestroyAtEnd;  // false = allow particles to complete their cycle
-```
-
-Use for: weapon trails, aura effects, charged attack indicators.
+Queued notifies are collected in `FAnimNotifyQueue` (`AnimNotifyQueue.h:169`):
+`AddAnimNotify(const FAnimNotifyEvent* Notify, const UObject* NotifySource)` (`:186`)
+appends to `TArray<FAnimNotifyEventReference> AnimNotifies` (`:215`), which is drained
+after evaluation. That is why a `Montage_JumpToSection` issued from a queued notify
+takes effect one frame late.
 
 ---
 
-### UAnimNotifyState_DisableRootMotion
+## Built-in notifies
 
-**Header**: `AnimNotifyState_DisableRootMotion.h`
+| Class | Header | Key properties |
+|---|---|---|
+| `UAnimNotify_PlaySound` | `AnimNotifies/AnimNotify_PlaySound.h:16` | `Sound` (`TObjectPtr<USoundBase>`), `VolumeMultiplier`, `PitchMultiplier`, `bFollow`, `AttachName` |
+| `UAnimNotify_PlayParticleEffect` | `AnimNotifies/AnimNotify_PlayParticleEffect.h:17` | `PSTemplate`, `LocationOffset`, `RotationOffset`, `Scale`, `SocketName`, `Attached` |
+| `UAnimNotifyState_TimedParticleEffect` | `AnimNotifies/AnimNotifyState_TimedParticleEffect.h:17` | `PSTemplate`, `SocketName`, `LocationOffset`, `RotationOffset`, `bDestroyAtEnd` |
+| `UAnimNotifyState_Trail` | `AnimNotifies/AnimNotifyState_Trail.h:19` | `PSTemplate`, `FirstSocketName`, `SecondSocketName`, `WidthScaleMode`, `WidthScaleCurve` |
+| `UAnimNotifyState_DisableRootMotion` | `AnimNotifies/AnimNotifyState_DisableRootMotion.h:8` | no properties; suppresses root motion for its duration |
+| `UAnimNotify_PlayNiagaraEffect` | `Plugins/FX/Niagara/.../AnimNotify_PlayNiagaraEffect.h:19` | `Template` (`TObjectPtr<UNiagaraSystem>`), `LocationOffset`, `SocketName` |
+| `UAnimNotifyState_TimedNiagaraEffect` | `Plugins/FX/Niagara/.../AnimNotifyState_TimedNiagaraEffect.h:31` | `Template`, `SocketName`, `LocationOffset`, `bDestroyAtEnd` |
 
-Suppresses root motion extraction for the duration of the notify state.
-Internally calls `PushDisableRootMotion()` on `FAnimMontageInstance` and
-`PopDisableRootMotion()` at end.
-
-Use for: ragdoll transitions, ability phases where motion is physics-driven.
-
----
-
-### UAnimNotifyState_Trail
-
-**Header**: `AnimNotifyState_Trail.h`
-
-Spawns and manages a particle trail between two sockets. Used for sword trails,
-cape effects, etc.
+The two Niagara notifies live in the `NiagaraAnimNotifies` module — see `ue-niagara-effects`.
 
 ---
 
-## Custom Notify Patterns
-
-### Pattern 1 — Footstep with Surface Detection
+## Pattern 1 — point-in-time notify with a surface trace
 
 ```cpp
-// FootstepNotify.h
+// MyFootstepNotify.h
 #pragma once
-#include "Animation/AnimNotifies/AnimNotify.h"
-#include "FootstepNotify.generated.h"
 
-UCLASS(meta=(DisplayName="Footstep"))
-class MYGAME_API UFootstepNotify : public UAnimNotify
+#include "CoreMinimal.h"
+#include "Animation/AnimNotifies/AnimNotify.h"
+#include "MyFootstepNotify.generated.h"
+
+class UAnimSequenceBase;
+class USkeletalMeshComponent;
+class USoundBase;
+
+UCLASS(meta = (DisplayName = "My Footstep"))
+class MYGAME_API UMyFootstepNotify : public UAnimNotify
 {
     GENERATED_BODY()
 
 public:
-    UFootstepNotify()
+    UMyFootstepNotify()
     {
-        bIsNativeBranchingPoint = false; // queued, not synchronous
+        bIsNativeBranchingPoint = false; // queued: fine for SFX/VFX
     }
 
-    virtual void Notify(
-        USkeletalMeshComponent* MeshComp,
-        UAnimSequenceBase* Animation,
+    virtual void Notify(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation,
         const FAnimNotifyEventReference& EventReference) override;
 
-    virtual FString GetNotifyName_Implementation() const override
-    {
-        return FString::Printf(TEXT("Footstep_%s"), *FootSocket.ToString());
-    }
+    virtual FString GetNotifyName_Implementation() const override;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Footstep")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep")
     FName FootSocket = FName("foot_l");
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Footstep")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep")
     float TraceDistance = 75.f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep")
+    TMap<TEnumAsByte<EPhysicalSurface>, TObjectPtr<USoundBase>> SurfaceSounds;
 };
 ```
 
 ```cpp
-// FootstepNotify.cpp
-#include "FootstepNotify.h"
+// MyFootstepNotify.cpp
+#include "MyFootstepNotify.h"
 #include "Components/SkeletalMeshComponent.h"
-#include "PhysicalMaterials/PhysicalMaterial.h"
+#include "Engine/World.h"
 #include "Kismet/GameplayStatics.h"
+#include "PhysicalMaterials/PhysicalMaterial.h"
+#include "Sound/SoundBase.h"
 
-void UFootstepNotify::Notify(
-    USkeletalMeshComponent* MeshComp,
-    UAnimSequenceBase* Animation,
+FString UMyFootstepNotify::GetNotifyName_Implementation() const
+{
+    return FString::Printf(TEXT("Footstep_%s"), *FootSocket.ToString());
+}
+
+void UMyFootstepNotify::Notify(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation,
     const FAnimNotifyEventReference& EventReference)
 {
     Super::Notify(MeshComp, Animation, EventReference);
 
-    if (!MeshComp || !MeshComp->GetWorld()) return;
+    UWorld* World = MeshComp ? MeshComp->GetWorld() : nullptr;
+    if (!World)
+    {
+        return;
+    }
 
     const FVector SocketLoc = MeshComp->GetSocketLocation(FootSocket);
     const FVector TraceStart = SocketLoc + FVector(0.f, 0.f, 20.f);
-    const FVector TraceEnd   = SocketLoc - FVector(0.f, 0.f, TraceDistance);
+    const FVector TraceEnd = SocketLoc - FVector(0.f, 0.f, TraceDistance);
 
-    FHitResult Hit;
-    FCollisionQueryParams Params(SCENE_QUERY_STAT(FootstepTrace), true);
+    FCollisionQueryParams Params(SCENE_QUERY_STAT(MyFootstepTrace), true);
     Params.AddIgnoredActor(MeshComp->GetOwner());
     Params.bReturnPhysicalMaterial = true;
 
-    if (MeshComp->GetWorld()->LineTraceSingleByChannel(
-            Hit, TraceStart, TraceEnd, ECC_Visibility, Params))
+    FHitResult Hit;
+    if (World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_Visibility, Params))
     {
-        EPhysicalSurface Surface = UGameplayStatics::GetSurfaceType(Hit);
-        // Dispatch footstep event to a surface manager or audio system
-        // e.g. UFootstepSubsystem::Get(World)->PlayFootstep(Surface, Hit.ImpactPoint);
+        const EPhysicalSurface Surface = UGameplayStatics::GetSurfaceType(Hit);
+        if (USoundBase* Sound = SurfaceSounds.FindRef(Surface))
+        {
+            UGameplayStatics::PlaySoundAtLocation(World, Sound, Hit.ImpactPoint);
+        }
     }
 }
 ```
 
+`SurfaceSounds` keeps the notify itself stateless: the notify object is shared across
+every character playing the animation, so the only per-hit data lives in local variables.
+Build.cs: add `PhysicsCore` — `EPhysicalSurface` in a `UPROPERTY` is reflected from that
+module (`PhysicsCore/Public/Chaos/ChaosEngineInterface.h:20`), and the link fails without it.
+
 ---
 
-### Pattern 2 — Weapon Collision Window (NotifyState)
+## Pattern 2 — notify state as a collision window
 
 ```cpp
-// WeaponCollisionNotifyState.h
+// MyWeaponWindowNotifyState.h
 #pragma once
-#include "Animation/AnimNotifies/AnimNotifyState.h"
-#include "WeaponCollisionNotifyState.generated.h"
 
-UCLASS(meta=(DisplayName="Weapon Collision Window"))
-class MYGAME_API UWeaponCollisionNotifyState : public UAnimNotifyState
+#include "CoreMinimal.h"
+#include "Animation/AnimNotifies/AnimNotifyState.h"
+#include "MyWeaponWindowNotifyState.generated.h"
+
+class UAnimSequenceBase;
+class USkeletalMeshComponent;
+
+UCLASS(meta = (DisplayName = "My Weapon Collision Window"))
+class MYGAME_API UMyWeaponWindowNotifyState : public UAnimNotifyState
 {
     GENERATED_BODY()
 
 public:
-    virtual void NotifyBegin(
-        USkeletalMeshComponent* MeshComp,
-        UAnimSequenceBase* Animation,
-        float TotalDuration,
+    virtual void NotifyBegin(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation,
+        float TotalDuration, const FAnimNotifyEventReference& EventReference) override;
+
+    virtual void NotifyEnd(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation,
         const FAnimNotifyEventReference& EventReference) override;
 
-    virtual void NotifyEnd(
-        USkeletalMeshComponent* MeshComp,
-        UAnimSequenceBase* Animation,
-        const FAnimNotifyEventReference& EventReference) override;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Weapon")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon")
     FName WeaponComponentTag = FName("PrimaryWeapon");
 };
 ```
 
 ```cpp
-// WeaponCollisionNotifyState.cpp
-#include "WeaponCollisionNotifyState.h"
+// MyWeaponWindowNotifyState.cpp
+#include "MyWeaponWindowNotifyState.h"
+#include "Components/PrimitiveComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Actor.h"
 
-void UWeaponCollisionNotifyState::NotifyBegin(
-    USkeletalMeshComponent* MeshComp,
-    UAnimSequenceBase* Animation,
-    float TotalDuration,
+namespace
+{
+    UPrimitiveComponent* FindTaggedWeaponComponent(USkeletalMeshComponent* MeshComp, FName Tag)
+    {
+        AActor* Owner = MeshComp ? MeshComp->GetOwner() : nullptr;
+        if (!Owner)
+        {
+            return nullptr;
+        }
+
+        TArray<UActorComponent*> Found = Owner->GetComponentsByTag(UPrimitiveComponent::StaticClass(), Tag);
+        return Found.Num() > 0 ? Cast<UPrimitiveComponent>(Found[0]) : nullptr;
+    }
+}
+
+void UMyWeaponWindowNotifyState::NotifyBegin(USkeletalMeshComponent* MeshComp,
+    UAnimSequenceBase* Animation, float TotalDuration,
     const FAnimNotifyEventReference& EventReference)
 {
     Super::NotifyBegin(MeshComp, Animation, TotalDuration, EventReference);
 
-    if (!MeshComp) return;
-    AActor* Owner = MeshComp->GetOwner();
-    if (!Owner) return;
-
-    // Enable weapon collision via interface or component lookup
-    // IWeaponInterface::Execute_EnableCollision(WeaponActor);
+    if (UPrimitiveComponent* Weapon = FindTaggedWeaponComponent(MeshComp, WeaponComponentTag))
+    {
+        Weapon->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+    }
 }
 
-void UWeaponCollisionNotifyState::NotifyEnd(
-    USkeletalMeshComponent* MeshComp,
-    UAnimSequenceBase* Animation,
-    const FAnimNotifyEventReference& EventReference)
+void UMyWeaponWindowNotifyState::NotifyEnd(USkeletalMeshComponent* MeshComp,
+    UAnimSequenceBase* Animation, const FAnimNotifyEventReference& EventReference)
 {
     Super::NotifyEnd(MeshComp, Animation, EventReference);
 
-    if (!MeshComp) return;
-    AActor* Owner = MeshComp->GetOwner();
-    if (!Owner) return;
-
-    // Disable weapon collision
+    if (UPrimitiveComponent* Weapon = FindTaggedWeaponComponent(MeshComp, WeaponComponentTag))
+    {
+        Weapon->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    }
 }
 ```
 
+`NotifyEnd` also fires when the montage is interrupted or blended out early, so it is
+the right place to undo whatever `NotifyBegin` enabled.
+
 ---
 
-### Pattern 3 — BranchingPoint Notify (Synchronous, Montage)
-
-Use when you need to jump sections or stop a montage at a precise frame:
+## Pattern 3 — branching point notify that redirects a montage
 
 ```cpp
-// ComboBranchNotify.h
+// MyComboBranchNotify.h
 #pragma once
-#include "Animation/AnimNotifies/AnimNotify.h"
-#include "ComboBranchNotify.generated.h"
 
-UCLASS(meta=(DisplayName="Combo Branch Point"))
-class MYGAME_API UComboBranchNotify : public UAnimNotify
+#include "CoreMinimal.h"
+#include "Animation/AnimNotifies/AnimNotify.h"
+#include "MyComboBranchNotify.generated.h"
+
+UCLASS(meta = (DisplayName = "My Combo Branch Point"))
+class MYGAME_API UMyComboBranchNotify : public UAnimNotify
 {
     GENERATED_BODY()
 
 public:
-    UComboBranchNotify()
+    UMyComboBranchNotify()
     {
-        // Marks this notify as always synchronous on montages
-        bIsNativeBranchingPoint = true;
+        bIsNativeBranchingPoint = true; // synchronous during montage advance
     }
 
-    virtual void BranchingPointNotify(
-        FBranchingPointNotifyPayload& BranchingPointPayload) override;
+    virtual void BranchingPointNotify(FBranchingPointNotifyPayload& BranchingPointPayload) override;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Combo")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combo")
     FName NextSection = FName("ComboEnd");
 };
 ```
 
 ```cpp
-// ComboBranchNotify.cpp
-#include "ComboBranchNotify.h"
-#include "Animation/AnimMontage.h"
+// MyComboBranchNotify.cpp
+#include "MyComboBranchNotify.h"
 #include "Animation/AnimInstance.h"
 #include "Components/SkeletalMeshComponent.h"
 
-void UComboBranchNotify::BranchingPointNotify(
-    FBranchingPointNotifyPayload& Payload)
+void UMyComboBranchNotify::BranchingPointNotify(FBranchingPointNotifyPayload& BranchingPointPayload)
 {
-    Super::BranchingPointNotify(Payload);
+    Super::BranchingPointNotify(BranchingPointPayload);
 
-    if (!Payload.SkelMeshComponent) return;
+    if (!BranchingPointPayload.SkelMeshComponent)
+    {
+        return;
+    }
 
-    UAnimInstance* AnimInst =
-        Payload.SkelMeshComponent->GetAnimInstance();
-    if (!AnimInst) return;
-
-    // Redirect the montage timeline to a different section synchronously
-    AnimInst->Montage_JumpToSection(NextSection);
+    if (UAnimInstance* AnimInst = BranchingPointPayload.SkelMeshComponent->GetAnimInstance())
+    {
+        AnimInst->Montage_JumpToSection(NextSection);
+    }
 }
 ```
 
+`FBranchingPointNotifyPayload` (`AnimNotify.h:23-41`) carries `SkelMeshComponent`,
+`SequenceAsset`, `NotifyEvent`, `MontageInstanceID` and `bReachedEnd`.
+
 ---
 
-### Pattern 4 — Named Notify + AnimInstance Delegate
+## Pattern 4 — named montage notifies from outside the AnimInstance
 
-For gameplay events (enabling abilities, triggering GAS effects) tied to
-animation timing, use a **PlayMontageNotify** Blueprint node or the
-`FPlayMontageAnimNotifyDelegate`:
+`UAnimInstance` exposes two dynamic multicast delegates (`AnimInstance.h:1820-1823`):
 
 ```cpp
-// From AnimInstance.h:
 // DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FPlayMontageAnimNotifyDelegate,
 //     FName, NotifyName, const FBranchingPointNotifyPayload&, BranchingPointPayload);
+FPlayMontageAnimNotifyDelegate OnPlayMontageNotifyBegin;
+FPlayMontageAnimNotifyDelegate OnPlayMontageNotifyEnd;
+```
 
-// Bind in C++ to receive named notify events:
-void UMyAbilityComponent::BindMontageNotifies(UAnimInstance* AnimInst)
+```cpp
+// MyCombatComponent.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Components/ActorComponent.h"
+#include "MyCombatComponent.generated.h"
+
+class UAnimInstance;
+struct FBranchingPointNotifyPayload;
+
+UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
+class MYGAME_API UMyCombatComponent : public UActorComponent
 {
-    AnimInst->OnPlayMontageNotifyBegin.AddDynamic(
-        this, &UMyAbilityComponent::HandleNotifyBegin);
-    AnimInst->OnPlayMontageNotifyEnd.AddDynamic(
-        this, &UMyAbilityComponent::HandleNotifyEnd);
+    GENERATED_BODY()
+
+public:
+    void BindMontageNotifies(UAnimInstance* AnimInst);
+
+protected:
+    UFUNCTION()
+    void HandleMontageNotifyBegin(FName NotifyName, const FBranchingPointNotifyPayload& Payload);
+
+    UFUNCTION()
+    void HandleMontageNotifyEnd(FName NotifyName, const FBranchingPointNotifyPayload& Payload);
+
+    void ActivateHitDetection();
+    void DeactivateHitDetection();
+};
+```
+
+```cpp
+// MyCombatComponent.cpp
+#include "MyCombatComponent.h"
+#include "Animation/AnimInstance.h"
+
+void UMyCombatComponent::BindMontageNotifies(UAnimInstance* AnimInst)
+{
+    if (!AnimInst)
+    {
+        return;
+    }
+
+    AnimInst->OnPlayMontageNotifyBegin.AddDynamic(this, &UMyCombatComponent::HandleMontageNotifyBegin);
+    AnimInst->OnPlayMontageNotifyEnd.AddDynamic(this, &UMyCombatComponent::HandleMontageNotifyEnd);
 }
 
-void UMyAbilityComponent::HandleNotifyBegin(
-    FName NotifyName,
+void UMyCombatComponent::HandleMontageNotifyBegin(FName NotifyName,
     const FBranchingPointNotifyPayload& Payload)
 {
     if (NotifyName == FName("EnableHitbox"))
     {
         ActivateHitDetection();
     }
-    else if (NotifyName == FName("ApplyGameplayEffect"))
-    {
-        ApplyDamageEffect();
-    }
 }
 
-void UMyAbilityComponent::HandleNotifyEnd(
-    FName NotifyName,
+void UMyCombatComponent::HandleMontageNotifyEnd(FName NotifyName,
     const FBranchingPointNotifyPayload& Payload)
 {
     if (NotifyName == FName("EnableHitbox"))
@@ -409,78 +431,29 @@ void UMyAbilityComponent::HandleNotifyEnd(
 }
 ```
 
----
-
-## Tick Type Summary
-
-| Tick Type       | Synchronous? | Use Case                                      |
-|-----------------|-------------|-----------------------------------------------|
-| Queued          | No          | VFX, SFX, gameplay events (safe, no re-entry) |
-| BranchingPoint  | Yes         | Montage section jumps, precise loop control   |
-
-Set in the montage editor per-notify, or via `bIsNativeBranchingPoint = true`
-in the C++ constructor for native notifies.
+These fire for every named notify on any montage on that instance, so always filter by
+`NotifyName`, and call `RemoveDynamic` when the listener is destroyed. The callbacks
+must be `UFUNCTION()` because the delegate is dynamic.
 
 ---
 
-## Notify Firing on Linked Instances
+## Notifies across linked instances
 
-By default, notifies fire only on the AnimInstance that owns the animation.
-To propagate across linked layers:
+By default a notify fires on the instance that owns the animation. To cross the boundary:
 
 ```cpp
-// Main instance receives notifies from linked layers
-AnimInst->SetReceiveNotifiesFromLinkedInstances(true);
-
-// Linked layer propagates its notifies to the main instance
-AnimInst->SetPropagateNotifiesToLinkedInstances(true);
+// AnimInstance.h:523-531
+AnimInst->SetReceiveNotifiesFromLinkedInstances(true);  // main instance receives from layers
+AnimInst->SetPropagateNotifiesToLinkedInstances(true);  // source instance sends named notifies to all instances on the mesh
 ```
 
-Also controllable per-node in the `FAnimNode_LinkedAnimGraph` properties:
+The same switches exist per node on `FAnimNode_LinkedAnimGraph`
+(`Animation/AnimNode_LinkedAnimGraph.h:76-80`):
+
 ```cpp
-// AnimNode_LinkedAnimGraph.h
 uint8 bReceiveNotifiesFromLinkedInstances : 1;
 uint8 bPropagateNotifiesToLinkedInstances : 1;
 ```
 
----
-
-## Receiving Montage Notify Events Outside AnimInstance
-
-To react to named montage notifies from code outside the `AnimInstance`, bind to the
-`OnPlayMontageNotifyBegin` and `OnPlayMontageNotifyEnd` delegates exposed on
-`UAnimInstance`:
-
-```cpp
-// In your owning actor / component — called after obtaining the AnimInstance.
-AnimInst->OnPlayMontageNotifyBegin.AddDynamic(
-    this, &AMyCharacter::HandleMontageNotifyBegin);
-
-AnimInst->OnPlayMontageNotifyEnd.AddDynamic(
-    this, &AMyCharacter::HandleMontageNotifyEnd);
-
-// Callback signature (must be UFUNCTION):
-UFUNCTION()
-void HandleMontageNotifyBegin(FName NotifyName,
-    const FBranchingPointNotifyPayload& Payload)
-{
-    if (NotifyName == FName("WeaponCollisionEnable"))
-    {
-        EnableWeaponCollision();
-    }
-}
-
-UFUNCTION()
-void HandleMontageNotifyEnd(FName NotifyName,
-    const FBranchingPointNotifyPayload& Payload)
-{
-    if (NotifyName == FName("WeaponCollisionEnable"))
-    {
-        DisableWeaponCollision();
-    }
-}
-```
-
-These delegates fire for every branching-point or standard notify on any montage
-playing on the instance, so always filter by `NotifyName`. Unbind with
-`RemoveDynamic` when the listener is destroyed.
+Turning both on for a deep layer stack makes each notify fire once per instance in the
+chain; enable only the direction you need.

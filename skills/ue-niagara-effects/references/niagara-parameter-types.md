@@ -1,76 +1,90 @@
 # Niagara Parameter Types — C++ to Niagara Type Mapping
 
-This reference maps Niagara editor parameter types to their C++ setter methods on `UNiagaraComponent`
-and the underlying native C++ types. All parameters must be declared in the `User.` namespace in the
-Niagara editor to be settable from C++ at runtime.
+Maps Niagara editor parameter types to their `UNiagaraComponent` setters and the native C++ types.
+A parameter must live in the `User.` namespace in the Niagara editor to be settable from C++.
 
-Sources: `NiagaraComponent.h`, `NiagaraFunctionLibrary.h`, `NiagaraDataInterfaceArrayFunctionLibrary.h`
-(Engine/Plugins/FX/Niagara/Source/Niagara/).
+Sources (all under `Engine/Plugins/FX/Niagara/Source/Niagara/`): `Public/NiagaraComponent.h`,
+`Public/NiagaraFunctionLibrary.h`, `Classes/NiagaraDataInterfaceArrayFunctionLibrary.h`,
+`Public/NiagaraComponentPoolMethodEnum.h`.
 
 ---
 
 ## Scalar Types
 
-| Niagara Editor Type | C++ Method (FName variant) | C++ Type | Notes |
-|---|---|---|---|
-| `float` | `SetVariableFloat(FName, float)` | `float` | Default precision |
-| `int32` | `SetVariableInt(FName, int32)` | `int32` | |
-| `bool` | `SetVariableBool(FName, bool)` | `bool` | |
+| Niagara Editor Type | C++ Method | C++ Type |
+|---|---|---|
+| `float` | `SetVariableFloat(FName, float)` | `float` |
+| `int32` | `SetVariableInt(FName, int32)` | `int32` |
+| `bool` | `SetVariableBool(FName, bool)` | `bool` |
 
 ---
 
 ## Vector Types
 
-| Niagara Editor Type | C++ Method (FName variant) | C++ Type | Notes |
+| Niagara Editor Type | C++ Method | C++ Type | Notes |
 |---|---|---|---|
 | `Vector2D` | `SetVariableVec2(FName, FVector2D)` | `FVector2D` | |
-| `Vector` / `Vector3` | `SetVariableVec3(FName, FVector)` | `FVector` | |
-| `Position` | `SetVariablePosition(FName, FVector)` | `FVector` | LWC-aware large-world position; use instead of `SetVariableVec3` for world-space positions |
-| `Vector4` | `SetVariableVec4(FName, FVector4)` | `FVector4` | |
-| `Color` (LinearColor) | `SetVariableLinearColor(FName, FLinearColor)` | `FLinearColor` | Do NOT use SetVariableVec3/4 for this |
-| `Quaternion` | `SetVariableQuat(FName, FQuat)` | `FQuat` | Internally converted to `FQuat4f` |
-| `Matrix` | `SetVariableMatrix(FName, FMatrix)` | `FMatrix` | FName variant available; legacy `SetNiagaraVariableMatrix(FString, FMatrix)` also works |
+| `Vector` | `SetVariableVec3(FName, FVector)` | `FVector` | |
+| `Position` | `SetVariablePosition(FName, FVector)` | `FVector` | LWC-aware; use this, not `SetVariableVec3`, for world positions |
+| `Vector4` | `SetVariableVec4(FName, const FVector4&)` | `FVector4` | |
+| `Color` | `SetVariableLinearColor(FName, const FLinearColor&)` | `FLinearColor` | Do not use the Vec3/Vec4 setters for a Color parameter |
+| `Quaternion` | `SetVariableQuat(FName, const FQuat&)` | `FQuat` | Stored internally as `FQuat4f` |
+| `Matrix` | `SetVariableMatrix(FName, const FMatrix&)` | `FMatrix` | |
 
 ---
 
 ## Object / Reference Types
 
-| Niagara Editor Type | C++ Method | Argument Type | Notes |
-|---|---|---|---|
-| `Object` (generic UObject) | `SetVariableObject(FName, UObject*)` | `UObject*` | Binds an object reference to a DI user param |
-| `Actor` | `SetVariableActor(FName, AActor*)` | `AActor*` | Convenience wrapper around `SetVariableObject` |
-| `Material` | `SetVariableMaterial(FName, UMaterialInterface*)` | `UMaterialInterface*` | |
-| `Texture` | `SetVariableTexture(FName, UTexture*)` | `UTexture*` | |
-| `TextureRenderTarget` | `SetVariableTextureRenderTarget(FName, UTextureRenderTarget*)` | `UTextureRenderTarget*` | |
-
----
-
-## Data Interface Types
-
-Data interfaces are bound by overriding the User parameter that holds the DI. The parameter appears
-as a DI type in the Niagara editor (e.g., "Skeletal Mesh", "Float Array"). The binding is done via
-`SetVariableObject`, or through the specialized helpers in `UNiagaraFunctionLibrary`.
-
-| Niagara DI Type | Binding Method | Notes |
+| Niagara Editor Type | C++ Method | Argument Type |
 |---|---|---|
-| Skeletal Mesh DI | `UNiagaraFunctionLibrary::OverrideSystemUserVariableSkeletalMeshComponent` | Pass `USkeletalMeshComponent*` |
-| Static Mesh DI | `UNiagaraFunctionLibrary::OverrideSystemUserVariableStaticMeshComponent` | Pass `UStaticMeshComponent*` |
-| Static Mesh DI (asset) | `UNiagaraFunctionLibrary::OverrideSystemUserVariableStaticMesh` | Pass `UStaticMesh*` directly |
-| Texture DI | `UNiagaraFunctionLibrary::SetTextureObject` | Pass `UTexture*` |
-| 2D Array Texture DI | `UNiagaraFunctionLibrary::SetTexture2DArrayObject` | Pass `UTexture2DArray*` |
-| Volume Texture DI | `UNiagaraFunctionLibrary::SetVolumeTextureObject` | Pass `UVolumeTexture*` |
-| Float Array DI | `UNiagaraDataInterfaceArrayFunctionLibrary::SetNiagaraArrayFloat` | Replaces entire array |
-| Generic DI (typed) | `UNiagaraFunctionLibrary::GetDataInterface<TDIType>` | Returns the DI object for direct mutation |
-| Generic DI (untyped) | `UNiagaraFunctionLibrary::GetDataInterface(UClass*, UNiagaraComponent*, FName)` | Non-template variant |
+| `Object` | `SetVariableObject(FName, UObject*)` | `UObject*` |
+| `Actor` | `SetVariableActor(FName, AActor*)` | `AActor*` |
+| `Material` | `SetVariableMaterial(FName, UMaterialInterface*)` | `UMaterialInterface*` |
+| `Static Mesh` | `SetVariableStaticMesh(FName, UStaticMesh*)` | `UStaticMesh*` |
+| `Texture` | `SetVariableTexture(FName, UTexture*)` | `UTexture*` |
+| `Texture Render Target` | `SetVariableTextureRenderTarget(FName, UTextureRenderTarget*)` | `UTextureRenderTarget*` |
 
 ---
 
-## Array DI Types (UNiagaraDataInterfaceArrayFunctionLibrary)
+## Getters
 
-All array setters replace the entire data array in the named User parameter DI.
-Single-element setters exist for in-place updates without replacing the full array.
+Every getter is `[[nodiscard]]`, takes the name plus a `bool& bIsValid` out parameter, and is `const`:
+`GetVariableBool`, `GetVariableInt`, `GetVariableFloat`, `GetVariableVec2`, `GetVariableVec3`,
+`GetVariableVec4`, `GetVariablePosition`, `GetVariableColor`, `GetVariableQuat`, `GetVariableMatrix`.
 
-| Array Element Type | Set Whole Array | Set Single Element | Get Whole Array | Get Single Element |
+Note the asymmetry: the setter is `SetVariableLinearColor`, the getter is `GetVariableColor`.
+
+```cpp
+bool bIsValid = false;
+const FLinearColor Tint = NiagaraComp->GetVariableColor(FName("User.TintColor"), bIsValid);
+```
+
+---
+
+## Data Interface Binding
+
+| Niagara DI Type | Binding Method | Argument |
+|---|---|---|
+| Skeletal Mesh | `UNiagaraFunctionLibrary::OverrideSystemUserVariableSkeletalMeshComponent` | `USkeletalMeshComponent*` |
+| Static Mesh (component) | `UNiagaraFunctionLibrary::OverrideSystemUserVariableStaticMeshComponent` | `UStaticMeshComponent*` |
+| Static Mesh (asset) | `UNiagaraFunctionLibrary::OverrideSystemUserVariableStaticMesh` | `UStaticMesh*` |
+| Texture | `UNiagaraFunctionLibrary::SetTextureObject` | `UTexture*` |
+| 2D Array Texture | `UNiagaraFunctionLibrary::SetTexture2DArrayObject` | `UTexture2DArray*` |
+| Volume Texture | `UNiagaraFunctionLibrary::SetVolumeTextureObject` | `UVolumeTexture*` |
+| Any DI (typed) | `UNiagaraFunctionLibrary::GetDataInterface<TDIType>(UNiagaraComponent*, FName)` | returns `TDIType*` |
+| Any DI (untyped) | `UNiagaraFunctionLibrary::GetDataInterface(UClass*, UNiagaraComponent*, FName)` | returns `UNiagaraDataInterface*` |
+
+The `Override*` and `Set*Object` helpers take the parameter name as `const FString&`; `GetDataInterface`
+takes `FName`. Mixing the two up is the most common compile error in this area.
+
+---
+
+## Array DI Function Library
+
+`UNiagaraDataInterfaceArrayFunctionLibrary` (`Classes/NiagaraDataInterfaceArrayFunctionLibrary.h`).
+All entries take `(UNiagaraComponent* NiagaraSystem, FName OverrideName, ...)`.
+
+| Element Type | Set Whole Array | Set Single Element | Get Whole Array | Get Single Element |
 |---|---|---|---|---|
 | `float` | `SetNiagaraArrayFloat` | `SetNiagaraArrayFloatValue` | `GetNiagaraArrayFloat` | `GetNiagaraArrayFloatValue` |
 | `FVector2D` | `SetNiagaraArrayVector2D` | `SetNiagaraArrayVector2DValue` | `GetNiagaraArrayVector2D` | `GetNiagaraArrayVector2DValue` |
@@ -84,70 +98,80 @@ Single-element setters exist for in-place updates without replacing the full arr
 | `uint8` | `SetNiagaraArrayUInt8` | `SetNiagaraArrayUInt8Value` | `GetNiagaraArrayUInt8` | `GetNiagaraArrayUInt8Value` |
 | `bool` | `SetNiagaraArrayBool` | `SetNiagaraArrayBoolValue` | `GetNiagaraArrayBool` | `GetNiagaraArrayBoolValue` |
 
-`bSizeToFit=true` on single-element setters will grow the array to accommodate the index if needed.
+Details that bite:
 
-**Low-precision internal storage**: Array DIs use internal `FVector3f` / `FVector2f` / `FQuat4f`
-storage (single-precision). The public API accepts double-precision UE types and converts internally.
-For non-BP code using `TConstArrayView<FVector3f>`, use the non-templated C++-only overloads:
+- The `UInt8` entries take and return `TArray<int32>` in the Blueprint-facing API, not `TArray<uint8>`.
+- Single-element setters take `int Index` and a **non-defaulted** `bool bSizeToFit`; pass it explicitly.
+  `bSizeToFit=true` grows the array to fit the index.
+- All four Matrix entries take a trailing `bool bApplyLWCRebase = true`, which controls whether the
+  large-world-coordinate tile offset is applied to the translation.
 
-```cpp
-// Non-BP overloads accepting single-precision directly (avoids conversion overhead):
-// SetNiagaraArrayFloat(Component, Name, TConstArrayView<double>)
-// SetNiagaraArrayVector(Component, Name, TConstArrayView<FVector3f>)
-// SetNiagaraArrayVector4(Component, Name, TConstArrayView<FVector4f>)
-// SetNiagaraArrayQuat(Component, Name, TConstArrayView<FQuat4f>)
-// SetNiagaraArrayMatrix(Component, Name, TConstArrayView<FMatrix44f>)
-// SetNiagaraArrayUInt8(Component, Name, TConstArrayView<uint8>)
-// SetNiagaraArrayInt32(Component, Name, TConstArrayView<int64>)
-```
-
----
-
-## Legacy FString Setters (Blueprint-Oriented, Slower)
-
-These exist on `UNiagaraComponent` for Blueprint compatibility. Prefer the `FName` variants above
-in C++ as they avoid a string-to-FName conversion on every call.
+**Low-precision C++-only overloads.** Array DIs store `FVector3f` / `FVector2f` / `FQuat4f` /
+`FMatrix44f` internally. When you already hold single-precision data, use the non-Blueprint
+overloads to skip the conversion:
 
 ```cpp
-// All FString setters — equivalent in behavior, slower in C++.
-SetNiagaraVariableFloat(const FString&, float)
-SetNiagaraVariableInt(const FString&, int32)
-SetNiagaraVariableBool(const FString&, bool)
-SetNiagaraVariableVec2(const FString&, FVector2D)
-SetNiagaraVariableVec3(const FString&, FVector)
-SetNiagaraVariableVec4(const FString&, FVector4)
-SetNiagaraVariableLinearColor(const FString&, FLinearColor)
-SetNiagaraVariableQuat(const FString&, FQuat)
-SetNiagaraVariableMatrix(const FString&, FMatrix)    // legacy FString variant; prefer SetVariableMatrix(FName, FMatrix)
-SetNiagaraVariableObject(const FString&, UObject*)
-SetNiagaraVariableActor(const FString&, AActor*)
-SetNiagaraVariablePosition(const FString&, FVector)
+// SetNiagaraArrayFloat(UNiagaraComponent*, FName, TConstArrayView<double>)
+// SetNiagaraArrayInt32(UNiagaraComponent*, FName, TConstArrayView<int64>)
+// SetNiagaraArrayVector2D(UNiagaraComponent*, FName, TConstArrayView<FVector2f>)
+// SetNiagaraArrayVector(UNiagaraComponent*, FName, TConstArrayView<FVector3f>)
+// SetNiagaraArrayVector4(UNiagaraComponent*, FName, TConstArrayView<FVector4f>)
+// SetNiagaraArrayQuat(UNiagaraComponent*, FName, TConstArrayView<FQuat4f>)
+// SetNiagaraArrayMatrix(UNiagaraComponent*, FName, TConstArrayView<FMatrix44f>)
+// SetNiagaraArrayUInt8(UNiagaraComponent*, FName, TConstArrayView<uint8>)
 ```
 
 ---
 
 ## ENCPoolMethod Values
 
-Used in `SpawnSystemAtLocation` and `SpawnSystemAttached` `PoolingMethod` parameter.
+`Public/NiagaraComponentPoolMethodEnum.h`. Used as the `PoolingMethod` argument of
+`SpawnSystemAtLocation` and `SpawnSystemAttached`.
 
 | Value | Behavior |
 |---|---|
-| `ENCPoolMethod::None` | No pooling. Component is destroyed when system finishes if `bAutoDestroy=true`. |
-| `ENCPoolMethod::AutoRelease` | Component returns to the world pool automatically when the system finishes. Never call `DestroyComponent`. |
-| `ENCPoolMethod::ManualRelease` | You must call `ReleaseToPool()` to return the component to the pool. Used for effects that you pause/resume explicitly. |
-| `ENCPoolMethod::FreeInPool` | Internal pool state (not for external use). |
+| `None` | No pooling. The component is destroyed when the system finishes if `bAutoDestroy` is true. |
+| `AutoRelease` | Allocated from the pool and returned automatically. Interaction after the spawning tick is unsafe, so do not cache the pointer. |
+| `ManualRelease` | Allocated from the pool; you own it and must call `ReleaseToPool()`. Use for persistent effects whose parameters you keep updating. |
+| `ManualRelease_OnComplete` | `UMETA(Hidden)` internal state: released manually but returned to the pool only on completion. |
+| `FreeInPool` | `UMETA(Hidden)` internal state marking a component that is currently sitting in the pool. |
+
+---
+
+## Deprecated FString Setters
+
+Every `const FString&` variant on `UNiagaraComponent` carries
+`UE_DEPRECATED(5.3, "This method will be removed in a future release.  Please update to use the FName variant")`.
+They are scheduled for removal, not merely slower. Do not emit them; use the `FName` setter in the
+right-hand column.
+
+| Do not emit | Use instead |
+|---|---|
+| `SetNiagaraVariableFloat(const FString&, float)` | `SetVariableFloat(FName, float)` |
+| `SetNiagaraVariableInt(const FString&, int32)` | `SetVariableInt(FName, int32)` |
+| `SetNiagaraVariableBool(const FString&, bool)` | `SetVariableBool(FName, bool)` |
+| `SetNiagaraVariableVec2(const FString&, FVector2D)` | `SetVariableVec2(FName, FVector2D)` |
+| `SetNiagaraVariableVec3(const FString&, FVector)` | `SetVariableVec3(FName, FVector)` |
+| `SetNiagaraVariableVec4(const FString&, FVector4)` | `SetVariableVec4(FName, const FVector4&)` |
+| `SetNiagaraVariableLinearColor(const FString&, FLinearColor)` | `SetVariableLinearColor(FName, const FLinearColor&)` |
+| `SetNiagaraVariableQuat(const FString&, FQuat)` | `SetVariableQuat(FName, const FQuat&)` |
+| `SetNiagaraVariableMatrix(const FString&, FMatrix)` | `SetVariableMatrix(FName, const FMatrix&)` |
+| `SetNiagaraVariableObject(const FString&, UObject*)` | `SetVariableObject(FName, UObject*)` |
+| `SetNiagaraVariableActor(const FString&, AActor*)` | `SetVariableActor(FName, AActor*)` |
+| `SetNiagaraVariablePosition(const FString&, FVector)` | `SetVariablePosition(FName, FVector)` |
 
 ---
 
 ## Parameter Namespace Rules
 
-Niagara parameters follow a `Namespace.VariableName` convention:
+Niagara parameters are `Namespace.VariableName`:
 
-- `User.MyParam` — authored as "User Exposed" in Niagara editor; the only namespace settable from C++.
-- `System.Age`, `System.DeltaTime`, `System.ExecutionState` — built-in system parameters; read-only.
-- `Emitter.MyEmitterVar` — scoped to a single emitter; not accessible from C++.
-- `Particle.Position`, `Particle.Velocity` — per-particle; not accessible from C++.
-- `Module.MyModuleVar` — private to a module stack node; not accessible from C++.
+- `User.MyParam` — authored as User Exposed; the only namespace overridable from C++.
+- `System.Age`, `System.DeltaTime`, `System.ExecutionState` — engine-owned, read-only.
+- `Emitter.MyEmitterVar` — per-emitter simulation state; not reachable from C++.
+- `Particle.Position`, `Particle.Velocity` — per-particle; not reachable from C++.
+- `Module.MyModuleVar` — private to a module stack node; not reachable from C++.
 
-Always confirm the exact parameter name in the Niagara editor's "Parameters" panel before writing
-C++ code — the name is case-sensitive and the namespace prefix must be included.
+Names are case-sensitive and must include the namespace prefix. `UNiagaraFunctionLibrary::GetAllUserParameters`
+returns the authored `User.` parameters of a system as `FNiagaraUserParameterInfo` (`ParameterName`,
+`ParameterType`, `TypeName`), which is the reliable way to confirm a name from code.

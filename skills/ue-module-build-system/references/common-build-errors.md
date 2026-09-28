@@ -1,381 +1,398 @@
-# Common UE Build Errors: Causes and Solutions
+# Common UE Build Errors: Causes and Fixes (UE 5.8)
 
-This reference maps common Unreal Build Tool (UBT) and compiler/linker error messages to their root causes and concrete fixes.
+Error texts below are the literal MSVC, UnrealHeaderTool (UHT), UnrealBuildTool (UBT) and runtime `FModuleManager`/`IPluginManager` messages emitted by 5.8. Placeholders such as `MyModule` stand for your names.
 
 ---
 
 ## Linker Errors (LNK)
 
-### LNK2019 — Unresolved External Symbol
+### LNK2019 — unresolved external symbol
 
-**Full message pattern**:
 ```
-error LNK2019: unresolved external symbol "public: void __cdecl FSomeClass::SomeMethod(void)"
-    referenced in function "..."
-```
-
-**Cause A: Missing module dependency**
-
-The module containing `FSomeClass` is not listed as a dependency.
-
-Fix: Add the module to `Build.cs`:
-```csharp
-PrivateDependencyModuleNames.Add("TheModuleThatDefinesFSomeClass");
+error LNK2019: unresolved external symbol "public: void __cdecl FMyGameTypes::DoSomething(void)"
+    referenced in function "public: virtual void __cdecl AMyActor::BeginPlay(void)"
 ```
 
-**Cause B: Missing `MODULENAME_API` export macro**
+**Cause A: module not a dependency.** Add the owning module to `PrivateDependencyModuleNames` (or `PublicDependencyModuleNames` if a public header needs it). Header access through `PrivateIncludePathModuleNames` alone does not link.
 
-`FSomeClass` exists in another module but was never marked for DLL export.
-
-Fix: Add the macro to the class or function declaration:
-```cpp
-// Before:
-class FSomeClass { void SomeMethod(); };
-
-// After:
-class MYMODULE_API FSomeClass { void SomeMethod(); };
-```
-
-**Cause C: Function defined in a .cpp but declared in a header without the macro**
+**Cause B: missing `MYGAME_API`.** The symbol lives in another module but is not exported.
 
 ```cpp
-// Header — export the declaration
-MYMODULE_API void SomeFreeFunction();
+// Before
+class FMyGameTypes { public: void DoSomething(); };
 
-// .cpp — no macro needed here, definition is in the same module
-void SomeFreeFunction() { ... }
+// After
+class MYGAME_API FMyGameTypes { public: void DoSomething(); };
 ```
 
-**Cause D: Dependency listed in PrivateDependencyModuleNames but type appears in a public header**
+**Cause C: free function exported at the definition instead of the declaration.**
 
-A type from a private dependency cannot be used in your public headers. Either:
-- Move the type usage to your Private/ .cpp files, OR
-- Promote the dependency to `PublicDependencyModuleNames`
+```cpp
+// MyGameTypes.h — export here
+MYGAME_API void MyGameFreeFunction();
 
-### LNK2001 — Unresolved External Symbol (variant)
-
-```
-error LNK2001: unresolved external symbol __declspec(dllimport) ...
-```
-
-This is the same problem as LNK2019. Follow the same fixes.
-
-### LNK4099 — PDB Not Found
-
-```
-warning LNK4099: PDB 'SomeLib.pdb' was not found
+// MyGameTypes.cpp — no macro on the definition
+void MyGameFreeFunction()
+{
+}
 ```
 
-Usually harmless for third-party libraries. Suppress with a linker flag in Build.cs:
+**Cause D: body never compiled for this target.** A member declared in the header but defined only in a `.cpp` that is excluded for this target (for example an editor-only `.cpp` guarded by `#if WITH_EDITOR` while the declaration is not).
+
+### LNK2001 — unresolved external symbol (dllimport variant)
+
+```
+error LNK2001: unresolved external symbol "__declspec(dllimport) public: static class UClass * __cdecl UMyObject::StaticClass(void)"
+```
+
+Same causes as LNK2019. `StaticClass` variants mean the `UCLASS` itself lacks `MYGAME_API`.
+
+### LNK1104 — cannot open file
+
+```
+fatal error LNK1104: cannot open file 'MyLib.lib'
+```
+
+A path in `PublicAdditionalLibraries` does not exist for this platform/architecture. Build paths with `Path.Combine` and guard them:
+
 ```csharp
-// Suppress PDB warnings for external libraries
-PublicAdditionalLibraries can omit .pdb — or suppress via:
-// bDisableSymbolLocalization = true  (or ignore in project linker settings)
-```
-
-### LNK1104 — Cannot Open File
-
-```
-fatal error LNK1104: cannot open file 'SomeLib.lib'
-```
-
-**Cause**: A library path in `PublicAdditionalLibraries` points to a file that doesn't exist.
-
-**Fix**: Verify the path. Use `Path.Combine` to build platform-correct paths:
-```csharp
-string LibPath = Path.Combine(ModuleDirectory, "lib", "Win64", "SomeLib.lib");
+string LibPath = Path.Combine(ModuleDirectory, "lib", "Win64", "MyLib.lib");
 if (File.Exists(LibPath))
 {
     PublicAdditionalLibraries.Add(LibPath);
 }
 ```
 
+### LNK4099 — PDB not found
+
+```
+warning LNK4099: PDB 'MyLib.pdb' was not found with 'MyLib.lib'
+```
+
+UBT already passes `/ignore:4099` to the Windows linker (`Platform/Windows/VCToolChain.cs`), so this only appears from custom link steps or third-party build scripts. It is harmless.
+
+### Missing precompiled manifest (installed engine builds)
+
+```
+Missing precompiled manifest for 'MyEngineModule', '.../MyEngineModule.precompiled'. This module can not be referenced in a monolithic precompiled build, remove this reference or migrate to a fully compiled source build.
+```
+
+Launcher (installed) engines ship only the engine modules Epic precompiled. Remove the dependency, depend on a module that is precompiled, or build from a source engine.
+
 ---
 
-## Compiler Errors (C-series, clang)
+## Compiler Errors and Warnings (MSVC)
 
-### C1083 — Cannot Open Include File
+### C1083 — cannot open include file
 
 ```
-fatal error C1083: Cannot open include file: 'SomeHeader.h': No such file or directory
+fatal error C1083: Cannot open include file: 'MyPluginTypes.h': No such file or directory
 ```
 
-**Cause A: Missing module dependency**
+**Cause A: module not a dependency.** Add it to `PublicDependencyModuleNames`, `PrivateDependencyModuleNames`, or (headers only) `PrivateIncludePathModuleNames`.
 
-The module that owns `SomeHeader.h` is not a dependency.
-
-Fix:
-```csharp
-PublicDependencyModuleNames.Add("TheModuleThatOwnsSomeHeader");
-// or
-PrivateDependencyModuleNames.Add("TheModuleThatOwnsSomeHeader");
-```
-
-**Cause B: Wrong include path in IWYU mode**
-
-UE5 with `PCHUsage = UseExplicitOrSharedPCHs` requires full paths relative to a module's `Public/` root.
+**Cause B: path not relative to the module's `Public/` root.** With `bLegacyPublicIncludePaths = false` (every `BuildSettingsVersion` since `V2`) headers from other modules need the full path from that module's `Public/` or `Classes/` folder.
 
 ```cpp
-// Wrong — works only if PCH pulls it in transitively
-#include "Actor.h"
+// Wrong: "Actor.h" or "Engine/Actor.h" — neither path exists relative to a Public/ or Classes/ root
 
-// Correct — explicit path from module root
+// Correct — Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h
 #include "GameFramework/Actor.h"
 ```
 
-**Cause C: Third-party header not on include path**
+**Cause C: third-party header.** Add its folder to `PublicSystemIncludePaths`.
 
-```csharp
-// In Build.cs:
-PublicSystemIncludePaths.Add(Path.Combine(ThirdPartyDir, "include"));
-```
+**Cause D: stale `.generated.h`.** Regenerate project files (`UnrealBuildTool -Mode=GenerateProjectFiles` or the `.uproject` context menu) and rebuild.
 
-**Cause D: Missing header generated by UHT**
-
-If the included file is a `.generated.h`, you may need to regenerate project files. Run "Generate Project Files" from the .uproject or from the Unreal Editor.
-
-### C2039 — Member Not Found
+### C2039 — is not a member of
 
 ```
-error C2039: 'SomeMember': is not a member of 'FSomeClass'
+error C2039: 'GetSubsystem': is not a member of 'UWorld'
 ```
 
-Often caused by:
-- Stale generated header (`.generated.h`) — regenerate project files
-- Forward declaration without full include — add `#include "SomeClass.h"` in the .cpp
-- IWYU violation — the type was previously pulled in by a PCH header that's no longer included
+Usually a forward-declared type used through an incomplete definition, or a header that used to be pulled in transitively. Include the header that defines the member in the `.cpp` (`Engine/World.h` for `UWorld`), and check whether the engine renamed or moved the member (search `UE_DEPRECATED` in the header).
 
-### C2027 / C2371 — Incomplete Type / Type Redefinition
+### C2027 / C2371 — undefined type / redefinition
 
 ```
-error C2027: use of undefined type 'FSomeClass'
-error C2371: 'FSomeClass': redefinition; different basic types
+error C2027: use of undefined type 'FMyGameTypes'
+error C2371: 'FMyGameTypes': redefinition; different basic types
 ```
 
-**Cause**: Forward declaration used where full definition is needed, OR the same header included via two different paths (`SomeClass.h` vs `SubDir/SomeClass.h`).
+**Undefined type:** forward declaration where the full definition is needed. Keep the forward declaration in the header for pointers and references; include the header in the `.cpp`.
 
-**Fix for incomplete type**: Replace forward declaration with full include in the .cpp:
 ```cpp
-// Header — keep forward declaration for pointer/reference params
-class FSomeClass;
-class MYMODULE_API FMyClass
+// MyActor.h
+#pragma once
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "MyActor.generated.h"
+
+class FMyGameTypes;
+
+UCLASS()
+class MYGAME_API AMyActor : public AActor
 {
-    void DoThing(FSomeClass* Param);
+    GENERATED_BODY()
+public:
+    void UseTypes(FMyGameTypes* Types);
 };
-
-// CPP — include the full definition
-#include "SomeClass.h"
-void FMyClass::DoThing(FSomeClass* Param) { ... }
 ```
 
-**Fix for redefinition**: Use consistent paths. Prefer includes from a module root:
 ```cpp
-// Inconsistent — may cause ODR violations
-#include "SomeClass.h"           // resolved via PublicIncludePaths
-#include "SubDir/SomeClass.h"   // different resolved path, same file
+// MyActor.cpp
+#include "MyActor.h"
+#include "MyGameTypes.h"
 
-// Consistent — always use full path from module root
-#include "SubDir/SomeClass.h"
+void AMyActor::UseTypes(FMyGameTypes* Types)
+{
+    Types->DoSomething();
+}
 ```
+
+**Redefinition:** the same header reached through two different include paths (`MyGameTypes.h` and `Types/MyGameTypes.h`) or a `class`/`struct` keyword mismatch between declaration and definition. Use one path from the module root everywhere.
+
+### C4996 — deprecated (UE_DEPRECATED)
+
+```
+warning C4996: 'AActor::NetUpdateFrequency': Public access to NetUpdateFrequency has been deprecated. Use SetNetUpdateFrequency() and GetNetUpdateFrequency() instead. - Please update your code to the new API before upgrading to the next release, otherwise your project will no longer compile.
+```
+
+The engine marks the old form with `UE_DEPRECATED(5.x, "...")`; the message names the replacement. Fix the call. `CppCompileWarningSettings.DeprecationWarningLevel = WarningLevel.Error` turns these into build breaks so they cannot accumulate.
+
+### C4456 / C4458 / C4459 — declaration hides
+
+```
+error C4458: declaration of 'Owner' hides class member
+```
+
+Controlled by `CppCompileWarningSettings.ShadowVariableWarningLevel` (Error by default for targets on `BuildSettingsVersion.V2` and later). Rename the local variable or parameter.
+
+### C4244 / C4838 — conversion, possible loss of data
+
+```
+warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+```
+
+Controlled by `CppCompileWarningSettings.UnsafeTypeCastWarningLevel`. Use explicit `static_cast<float>(...)` or keep the wider type; large world coordinates use `double` in `FVector`.
+
+### C4668 — undefined identifier in `#if`
+
+```
+error C4668: 'MYGAME_WITH_DEBUG_MENU' is not defined as a preprocessor macro, replacing with '0' for '#if/#elif'
+```
+
+Error from `BuildSettingsVersion.V6`. Define the macro in every configuration (`PublicDefinitions.Add("MYGAME_WITH_DEBUG_MENU=0")` in the `else` branch) instead of relying on the undefined-is-zero behaviour.
 
 ---
 
-## UHT Errors (Unreal Header Tool)
+## UnrealHeaderTool Errors
 
-### Missing #include for generated header
+### `.generated.h` must be the last include
 
 ```
-error: include 'MyClass.generated.h' must be the last include in the header
+error: #include found after .generated.h file - the .generated.h file should always be the last #include in a header
 ```
 
-**Fix**: Move the `.generated.h` include to the very last line of your header's includes:
 ```cpp
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "MyClass.generated.h"   // MUST be last
+#include "MyActor.generated.h"   // last include, always
 ```
 
-### UCLASS / USTRUCT not found by UHT
+### GENERATED_BODY missing or misplaced
 
 ```
-error: Expected type name after 'class' keyword
+error: Expected a GENERATED_BODY() at the start of the class
 ```
 
-Common causes:
-- The file is in the wrong directory (UHT only scans `Public/` and `Private/`)
-- The file is not listed in the project (ensure .uproject or .uplugin has the module)
-- `GENERATED_BODY()` or `GENERATED_USTRUCT_BODY()` is missing inside the class/struct
-
-### Missing MODULE_API on exported UCLASS
-
-UHT-generated reflection requires that classes with `UCLASS()` macro are exported if they're in a module:
+`GENERATED_BODY()` must be the first statement inside every `UCLASS`, `USTRUCT`, `UINTERFACE` body and the generated interface class:
 
 ```cpp
-UCLASS()
-class MYMODULE_API UMyObject : public UObject
+#pragma once
+#include "CoreMinimal.h"
+#include "MyGameStats.generated.h"
+
+USTRUCT(BlueprintType)
+struct MYGAME_API FMyGameStats
 {
     GENERATED_BODY()
-    // ...
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    float Health = 100.f;
 };
 ```
 
-Omitting `MYMODULE_API` here will compile but causes reflection failures when the class is referenced across module boundaries.
+### Missing `#pragma once`
 
----
+```
+error: MyActor.generated.h already included, missing '#pragma once' in MyActor.h
+```
 
-## IWYU Violations
+The `#error` is emitted by the generated header itself. Add `#pragma once` as the first line of the header.
 
-### Symptom: Builds in unity mode, fails with standalone compile
-
-With `bUseUnityBuild = true` (default), UBT combines multiple .cpp files. A violation is only caught when:
-- `bUseUnityBuild = false` (set in Target.cs for iteration)
-- `bEnforceIWYU = true` (set in Build.cs)
-- Building with `-singlefile` flag
-
-**Fix pattern**: For each compilation unit, include exactly what it uses:
+### Missing `MYGAME_API` on a UCLASS
 
 ```cpp
-// MyActor.cpp
-#include "MyActor.h"              // own header first — always
-#include "Engine/World.h"         // uses GetWorld()
-#include "GameFramework/PlayerController.h"  // uses APlayerController
-// Do NOT include "CoreMinimal.h" and rely on it to pull in FString — include what you need
+#pragma once
+#include "CoreMinimal.h"
+#include "UObject/Object.h"
+#include "MyObject.generated.h"
+
+UCLASS()
+class MYGAME_API UMyObject : public UObject
+{
+    GENERATED_BODY()
+};
 ```
 
-### Relying on Transitive Includes
+Omitting the macro compiles inside the module and fails with LNK2001 on `StaticClass()` the first time another module (or Blueprint-generated code in the editor target) references the class.
+
+---
+
+## UnrealBuildTool Errors
+
+### Could not find definition for module
+
+```
+Could not find definition for module 'MyGameplay', (referenced via MyGame.uproject -> MyGame.Build.cs)
+```
+
+No `MyGameplay.Build.cs` was found under `Source/` or an enabled plugin's `Source/`, or the class inside the `Build.cs` is not named `MyGameplay`. Check spelling in `PublicDependencyModuleNames`, `.uproject` `Modules` and `ExtraModuleNames`.
+
+### Unable to find module referenced by a plugin
+
+```
+Unable to find module 'MyPluginEditor' referenced by D:/Project/Plugins/MyPlugin/MyPlugin.uplugin
+```
+
+The `.uplugin` lists a module with no matching `Source/<Name>/<Name>.Build.cs`.
+
+### Plugin not found or dependency undeclared
+
+```
+Unable to find plugin 'MyPlugin' (referenced via MyGame.uproject). Install it and try again, or remove it from the required plugin list.
+Plugin 'MyPlugin' (referenced via MyGame.uproject) does not contain the 'MyPluginEditor' module, but lists it in 'D:/Project/Plugins/MyPlugin/MyPlugin.uplugin'.
+Warning: Plugin 'MyPlugin' does not list plugin 'GameplayAbilities' as a dependency, but module 'MyPlugin' depends on module 'GameplayAbilities'.
+```
+
+Add the plugin to `Plugins` in the `.uplugin` (dependency) or `.uproject` (enable), mark it `"Optional": true` if it may be absent, and make the `Modules` array match the `Source/` folders.
+
+### Target rules class name
+
+```
+Expecting to find a type to be declared in a target rules named 'MyGameTarget'.  This type must derive from the 'TargetRules' type defined by UnrealBuildTool.
+```
+
+`Source/MyGame.Target.cs` must declare `public class MyGameTarget : TargetRules`.
+
+### Circular dependency
+
+```
+Circular dependency for 'MyModuleA.Build.cs' detected:
+```
+
+UBT prints each cycle as `* A -> B -> A`, then `Circular dependency in 'MyModuleA' possibly due to '<file>.Build.cs'` and suggests moving dependencies into a separate module or using `Private/PublicIncludePathModuleNames` (`Configuration/UEBuildModule.cs`). Resolve, in preference order:
+
+1. **Extract a shared module.** Move the interfaces both sides need (`IMyServiceA`, `IMyServiceB`) into `MyInterfaces`; both modules depend on it.
+2. **Break the link with dynamic loading.** The lower-level module lists the higher one in `DynamicallyLoadedModuleNames` and resolves it at runtime:
 
 ```cpp
-// ActorA.h includes Engine.h which includes World.h
-// Your file:
-#include "ActorA.h"
-// ... uses UWorld without including Engine/World.h
+// MyModuleB.cpp — no compile-time dependency on MyModuleA
+#include "Modules/ModuleManager.h"
+#include "IMyModuleA.h"
 
-// This breaks when ActorA.h changes its includes
+void UseModuleA()
+{
+    if (IMyModuleA* ModuleA = FModuleManager::GetModulePtr<IMyModuleA>("MyModuleA"))
+    {
+        ModuleA->DoThing();
+    }
+}
 ```
 
-**Fix**: Include every header you directly use.
+3. **Forward declare** in headers and include only in `.cpp` files.
+
+`CircularlyReferencedDependentModules` exists for legacy engine cases only; `bValidateCircularDependencies` should stay true.
+
+### Unknown mode
+
+```
+No mode named 'GenerateProjectFile'. Available modes are:
+```
+
+Valid names include `Build`, `Clean`, `GenerateProjectFiles`, `IWYU`, `FixIncludePaths`, `QueryTargets`, `JsonExport`, `GenerateClangDatabase`.
 
 ---
 
-## Module Not Found at Runtime
-
-### Symptom
+## Runtime Module-Load Failures
 
 ```
-LogModuleManager: Warning: ModuleNotFound: Could not find module 'MyModule'
+LogModuleManager: Warning: ModuleManager: Module 'MyModule' not found - its StaticallyLinkedModuleInitializers function is null.
+LogModuleManager: Warning: ModuleManager: Unable to load module 'MyModule'  - 0 instances of that module name found.
+LogModuleManager: Warning: ModuleManager: Unable to load module 'MyModule' because InitializeModule function was not found.
+LogModuleManager: Warning: ModuleManager: Unable to load module 'MyModule' because InitializeModule function failed (returned nullptr.)
+Plugin 'MyPlugin' failed to load because module 'MyPlugin' could not be found.  Please ensure the plugin is properly installed, otherwise consider disabling the plugin for this project.
+Plugin 'MyPlugin' failed to load because module 'MyPlugin' does not appear to be compatible with the current version of the engine.  The plugin may need to be recompiled.
 ```
 
-or a crash at startup with module load failure.
+`FModuleManager::LoadModuleWithFailureReason` reports one of `EModuleLoadResult::Success`, `FileNotFound`, `FileIncompatible`, `CouldNotBeLoadedByOS`, `FailedToInitialize`, `NotLoadedByGameThread`.
 
-**Checklist**:
-1. Module is listed in `.uproject` or `.uplugin` `Modules` array
-2. `LoadingPhase` is appropriate — if you load the module via C++ at a specific time, the module must have loaded by then
-3. The module binary exists — rebuild the project
-4. If it's a plugin module, the plugin is enabled in `.uproject`'s `Plugins` array
+| Message | Fix |
+|---|---|
+| `StaticallyLinkedModuleInitializers function is null` | Monolithic target did not link the module: add it to `ExtraModuleNames` or list it in an enabled `.uplugin` |
+| `0 instances of that module name found` | The DLL was never built for this target/configuration: rebuild, check `Type` and `PlatformAllowList` |
+| `InitializeModule function was not found` | The module has no `IMPLEMENT_MODULE` (or `bRequiresImplementModule = false` was set wrongly) |
+| `does not appear to be compatible` | Plugin binaries built against another engine version: recompile the plugin |
+| `Module name mismatch` compile *warning* (`UE_STATIC_ASSERT_WARN`; error only with warnings-as-errors), plus a load failure in monolithic builds | Second argument of `IMPLEMENT_MODULE` differs from the `Build.cs` module name |
+| Module loads too late | Move `LoadingPhase` to `PreDefault` or load explicitly with `FModuleManager::Get().LoadModule(...)` |
 
 ---
 
-## Circular Dependency
+## Live Coding and Hot Reload
 
-### Symptom
+Live Coding (`bWithLiveCoding`, Windows editor and development targets) patches functions in place. Hot Reload (`WITH_HOT_RELOAD`, modular non-shipping builds) swaps a module DLL. Neither can safely change the layout of a live `UObject`:
 
-```
-Error: Circular dependency detected: ModuleA -> ModuleB -> ModuleA
-```
-
-UBT cannot build a static dependency graph that includes cycles.
-
-**Resolution strategies**:
-
-**Strategy 1: Extract a shared interface module**
-
-Before:
-- `ModuleA` depends on `ModuleB` (for `IServiceB`)
-- `ModuleB` depends on `ModuleA` (for `IServiceA`)
-
-After:
-- `ModuleInterfaces` defines both `IServiceA` and `IServiceB`
-- `ModuleA` depends on `ModuleInterfaces`
-- `ModuleB` depends on `ModuleInterfaces`
-
-**Strategy 2: Use DynamicallyLoadedModuleNames**
-
-```csharp
-// ModuleB.Build.cs — no compile-time dependency on ModuleA
-DynamicallyLoadedModuleNames.Add("ModuleA");
-```
-
-Then at runtime:
-```cpp
-IModuleA* ModuleA = FModuleManager::GetModulePtr<IModuleA>("ModuleA");
-if (ModuleA) { ModuleA->DoThing(); }
-```
-
-**Strategy 3: Forward declare and use pointers/references**
-
-Move full includes from headers to .cpp files and use forward declarations in the header.
+- Adding, removing or reordering `UPROPERTY` members, changing a base class, or adding `UFUNCTION`s to a class that already has instances requires closing the editor and rebuilding.
+- Function-body-only edits are what Live Coding is for.
+- A crash on the next PIE or hot reload after a structural change means the process still holds the old layout: full restart.
 
 ---
 
-## Hot Reload Failures
+## Packaging and Cooking Failures
 
-### Symptom: Changes not reflected after recompile
-
-Hot Reload (Live Coding in UE5) has limitations:
-- New UPROPERTY fields on existing UClasses are not applied to existing instances
-- New UFUNCTIONs added to existing classes may not bind correctly
-- Changes to class hierarchy require a full restart
-
-**Fix**: For structural changes to UObject classes, always do a full restart rather than hot reload.
-
-### Symptom: Crash on hot reload
+### Editor-only module referenced from runtime code
 
 ```
-Assertion failed: Class->ClassDefaultObject ...
+Unable to instantiate module 'UnrealEd': Unable to instantiate UnrealEd module for non-editor targets.
+(referenced via Target -> MyGame.Build.cs -> UnrealEd.Build.cs)
 ```
 
-Caused by:
-- Adding/removing fields from USTRUCTs without restarting
-- Changing the memory layout of UObjects that already have instances
+A runtime module depends on `UnrealEd` (or another editor-only module) outside `if (Target.bBuildEditor)`, so building the `Game`, `Client` or `Server` target fails (`Editor/UnrealEd/UnrealEd.Build.cs` throws when `!Target.bCompileAgainstEditor`). The same applies to code that reaches a `Type: Editor`, `EditorNoCommandlet`, `DeveloperTool` or `UncookedOnly` module from a cooked path.
 
-**Fix**: Full rebuild and editor restart.
+- C++: wrap with `#if WITH_EDITOR` / `#if WITH_EDITORONLY_DATA`
+- `Build.cs`: add editor dependencies only inside `if (Target.bBuildEditor)`
+- `.uproject`/`.uplugin`: give the module the correct `Type`
+
+### Blueprint references a stripped module
+
+Blueprint graphs that call `UFUNCTION`s from an `Editor`-type module fail to load in cooked builds. Move the functions to a `Runtime` module, or put Blueprint-editor-only nodes (K2Node classes) in an `UncookedOnly` module so the editor compiles them but the cook excludes them.
 
 ---
 
-## Packaging / Cooking Errors
-
-### Missing module in cooked build
-
-```
-LogPackageName: Error: DoesPackageExist: DoesPackageExistFast FAILED: 'MyModule'
-```
-
-**Cause**: A module with `Type: "Editor"` or `Type: "Developer"` was referenced from runtime code.
-
-**Fix**:
-- In C++: guard editor-only code with `#if WITH_EDITOR`
-- In Build.cs: use `if (Target.bBuildEditor)` for editor-only dependencies
-- In .uproject: ensure the module type matches actual usage
-
-### Blueprint assets referencing stripped modules
-
-If Blueprint graphs reference C++ functions from editor-only modules, cooking strips the module and breaks the Blueprint.
-
-**Fix**: Move the referenced functions to a Runtime module, or use `CallInEditor = true` UFUNCTION specifier for functions that should only call from editor — ensuring they're never called from game code paths.
-
----
-
-## Build Configuration Quick Reference
+## Quick Reference
 
 | Error type | First thing to check |
 |---|---|
-| LNK2019 unresolved symbol | Missing dependency or missing `MODULENAME_API` |
-| C1083 cannot open include | Missing dependency or wrong include path |
-| IWYU violation | Missing direct include, relying on transitive pull |
-| UHT parse error | Missing `.generated.h` last, missing `GENERATED_BODY()` |
-| Module not found at runtime | Not listed in .uproject/.uplugin, or wrong LoadingPhase |
-| Circular dependency | Extract interface module or use dynamic loading |
-| Cooking failure | Editor-only code/module referenced from runtime path |
-| Hot reload crash | Structural UObject change — full restart required |
+| LNK2019 / LNK2001 | Missing dependency or missing `MYGAME_API` |
+| C1083 | Missing dependency or path not relative to the module `Public/` root |
+| C4996 | `UE_DEPRECATED` replacement named in the message |
+| UHT `.generated.h` / `GENERATED_BODY()` | Last include; first statement in the body; `#pragma once` |
+| Could not find definition for module | `Build.cs` class name and dependency spelling |
+| Circular dependency | Extract interface module or `DynamicallyLoadedModuleNames` |
+| Missing precompiled manifest | Installed engine; remove dependency or use a source build |
+| Module not found at runtime | `.uproject`/`.uplugin` `Modules`, `ExtraModuleNames`, `LoadingPhase` |
+| Cooking failure | Editor-only code or module on a runtime path |
+| Live Coding crash | Structural `UObject` change; restart and rebuild |

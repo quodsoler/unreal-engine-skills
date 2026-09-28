@@ -1,276 +1,290 @@
 ---
 name: ue-project-context
-description: "When the user wants to create or update their Unreal Engine project context document. Use when the user says 'project context,' 'set up context,' 'UE context,' 'configure project,' or wants to avoid repeating their project setup across UE development tasks. Creates `.agents/ue-project-context.md` that all other UE skills reference. See related skills footer for skills that depend on this context."
+description: "Use when creating, refreshing or repairing `.agents/ue-project-context.md`, the project document every other UE skill reads first. Also use when the user says 'project context', 'set up context', 'UE context', 'scan my project', 'onboard the agent to my project', 'update project context', 'configure project', 'what engine version is this project on', 'which plugins do we have enabled', or complains that UE advice keeps coming out generic. For Build.cs and Target.cs mechanics, see ue-module-build-system; for naming and API-macro conventions, see ue-cpp-foundations; for GAS specifics, see ue-gameplay-abilities."
 metadata:
-  version: 1.0.0
+  version: "2.0.0"
+  engine: "5.8"
 ---
 
 # UE Project Context
 
-You help UE developers create and maintain a project context document that other UE skills reference. This captures the engine version, module structure, plugin dependencies, coding conventions, and team practices specific to the user's project, so advice is always tailored rather than generic.
+Target engine: **UE 5.8**. APIs below are verified against the 5.8 headers; older forms are listed under "Deprecated — do not use".
 
-The document is stored at `.agents/ue-project-context.md`.
+This skill produces and maintains `.agents/ue-project-context.md` — the single file the other UE skills read to learn the project's engine version, module layout, enabled plugins, coding conventions, gameplay framework classes, networking model and build targets. It reads project files only (`.uproject`, `*.Build.cs`, `*.Target.cs`, `Config/Default*.ini`, `Plugins/*/*.uplugin`); it calls no engine API. This is the one skill in this set that is deliberately a conversation: every line it writes must come from the codebase or from the user, never from a guess.
 
----
+## Context
 
-## Workflow
+Read `.agents/ue-project-context.md` if it exists (module names, conventions, enabled plugins, GAS/networking setup). Do not stop if it is missing — this skill is what creates it.
 
-### Step 1: Check for Existing Context
+The default path is **scan first, then interview**. Build a draft from the codebase before asking anything, then let the user correct it. Do not open with a menu of options.
 
-First, check if `.agents/ue-project-context.md` already exists.
+| Request is about… | Go to |
+|---|---|
+| First-time setup, or the file is missing | [Step 1: Scan and draft](#step-1-scan-and-draft) |
+| What to read and what to pull out of each file | [What to scan](#what-to-scan) |
+| Naming a plugin the project has enabled | [Plugin checklist](#plugin-checklist) |
+| Reviewing the draft with the user | [Step 2: Correct the draft](#step-2-correct-the-draft) |
+| Saving or refreshing an existing context file | [Step 3: Save and confirm](#step-3-save-and-confirm) |
+| No C++ source to scan (Blueprint-only, or a new empty project) | [Fallback questionnaire](#fallback-questionnaire) |
+| The shape of the output file | [Document template](#document-template) |
 
-**If it exists:**
-- Read it and summarize what's captured
-- Ask which sections the user wants to update
-- Only gather information for those sections
+## Step 1: Scan and draft
 
-**If it doesn't exist, offer two options:**
+1. Check whether `.agents/ue-project-context.md` exists. If it does, read it and treat it as the previous draft rather than starting over.
+2. Scan the files in [What to scan](#what-to-scan). Fill every field you can prove from a file.
+3. Mark anything the files cannot answer as `[unknown]` in the draft. Never invent a team size, a coding rule or a networking model.
+4. Present the whole draft in one message, then move to [Step 2](#step-2-correct-the-draft).
 
-1. **Auto-draft from codebase** (recommended): Scan the project files — `.uproject`, `Source/*/Build.cs`, `Source/*/*.Target.cs`, `Config/*.ini`, `Plugins/` — and draft a V1 of the context document. The user reviews, corrects, and fills gaps. Faster than starting from scratch.
+A partial scan is still worth presenting. Engine version, module list and plugin list come out of the files almost entirely, which removes most of the interview.
 
-2. **Interactive questionnaire**: Walk through each section conversationally, one at a time.
+### What to scan
 
-Most users prefer option 1. After presenting the auto-draft, ask: "What needs correcting? What's missing?"
+| File | Pull out |
+|---|---|
+| `*.uproject` | `EngineAssociation` (e.g. `"EngineAssociation": "5.8"`; a GUID means a registered source build; empty means a native project inside an engine tree), `Modules[]` (`Name`, `Type`, `LoadingPhase`), `Plugins[]` (`Name`, `Enabled`), `TargetPlatforms[]` |
+| `Source/*/*.Build.cs` | Module class name, `PublicDependencyModuleNames`, `PrivateDependencyModuleNames`, `PublicIncludePathModuleNames`, third-party include/library paths, any `PublicDefinitions` |
+| `Source/*.Target.cs` | `Type` (`TargetType.Game`, `Editor`, `Client`, `Server`, `Program`), `ExtraModuleNames`, `DefaultBuildSettings`, `IncludeOrderVersion`, platform conditionals |
+| `Config/DefaultEngine.ini` | `[/Script/EngineSettings.GameMapsSettings]` — `GameDefaultMap`, `ServerDefaultMap`, `GlobalDefaultGameMode`, `GameInstanceClass` (the module is `EngineSettings`, not `Engine`); `[/Script/Engine.RendererSettings]` for the rendering feature set |
+| `Config/DefaultGame.ini` | Project display name and version; `[/Script/Engine.AssetManagerSettings]` — `PrimaryAssetTypesToScan`, which reveals the data-driven asset layout |
+| `Config/DefaultInput.ini` | `[/Script/Engine.InputSettings]` — `DefaultPlayerInputClass` / `DefaultInputComponentClass` (`/Script/EnhancedInput.EnhancedPlayerInput` / `EnhancedInputComponent` means Enhanced Input is live; `InputSettings.h:219,223`), leftover legacy `ActionMappings`/`AxisMappings`; `[/Script/EnhancedInput.EnhancedInputDeveloperSettings]` for Enhanced Input project settings |
+| `Config/DefaultGameplayTags.ini` | `[/Script/GameplayTags.GameplayTagsSettings]` — `GameplayTagList`, `GameplayTagTableList`, `ImportTagsFromConfig` |
+| `Plugins/*/*.uplugin` | In-house plugin names, their `Modules[]` and their `Plugins[]` dependencies |
+| `Source/*/Public/**` (spot-check 3–5 headers) | Naming prefixes in practice, `TObjectPtr` versus raw pointers, API macro style (`MYGAME_API` on each declaration, or a per-header `#define UE_API MYGAME_API`), `DEFINE_LOG_CATEGORY` names, `check`/`ensure` usage |
 
----
+Also grep `Config/Default*.ini` for every other `[/Script/...]` section the project has customised — those sections name the systems the team actually configures.
 
-### Step 2: Gather Information
+### Plugin checklist
 
-#### If Auto-Drafting
+Cross-check `Plugins[]` in the `.uproject` against this list and record maturity wherever it changes the advice other skills give. These are `.uplugin` names in 5.8.
 
-Scan these files and populate each section:
+| Area | Plugins to look for |
+|---|---|
+| Abilities & modularity | `GameplayAbilities`, `GameFeatures` (Beta), `ModularGameplay` (Beta), `SmartObjects`, `InstancedActors` (Experimental) |
+| Input | `EnhancedInput` |
+| UI | `CommonUI`, `ModelViewViewModel` (Beta) |
+| AI & simulation | `StateTree`, `GameplayStateTree`, `MassGameplay` (Experimental), `MassAI` (Experimental) |
+| Animation & movement | `Mover` (Experimental), `MotionWarping` (Beta), `PoseSearch`, `Chooser`, `AnimationBudgetAllocator` |
+| Camera | `GameplayCameras` (Experimental), `EngineCameras` |
+| Networking | `Iris` (Beta), `ReplicationGraph` (Beta) |
+| Audio | `Metasound`, `AudioModulation` |
+| FX & procedural | `Niagara`, `PCG`, `ProceduralMeshComponent`, `GeometryScripting` |
+| Data & services | `DataRegistry` (Beta), `OnlineSubsystem`, `OnlineServices`, `SignificanceManager` |
+| Streaming & messaging | `LevelStreamingPersistence` (Experimental), `AsyncMessageSystem` (Experimental) |
 
-**`.uproject`**
-- `EngineAssociation` → engine version
-- `Plugins[]` → enabled plugins (name + enabled state)
-- `Modules[]` → module list and types
+Record the `.uplugin` name, not the friendly display name, so other skills can match it. A project plugin under `Plugins/` that is absent from `.uproject` `Plugins[]` is still enabled unless its `.uplugin` says `"EnabledByDefault": false` (`FPlugin::IsEnabledByDefault`, `Projects/Private/PluginManager.cpp:421-435`); an engine plugin absent from `Plugins[]` is enabled only if its `.uplugin` has `"EnabledByDefault": true`. Record which rule applied.
 
-**`Source/*/Build.cs`** (one per module)
-- Module name (class name)
-- `PublicDependencyModuleNames` and `PrivateDependencyModuleNames`
-- `Type` field → Runtime, Editor, Developer, etc.
-- Any `ThirdParty` include/library paths
+## Step 2: Correct the draft
 
-**`Source/*/*.Target.cs`**
-- Target types: Game, Editor, Server, Client
-- `DefaultBuildSettings`, `ExtraModuleNames`
-- Platform-specific conditions
+Present the draft, then put two questions to the user:
 
-**`Config/DefaultEngine.ini`**
-- `ActiveGameNameRedirect`, `GameDefaultMap`, `GlobalDefaultGameMode`
-- Any custom subsystem or plugin settings
+> What is wrong in this draft, and what is missing?
 
-**`Config/DefaultGame.ini`**
-- Project display name, version
+Work through their answers, then re-present only the sections that changed. Repeat until the user says it is accurate.
 
-**`Plugins/*/`**
-- Custom plugin directories → names and types
+Fill the `[unknown]` fields the same way, a few at a time, highest value first:
 
-After scanning, draft all sections and present the document. Ask what needs correcting or is missing. Iterate until the user confirms it's accurate.
+1. **Conventions that cannot be read off the code** — assertion policy, header organisation, rules enforced in review.
+2. **Gameplay framework class names** — GameMode, GameState, PlayerController, PlayerState, Pawn/Character, GameInstance. Request the class name, not whether one exists.
+3. **Networking model** — listen or dedicated server, classic replication or `Iris`, push model on or off, `ReplicationGraph` in use.
+4. **Save system, streaming model, AI stack** — only the parts the files did not already prove.
+5. **Team and source control** — skip entirely for a solo developer.
 
-#### If Using Interactive Questionnaire
+`[unknown]` and "not yet established" are valid final answers. A field the team has not decided is more useful written down as undecided than filled with a plausible invention.
 
-Walk through each section below one at a time. Do not dump all questions at once.
+## Step 3: Save and confirm
 
-For each section:
-1. Briefly explain what you're capturing and why it matters
-2. Ask the relevant questions
-3. Confirm accuracy
-4. Move to the next section
+- Write the file to `.agents/ue-project-context.md`, creating `.agents/` if needed.
+- Stamp the engine version and the date at the top.
+- Tell the user the other UE skills now read this file automatically, and that re-running this skill refreshes it as the project changes.
+- On a refresh, keep the sections the user did not revisit and update the date.
 
----
+The skills in this repo target UE 5.8. Record the project's actual engine version verbatim from `EngineAssociation` so that advice can be adjusted when the project sits on a different version, and note whether it is a launcher build or a source build.
 
-## Sections to Capture
+## Fallback questionnaire
 
-### 1. Engine & Project Overview
+Use this only when there is no `Source/` tree to scan (Blueprint-only project, or an empty project being planned). Work through one group at a time and confirm each before moving on.
 
-Discovery questions:
-- What is the project name and a one-sentence description of what it is?
-- Which Unreal Engine version are you using (e.g., 5.3, 5.4)? Is this a launcher build or a source build?
-- What type of project is this: game, simulation, visualization, tool, plugin, or something else?
-- What genre or domain (e.g., first-person shooter, strategy, architectural viz, training sim)?
-- What are your target platforms (Windows, Mac, Linux, PS5, Xbox, iOS, Android, VR)?
+**Engine and project.** Project name and a one-sentence description. Engine version, launcher or source build. Project type (game, simulation, visualisation, tool, plugin) and genre. Target platforms.
 
-### 2. Module Structure
+**Modules.** Module names, which is the primary game module, and each module's host type (`Runtime`, `Editor`, `Developer`, `CookedOnly`, `UncookedOnly`, `Program`). Key dependencies per module.
 
-Discovery questions:
-- How many modules does the project have? What are their names?
-- Which is the primary game module?
-- What type is each module: Runtime, Editor, Developer, or ThirdParty?
-- Are any modules shared libraries or standalone plugins?
-- Are there any modules under active development vs. stable/locked modules?
+**Plugins.** Walk the [Plugin checklist](#plugin-checklist) by area rather than reciting names. Then in-house plugins under `Plugins/`, Fab/marketplace plugins critical to gameplay, and any licence restriction worth recording.
 
-### 3. Plugin Dependencies
+**Conventions.** Epic's `F`/`U`/`A`/`E`/`I` prefixes or a house variant. `TObjectPtr` for `UPROPERTY` object references, or raw pointers. Module API macro style — `MYGAME_API` on each declaration, or a per-header `#define UE_API MYGAME_API`. Log category names. Assertion policy (`check`, `checkf`, `ensure`, `ensureMsgf`, `verify`) and where each is allowed. Public/Private header layout. Any rule enforced in review.
 
-Discovery questions:
-- Which engine plugins are enabled (e.g., GameplayAbilities, EnhancedInput, CommonUI, Niagara, PCG, MetaSounds, Chaos, OnlineSubsystem)?
-- Do you use any Fab/Marketplace plugins? Which ones are critical to gameplay?
-- Do you have any custom or in-house plugins in the `Plugins/` directory?
-- Are any plugins licensed with restrictions the AI should know about?
+**Gameplay framework.** Class names for GameMode, GameState, PlayerController, PlayerState, Pawn/Character, GameInstance. Subsystem classes in use and what each owns.
 
-### 4. Coding Conventions
+**GAS.** Whether `GameplayAbilities` is enabled; if so, the AbilitySystemComponent subclass, AttributeSet class names, the ability base class, and where the tag hierarchy is defined.
 
-Discovery questions:
-- Do you follow Epic's standard UE naming prefixes (F, U, A, E, I)? Any exceptions or additions?
-- Do you use `#pragma once` or traditional header guards?
-- What `DEFINE_LOG_CATEGORY` names does the project use most?
-- What is your preferred assertion style: `check()`, `ensure()`, `checkf()`, or `verify()`?
-- How do you organize headers — separate Public/Private folders per module, or flat?
-- Any other code style rules the team enforces (e.g., no raw pointers for UObjects, always use TObjectPtr)?
+**Networking.** Listen server, dedicated server, or single-player. `Iris` or classic replication. Push model on or off. `ReplicationGraph` in use. Expected player count and tick budget.
 
-### 5. Subsystems in Use
+**Input.** `EnhancedInput` or legacy mappings. Where `UInputMappingContext` and `UInputAction` assets live, and which class adds the contexts.
 
-Discovery questions:
-- Do you have a custom GameMode or GameState? What are the class names?
-- What custom PlayerController and Pawn/Character classes exist?
-- Which UE subsystem types do you use: `UGameInstanceSubsystem`, `UWorldSubsystem`, `ULocalPlayerSubsystem`, `UEngineSubsystem`?
-- Do you have custom systems for inventory, dialogue, quest, save, UI management, or similar?
-- Are you using the Gameplay Ability System (GAS)? If so, what are your key Ability, Effect, and AttributeSet class names?
+**UI.** UMG only, `CommonUI`, or `CommonUI` plus `ModelViewViewModel`. Base widget classes and how the HUD/menu stack is managed.
 
-### 6. Build Configuration
+**AI.** Behavior Trees, `StateTree`/`GameplayStateTree`, Mass, or a custom stack. Navigation setup and whether `SmartObjects` is in use.
 
-Discovery questions:
-- Which build targets do you ship: Game, Editor, Server, Client, or a subset?
-- Do you define any custom preprocessor macros or build flags?
-- Do you integrate any third-party C++ libraries? Which ones and how (binary, source)?
-- Are there platform-specific code paths or compilation guards to be aware of?
-- Do you use a custom engine fork or any engine modifications?
+**Streaming.** World Partition with Data Layers, or classic sub-levels. Level-instancing approach.
 
-### 7. Team Context (Optional)
+**Saves.** `USaveGame` subclass names, slot naming, versioning approach.
 
-Discovery questions:
-- How large is the team, and what are the main roles (engineers, designers, artists)?
-- What source control system do you use (Perforce, Git, Plastic SCM)?
-- Do you have a branching strategy or lock policy for assets?
-- Do you have a code review process? What's the bar for approval?
-- Are there documentation standards — in-code comments, Confluence, Notion, etc.?
+**Build.** Which target types ship. Custom preprocessor defines. Third-party libraries and how they are integrated. Platform-specific code paths. Engine fork or modifications.
 
----
+**Team.** Size and roles. Source control (Perforce, Git, Plastic). Branching and asset-lock policy. Review bar. Documentation home.
 
-## Step 3: Create the Document
+## Document template
 
-After gathering information, create `.agents/ue-project-context.md` with this structure:
+Write `.agents/ue-project-context.md` in this shape. Drop any section the project genuinely has nothing to say about.
 
 ```markdown
 # UE Project Context
 
-*Last updated: [date]*
+*Engine: UE 5.8 · Last updated: [date]*
 
-## Engine & Project Overview
-**Engine version:** [e.g., UE 5.4 — Launcher build]
-**Project name:** [name]
+## Engine & Project
+**Engine version:** [5.8 — launcher build / source build at [path]]
+**Project name:** [name] · **Type:** [game / sim / tool] · **Genre:** [genre]
 **Description:** [one sentence]
-**Project type:** [game / simulation / visualization / tool]
-**Genre / domain:** [e.g., third-person action RPG]
-**Target platforms:**
-- [Platform 1]
-- [Platform 2]
+**Target platforms:** [list]
 
-## Module Structure
+## Modules
 **Primary game module:** [ModuleName]
 
-| Module | Type | Notes |
-|--------|------|-------|
-| [Name] | Runtime | Core gameplay |
-| [Name] | Editor | Custom editor tools |
-| [Name] | Developer | Shared utilities |
+| Module | Host type | Public deps | Private deps | Notes |
+|---|---|---|---|---|
+| [MyGame] | Runtime | Core, CoreUObject, Engine, InputCore | [list] | [purpose] |
+| [MyGameEditor] | Editor | [list] | [list] | [purpose] |
 
-**Key dependencies per module:**
-- **[ModuleName]**: PublicDeps: [list]; PrivateDeps: [list]
+## Plugins
+| Plugin | Maturity | Used for |
+|---|---|---|
+| [EnhancedInput] | [stable] | [input] |
+| [Mover] | [Experimental] | [locomotion prototype] |
 
-## Plugin Dependencies
-**Engine plugins enabled:**
-- [PluginName] — [brief purpose]
+**In-house plugins:** [Name — purpose]
+**Fab / marketplace:** [Name — purpose, licence notes]
 
-**Marketplace / Fab plugins:**
-- [PluginName] — [brief purpose]
+## Coding conventions
+**Prefixes:** [standard F/U/A/E/I, exceptions]
+**Object references:** [TObjectPtr in UPROPERTY / raw pointers]
+**API macro style:** [MYGAME_API per declaration / per-header #define UE_API MYGAME_API]
+**Log categories:** `[LogMyGame]` — [scope]
+**Assertions:** [check where / ensure where / verify where]
+**Header layout:** [Public/Private per module / flat]
+**Enforced rules:** [list]
 
-**Custom plugins:**
-- [PluginName] — [brief purpose]
+## Gameplay framework
+| Role | Class |
+|---|---|
+| GameMode | `[AMyGameMode]` |
+| GameState | `[AMyGameState]` |
+| PlayerController | `[AMyPlayerController]` |
+| PlayerState | `[AMyPlayerState]` |
+| Pawn / Character | `[AMyCharacter]` |
+| GameInstance | `[UMyGameInstance]` |
 
-## Coding Conventions
-**Naming prefixes:** Standard UE (F/U/A/E/I) [+ any exceptions]
-**Header style:** `#pragma once`
-**Log categories in use:**
-- `LOG_[CategoryName]` — [scope]
-**Assertion style:** [check / ensure / verify — preferred and rationale]
-**Header organization:** [Public/Private folders per module / flat]
-**Additional rules:**
-- [Rule 1]
-- [Rule 2]
+**Subsystems:** `[UMyClass]` ([UGameInstanceSubsystem / UWorldSubsystem / ULocalPlayerSubsystem]) — [owns]
 
-## Subsystems in Use
-**Gameplay framework:**
-- GameMode: `[ClassName]`
-- GameState: `[ClassName]`
-- PlayerController: `[ClassName]`
-- Pawn / Character: `[ClassName]`
+## GAS
+**Enabled:** [yes / no]
+**AbilitySystemComponent:** `[UMyAbilitySystemComponent]` — lives on [PlayerState / Pawn]
+**AttributeSets:** `[UMyAttributeSet]` — [attributes]
+**Ability base:** `[UMyGameplayAbility]`
+**Tag source:** [Config/DefaultGameplayTags.ini / native tags in [file]]
 
-**Subsystems:**
-| Class | Type | Responsibility |
-|-------|------|----------------|
-| [ClassName] | UGameInstanceSubsystem | [purpose] |
-| [ClassName] | UWorldSubsystem | [purpose] |
+## Networking
+**Model:** [single-player / listen server / dedicated server]
+**Replication stack:** [classic / Iris (Beta)]
+**Push model:** [on / off] · **ReplicationGraph:** [yes / no]
+**Budget:** [N players, tick rate]
 
-**Custom systems:**
-- [System name]: [brief description and key classes]
+## Input
+**Stack:** [EnhancedInput / legacy]
+**Mapping contexts:** [asset paths] · **Added by:** `[class]`
 
-**GAS usage:**
-- Abilities: [base class name]
-- Attribute Sets: [class names]
-- Key gameplay tags: [list or "see Config/DefaultGameplayTags.ini"]
+## UI
+**Stack:** [UMG / CommonUI / CommonUI + ModelViewViewModel]
+**Base widgets:** `[UMyUserWidget]` · **Layer / stack management:** [description]
 
-## Build Configuration
-**Build targets:** [Game, Editor, Server, Client — which apply]
-**Custom macros / build flags:**
-- `[MACRO_NAME]` — [purpose]
-**Third-party libraries:**
-- [LibraryName] — [integration method: binary / source]
-**Platform-specific notes:**
-- [Platform]: [relevant constraint or code path]
-**Engine modifications:** [None / Custom fork at [repo] — [what was changed]]
+## AI
+**Stack:** [Behavior Trees / StateTree / GameplayStateTree / Mass / custom]
+**Navigation:** [NavMesh setup] · **SmartObjects:** [yes / no]
 
-## Team Context
-**Team size:** [N engineers, N designers, N artists]
-**Source control:** [Perforce / Git / Plastic SCM]
-**Branching strategy:** [description]
-**Code review:** [process and bar]
-**Documentation standards:** [in-code / Confluence / Notion / etc.]
+## Streaming
+**Model:** [World Partition + Data Layers / sub-levels]
+**Notes:** [cell size, streaming sources, level instances]
+
+## Saves
+**SaveGame classes:** `[UMySaveGame]` · **Slots:** [naming] · **Versioning:** [approach]
+
+## Build
+**Targets:** [Game, Editor, Client, Server]
+**Defines:** `[MYGAME_WITH_CHEATS]` — [purpose]
+**Third-party:** [Library — binary / source]
+**Platform notes:** [platform: constraint]
+**Engine modifications:** [none / fork at [repo] — [what changed]]
+
+## Team
+**Size & roles:** [N engineers, N designers, N artists]
+**Source control:** [Perforce / Git / Plastic] · **Branching:** [strategy]
+**Review bar:** [description] · **Docs:** [where]
 ```
 
----
+## Deprecated — do not use
 
-## Step 4: Confirm and Save
+Old forms an agent is likely to write into a context document, or into the code it generates from one.
 
-- Show the completed document
-- Ask if anything needs adjustment before saving
-- Save to `.agents/ue-project-context.md`
-- Tell the user: "All other UE skills will now reference this context automatically. Run `/ue-project-context` anytime to update it as your project evolves."
+| Do not emit | Use in 5.8 | Source |
+|---|---|---|
+| `GENERATED_UCLASS_BODY()` | `GENERATED_BODY()` | `#define GENERATED_UCLASS_BODY(...) GENERATED_BODY_LEGACY()` in `CoreUObject/Public/UObject/ObjectMacros.h:803` |
+| `UPROPERTY() UObject* Ptr;` | `UPROPERTY() TObjectPtr<UObject> Ptr;` | `struct TObjectPtr` in `CoreUObject/Public/UObject/ObjectPtr.h:519` |
+| `NetUpdateFrequency = 10.f;` | `SetNetUpdateFrequency(10.f)` / `GetNetUpdateFrequency()` | `UE_DEPRECATED(5.5)` in `Engine/Classes/GameFramework/Actor.h:903` |
+| `MinNetUpdateFrequency = 2.f;` | `SetMinNetUpdateFrequency(2.f)` / `GetMinNetUpdateFrequency()` | `UE_DEPRECATED(5.5)` in `Engine/Classes/GameFramework/Actor.h:908` |
+| `UDataLayerSubsystem` accessors | the `UDataLayerManager` equivalents | `UE_DEPRECATED(5.3)` in `Engine/Public/WorldPartition/DataLayer/DataLayerSubsystem.h:37` |
+| `bEnableDynamicComponentInputBinding` in `DefaultInput.ini` | drop the key | `UE_DEPRECATED(5.7)` in `Engine/Classes/GameFramework/InputSettings.h:96` |
+| `SpeechMappings` in `DefaultInput.ini` | drop the key | `UE_DEPRECATED(5.7)` in `Engine/Classes/GameFramework/InputSettings.h:211` |
+| `[/Script/Engine.GameMapsSettings]` | `[/Script/EngineSettings.GameMapsSettings]` | `class UGameMapsSettings` in `Runtime/EngineSettings/Classes/GameMapsSettings.h:101` |
+| `MetaSounds` as a plugin name | `Metasound` | `Engine/Plugins/Runtime/Metasound/Metasound.uplugin` |
 
----
+## Common Mistakes
 
-## Tips
+**Opening with a questionnaire instead of a draft:** the `.uproject`, the `*.Build.cs` files and `Config/Default*.ini` answer most of the document. Scan, draft, then find out what is wrong — do not make the user dictate what is already on disk.
 
-- **Prioritize auto-draft**: Even a partial scan saves significant back-and-forth.
-- **Engine version matters**: UE 5.0 vs 5.4 have meaningful API differences — always confirm it.
-- **Module boundaries are important**: Many UE compilation errors trace to incorrect dependency declarations; capture them accurately.
-- **Ask for class names, not descriptions**: "What's your GameMode called?" beats "Do you have a custom GameMode?"
-- **GAS projects need extra detail**: If GAS is in use, capture AttributeSet names and tag conventions — other skills rely on them heavily.
-- **Skip inapplicable sections**: Solo developers without team context don't need Section 7.
-- **Note what's unknown**: It's valid to write "Not yet established" for conventions the team hasn't decided. Don't invent answers.
+**Guessing to fill a gap:** a fabricated team size or assertion policy is worse than a blank, because every other skill then acts on it. Write `[unknown]` and move on.
 
----
+**Writing friendly plugin names:** record the `.uplugin` name (`ModelViewViewModel`, `Metasound`, `GameplayAbilities`), not the display name, so other skills can match it against `.uproject` `Plugins[]`.
+
+**Misjudging plugin state:** a plugin is active if its `.uproject` `Plugins[]` entry has `"Enabled": true`, or if it is enabled by default and not disabled there — and a project plugin under `Plugins/` with no `EnabledByDefault` key counts as enabled by default.
+
+**Putting `GameMapsSettings` under the `Engine` module:** the class lives in the `EngineSettings` module, so the section is `[/Script/EngineSettings.GameMapsSettings]`. The wrong section silently does nothing.
+
+**Omitting maturity:** an Experimental or Beta plugin changes what other skills should recommend. `Mover` (Experimental), `Iris` (Beta) and `GameplayCameras` (Experimental) each need the label next to the name.
+
+**Dropping module dependencies:** most UE link errors trace to a missing entry in `PublicDependencyModuleNames`/`PrivateDependencyModuleNames`. Capture both lists per module verbatim.
+
+**Overwriting on a refresh:** on a re-run, merge into the existing file. Sections the user did not revisit keep their content.
 
 ## Related Skills
 
-Other UE skills that depend on this context:
-- `ue-cpp-foundations` — uses module names and coding conventions
-- `ue-module-build-system` — uses module structure and dependencies
-- `ue-gameplay-abilities` — uses GAS setup and attribute sets
-- `ue-gameplay-framework` — uses GameMode, GameState, and PlayerController classes
-- `ue-actor-component-architecture` — uses module structure and subsystem list
-- `ue-input-system` — uses Enhanced Input plugin status and PlayerController class
-- `ue-ui-umg-slate` — uses CommonUI plugin status and module structure
-- `ue-networking-replication` — uses build targets (Server/Client) and GameState class
-- `ue-testing-debugging` — uses log categories and module structure
-- `ue-editor-tools` — uses Editor module names and plugin list
+Skills that read `.agents/ue-project-context.md`, and what each takes from it:
+
+- `ue-module-build-system` — module list, host types, Build.cs dependency lists, target types
+- `ue-cpp-foundations` — naming prefixes, `TObjectPtr` policy, API macro style, assertion policy
+- `ue-gameplay-framework` — GameMode, GameState, PlayerController, PlayerState, Pawn classes
+- `ue-gameplay-abilities` — GAS setup, AbilitySystemComponent owner, AttributeSet names
+- `ue-gameplay-tags-messaging` — tag source (`DefaultGameplayTags.ini` or native tags) and messaging stack
+- `ue-networking-replication` — networking model, Iris versus classic, push model, ReplicationGraph
+- `ue-input-system` — Enhanced Input status, mapping context locations, PlayerController class
+- `ue-ui-umg-slate` — CommonUI / ModelViewViewModel status and base widget classes
+- `ue-blueprint-cpp-interop` — API macro style and which systems are Blueprint-facing
+- `ue-actor-component-architecture` — subsystem list and component conventions
+- `ue-character-movement` — character class and movement stack
+- `ue-mover` — whether the `Mover` plugin (Experimental) is enabled
+- `ue-gameplay-cameras` — whether `GameplayCameras` (Experimental) is enabled
+- `ue-ai-navigation` — AI stack, navigation setup, SmartObjects status
+- `ue-state-trees` — StateTree / GameplayStateTree plugin status
+- `ue-world-level-streaming` — World Partition versus sub-levels, Data Layer usage
+- `ue-serialization-savegames` — SaveGame classes, slot naming, versioning
+- `ue-testing-debugging` — log categories, assertion policy, module list
+- `ue-editor-tools` — Editor module names and editor plugin list
+- `ue-game-features` — GameFeatures / ModularGameplay plugin status

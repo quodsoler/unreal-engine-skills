@@ -1,17 +1,19 @@
 # Threading Patterns Reference
 
-Complete code templates for UE async and threading patterns. Each template is production-ready with proper lifecycle management and error handling.
+Complete templates for UE 5.8 async and threading patterns. Each snippet compiles against the 5.8 headers named in its include list; user types follow the `FMy*`/`AMy*` convention.
 
 ---
 
 ## FRunnable Subclass Template
 
-Full dedicated-thread pattern with cooperative shutdown via `std::atomic<bool>`.
+Dedicated thread with cooperative shutdown through `std::atomic<bool>` and an event so the loop never spins.
 
 ```cpp
 #include "HAL/Runnable.h"
 #include "HAL/RunnableThread.h"
+#include "HAL/Event.h"
 #include "HAL/PlatformProcess.h"
+#include "Containers/MpscQueue.h"
 #include <atomic>
 
 class FMyBackgroundWorker : public FRunnable
@@ -19,99 +21,112 @@ class FMyBackgroundWorker : public FRunnable
 public:
     FMyBackgroundWorker() = default;
 
-    // Start the thread — call from game thread
-    void StartThread()
-    {
-        Thread = FRunnableThread::Create(
-            this,
-            TEXT("MyBackgroundWorker"),
-            0,                    // StackSize (0 = platform default)
-            TPri_BelowNormal,    // lower than game thread
-            FPlatformAffinity::GetPoolThreadMask()
-        );
-    }
-
-    // Request shutdown and wait — call from game thread
     ~FMyBackgroundWorker()
     {
-        if (Thread)
+        StopThread();
+    }
+
+    // Call from the game thread
+    void StartThread()
+    {
+        if (Thread == nullptr)
         {
-            Thread->Kill(true);  // calls Stop(), then blocks until Run() exits
+            Thread = FRunnableThread::Create(
+                this,
+                TEXT("MyBackgroundWorker"),
+                0,                                   // InStackSize: 0 = platform default
+                TPri_BelowNormal,                    // stay below the game thread
+                FPlatformAffinity::GetPoolThreadMask(),
+                EThreadCreateFlags::None);
+        }
+    }
+
+    // Call from the game thread; safe to call twice
+    void StopThread()
+    {
+        if (Thread != nullptr)
+        {
+            Thread->Kill(true);                      // calls Stop(), then blocks until Run() returns
             delete Thread;
             Thread = nullptr;
         }
     }
 
-    // --- FRunnable interface ---
-
-    bool Init() override
+    // Any thread
+    void Submit(int32 WorkItem)
     {
-        // Runs on NEW thread before Run() starts
-        // Return false to abort thread creation
-        return true;
+        Queue.Enqueue(WorkItem);
+        WakeEvent->Trigger();
     }
 
-    uint32 Run() override
+    // --- FRunnable (HAL/Runnable.h:32-61) ---
+    virtual bool Init() override
     {
-        // Runs on the NEW thread
-        while (!bShouldStop.load(std::memory_order_relaxed))
-        {
-            // --- Do your work here ---
-            ProcessNextWorkItem();
+        return true;                                 // new thread; return false to abort
+    }
 
-            // Yield to prevent CPU spin when no work available
-            FPlatformProcess::Sleep(0.001f);
+    virtual uint32 Run() override
+    {
+        while (!bStopRequested.load(std::memory_order_relaxed))
+        {
+            int32 Item = 0;
+            while (Queue.Dequeue(Item))
+            {
+                ProcessItem(Item);
+            }
+            WakeEvent->Wait(100);                    // ms; wakes early on Trigger()
         }
         return 0;
     }
 
-    void Stop() override
+    virtual void Stop() override
     {
-        // Called from OUTSIDE the thread (by Kill or directly)
-        // Must be thread-safe — only set the atomic flag
-        bShouldStop.store(true, std::memory_order_relaxed);
+        bStopRequested.store(true, std::memory_order_relaxed);   // called from the killing thread; signal only
+        WakeEvent->Trigger();
     }
 
-    void Exit() override
+    virtual void Exit() override
     {
-        // Runs on the worker thread AFTER Run() returns
-        // Clean up thread-local resources here
+        // new thread, after Run() returns: release thread-local resources
     }
 
 private:
-    std::atomic<bool> bShouldStop{false};
-    FRunnableThread* Thread = nullptr;
-
-    void ProcessNextWorkItem()
+    void ProcessItem(int32 Item)
     {
-        // Your actual work implementation
+        // pure data work; no UObject access here
     }
+
+    FRunnableThread* Thread = nullptr;
+    FEventRef WakeEvent{ EEventMode::AutoReset };    // HAL/Event.h:136 — pooled FEvent, released in the destructor
+    TMpscQueue<int32> Queue;
+    std::atomic<bool> bStopRequested{ false };
 };
 ```
+
+`FRunnableThread::Create(FRunnable*, const TCHAR* ThreadName, uint32 InStackSize = 0, EThreadPriority InThreadPri = TPri_Normal, uint64 InThreadAffinityMask = FPlatformAffinity::GetNoAffinityMask(), EThreadCreateFlags InCreateFlags = EThreadCreateFlags::None)` (`HAL/RunnableThread.h:44`). If the platform reports `FPlatformProcess::SupportsMultithreading() == false`, `GetSingleThreadInterface()` must return an `FSingleThreadRunnable*` that the engine ticks instead, otherwise return `nullptr` and the feature is unavailable there.
 
 ---
 
 ## FNonAbandonableTask + FAsyncTask Template
 
-Thread pool work unit pattern. The `friend` declaration lets `FAsyncTask` construct the inner task.
+Thread-pool work unit. `FAsyncTask<T>` constructs `T` from the forwarded arguments; you read the result through `GetTask()`. Construction happens inside `FAsyncTask<T>`, so the friend declaration lets the constructor be private; `GetTask()` reads happen in your code, so the result members must be `public`.
 
 ```cpp
 #include "Async/AsyncWork.h"
 
-class FChunkProcessTask : public FNonAbandonableTask
+class FMyChunkProcessTask : public FNonAbandonableTask
 {
-    friend class FAsyncTask<FChunkProcessTask>;
-
 public:
-    // Results accessible after completion
-    TArray<FVector> ProcessedVertices;
+    friend class FAsyncTask<FMyChunkProcessTask>;
+    friend class FAutoDeleteAsyncTask<FMyChunkProcessTask>;
 
-private:
-    // Constructor — args forwarded from FAsyncTask constructor
-    FChunkProcessTask(TArray<FVector> InRawVertices, float InScale)
+    FMyChunkProcessTask(TArray<FVector> InRawVertices, float InScale)
         : RawVertices(MoveTemp(InRawVertices))
         , Scale(InScale)
     {}
+
+    // Result: read after IsDone()/EnsureCompletion()
+    TArray<FVector> ProcessedVertices;
 
     void DoWork()
     {
@@ -124,59 +139,54 @@ private:
 
     FORCEINLINE TStatId GetStatId() const
     {
-        RETURN_QUICK_DECLARE_CYCLE_STAT(FChunkProcessTask, STATGROUP_ThreadPoolAsyncTasks);
+        RETURN_QUICK_DECLARE_CYCLE_STAT(FMyChunkProcessTask, STATGROUP_ThreadPoolAsyncTasks);
     }
 
+private:
     TArray<FVector> RawVertices;
     float Scale;
 };
 
-// --- Usage: reusable task ---
-auto* Task = new FAsyncTask<FChunkProcessTask>(MoveTemp(Vertices), 2.0f);
-Task->StartBackgroundTask();          // dispatch to GThreadPool
-// ... do other game thread work ...
-Task->EnsureCompletion();             // block until done
-TArray<FVector> Result = MoveTemp(Task->GetTask().ProcessedVertices);
-delete Task;
+// --- Owner-managed: keep the pointer, poll, then collect ---
+TArray<FVector> Vertices;
+FAsyncTask<FMyChunkProcessTask>* Task = new FAsyncTask<FMyChunkProcessTask>(MoveTemp(Vertices), 2.0f);
+Task->StartBackgroundTask(GBackgroundPriorityThreadPool);     // default pool is GThreadPool
+// ... later, once per frame:
+if (Task->IsDone())
+{
+    TArray<FVector> Result = MoveTemp(Task->GetTask().ProcessedVertices);
+    delete Task;
+    Task = nullptr;
+}
+// ... or force completion (runs inline if not started yet):
+// Task->EnsureCompletion(); delete Task;
 
-// --- Usage: fire-and-forget ---
-(new FAutoDeleteAsyncTask<FChunkProcessTask>(MoveTemp(Vertices), 2.0f))
-    ->StartBackgroundTask();
-// Task auto-deletes when DoWork completes — no result retrieval possible
+// --- Fire-and-forget: deletes itself after DoWork, no result retrieval ---
+(new FAutoDeleteAsyncTask<FMyChunkProcessTask>(MoveTemp(Vertices), 2.0f))->StartBackgroundTask();
 ```
+
+Member signatures (`Async/AsyncWork.h`): `StartBackgroundTask(FQueuedThreadPool* InQueuedPool = GThreadPool, EQueuedWorkPriority InQueuedWorkPriority = EQueuedWorkPriority::Normal, EQueuedWorkFlags InQueuedWorkFlags = EQueuedWorkFlags::None, int64 InRequiredMemory = -1, const TCHAR* InDebugName = nullptr)` (`:423`), `StartSynchronousTask(...)` (`:415`), `EnsureCompletion(bool bDoWorkOnThisThreadIfNotStarted = true, bool bIsLatencySensitive = false)` (`:433`), `bool Cancel()` (`:486`), `bool WaitCompletionWithTimeout(float TimeLimitSeconds)` (`:512`), `bool IsDone()` (`:544`), `bool IsWorkDone() const` (`:558`), `TTask& GetTask()` (`:631`).
 
 ---
 
 ## TGraphTask Template with Prerequisites
 
-Custom TaskGraph task with dependency chaining.
+Legacy TaskGraph class-based task; still compiles and interoperates with `UE::Tasks` (an `FGraphEventRef` is a valid prerequisite for `UE::Tasks::Launch`). Prefer `UE::Tasks` for new code.
 
 ```cpp
 #include "Async/TaskGraphInterfaces.h"
 
-class FComputeNavTask
+class FMySmoothPathTask
 {
 public:
-    FComputeNavTask(TArray<FVector>& InOutPath) : Path(InOutPath) {}
+    explicit FMySmoothPathTask(TArray<FVector>& InOutPath) : Path(InOutPath) {}
 
-    static ESubsequentsMode::Type GetSubsequentsMode()
-    {
-        return ESubsequentsMode::TrackSubsequents;
-    }
-
-    ENamedThreads::Type GetDesiredThread()
-    {
-        return ENamedThreads::AnyThread;
-    }
-
-    TStatId GetStatId() const
-    {
-        RETURN_QUICK_DECLARE_CYCLE_STAT(FComputeNavTask, STATGROUP_TaskGraphTasks);
-    }
+    static ESubsequentsMode::Type GetSubsequentsMode() { return ESubsequentsMode::TrackSubsequents; }
+    ENamedThreads::Type GetDesiredThread() { return ENamedThreads::AnyBackgroundThreadNormalTask; }
+    TStatId GetStatId() const { RETURN_QUICK_DECLARE_CYCLE_STAT(FMySmoothPathTask, STATGROUP_TaskGraphTasks); }
 
     void DoTask(ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent)
     {
-        // Compute path — runs on worker thread
         for (FVector& Point : Path)
         {
             Point = SmoothPoint(Point);
@@ -187,63 +197,93 @@ private:
     TArray<FVector>& Path;
 };
 
-// --- Dispatch with prerequisites ---
-FGraphEventArray NoPrereqs;
-FGraphEventRef StepA = TGraphTask<FComputeNavTask>::CreateTask(&NoPrereqs)
-    .ConstructAndDispatchWhenReady(PathData);
+// Step A: no prerequisites
+TArray<FVector> PathData;
+FGraphEventRef StepA = TGraphTask<FMySmoothPathTask>::CreateTask(nullptr).ConstructAndDispatchWhenReady(PathData);
 
+// Step B: same task type again, after A (FGraphEventArray = TArray<FGraphEventRef, TInlineAllocator<4>>)
 FGraphEventArray StepAPrereq;
 StepAPrereq.Add(StepA);
-FGraphEventRef StepB = TGraphTask<FApplyNavTask>::CreateTask(&StepAPrereq)
-    .ConstructAndDispatchWhenReady(PathData);
+FGraphEventRef StepB = TGraphTask<FMySmoothPathTask>::CreateTask(&StepAPrereq).ConstructAndDispatchWhenReady(PathData);
 
-// Wait for final step on game thread
-FTaskGraphInterface::Get().WaitUntilTaskCompletes(StepB, ENamedThreads::GameThread);
+// Lambda form without a class (Async/TaskGraphInterfaces.h:1135)
+FGraphEventRef StepC = FFunctionGraphTask::CreateAndDispatchWhenReady(
+    [&PathData]() { FinalizePath(PathData); }, TStatId(), &StepAPrereq, ENamedThreads::AnyThread);
+
+// Wait on the game thread (Async/TaskGraphInterfaces.h:414)
+FTaskGraphInterface::Get().WaitUntilTaskCompletes(StepC, ENamedThreads::GameThread);
+
+// Or feed the legacy event into UE::Tasks: a single FGraphEventRef is a valid prerequisites argument (Tasks/TaskPrivate.h:266)
+UE::Tasks::TTask<void> After = UE::Tasks::Launch(UE_SOURCE_LOCATION, []() { PublishPath(); }, StepC);
 ```
 
 ---
 
-## UE::Tasks::Launch with Prerequisites
-
-Modern preferred API (UE 5.0+).
+## UE::Tasks Chain with FTaskEvent and Cancellation
 
 ```cpp
 #include "Tasks/Task.h"
+#include "Tasks/Pipe.h"                     // FPipe (Tasks/Task.h only forward-declares it)
+#include "Tasks/TaskConcurrencyLimiter.h"   // FTaskConcurrencyLimiter
 
-// Step 1: compute positions
-UE::Tasks::TTask<TArray<FVector>> PosTask = UE::Tasks::Launch(
-    UE_SOURCE_LOCATION,
-    []() -> TArray<FVector>
-    {
-        TArray<FVector> Positions;
-        // ... expensive computation ...
-        return Positions;
-    }
-);
+using namespace UE::Tasks;
 
-// Step 2: depends on step 1
-UE::Tasks::TTask<TArray<FVector>> SmoothTask = UE::Tasks::Launch(
-    UE_SOURCE_LOCATION,
-    [&PosTask]() -> TArray<FVector>
-    {
-        TArray<FVector> Raw = PosTask.GetResult();
-        // ... smooth positions ...
-        return Raw;
-    },
-    UE::Tasks::Prerequisites(PosTask)
-);
-
-// Retrieve on game thread (blocks until chain completes)
-TArray<FVector> Final = SmoothTask.GetResult();
-
-// Non-blocking check
-if (SmoothTask.IsCompleted()) { /* safe to GetResult without blocking */ }
-
-// Timed wait
-if (SmoothTask.Wait(FTimespan::FromMilliseconds(5.0)))
+// Step 1: produce
+TTask<TArray<FVector>> PosTask = Launch(UE_SOURCE_LOCATION, []() -> TArray<FVector>
 {
-    // completed within timeout
+    TArray<FVector> Positions;
+    FillPositions(Positions);
+    return Positions;
+});
+
+// Step 2: consume step 1 (capture the handle by value; GetResult() is non-const so the lambda is mutable)
+TTask<TArray<FVector>> SmoothTask = Launch(UE_SOURCE_LOCATION, [PosTask]() mutable -> TArray<FVector>
+{
+    TArray<FVector> Raw = PosTask.GetResult();
+    SmoothPositions(Raw);
+    return Raw;
+}, Prerequisites(PosTask), ETaskPriority::BackgroundNormal);
+
+// Step 3: gated by an event the game thread triggers later
+FTaskEvent PublishGate{ UE_SOURCE_LOCATION };
+FCancellationToken Cancel;
+TTask<void> PublishTask = Launch(UE_SOURCE_LOCATION, [SmoothTask, &Cancel]() mutable
+{
+    if (Cancel.IsCanceled()) { return; }
+    const TArray<FVector>& Final = SmoothTask.GetResult();
+    PublishPositions(Final);
+}, Prerequisites(SmoothTask, PublishGate));
+
+PublishGate.Trigger();                                            // releases step 3 once step 2 is done
+
+// Nested task: parent is not complete until the nested one is, without blocking a worker
+TTask<void> Parent = Launch(UE_SOURCE_LOCATION, []()
+{
+    TTask<void> Child = Launch(UE_SOURCE_LOCATION, []() { ChildWork(); });
+    AddNested(Child);
+});
+
+// Group wait with timeout; WaitAny returns the index of the first completed task or INDEX_NONE
+TArray<FTask> All{ PublishTask, Parent };
+const bool bDone = Wait(All, FTimespan::FromMilliseconds(2.0));
+const int32 FirstDone = WaitAny(All, FTimespan::Zero());
+
+// Game-thread body via extended priority (no AsyncTask needed)
+Launch(UE_SOURCE_LOCATION, []() { check(IsInGameThread()); }, ETaskPriority::Normal, EExtendedTaskPriority::GameThreadNormalPri);
+
+// Pipe: serialize access to one resource
+FPipe StatsPipe{ TEXT("StatsPipe") };
+StatsPipe.Launch(UE_SOURCE_LOCATION, []() { AccumulateStats(0); });
+StatsPipe.Launch(UE_SOURCE_LOCATION, []() { AccumulateStats(1); });   // runs strictly after the previous pipe task
+StatsPipe.WaitUntilEmpty();
+
+// Concurrency limiter: at most 3 tasks in flight, each gets a unique slot index for scratch buffers
+FTaskConcurrencyLimiter Limiter(3, ETaskPriority::BackgroundHigh);
+for (int32 Index = 0; Index < 32; ++Index)
+{
+    Limiter.Push(UE_SOURCE_LOCATION, [Index](uint32 Slot) { DecompressInto(Index, Slot); });
 }
+Limiter.Wait(FTimespan::FromSeconds(10.0));
 ```
 
 ---
@@ -253,34 +293,47 @@ if (SmoothTask.Wait(FTimespan::FromMilliseconds(5.0)))
 ```cpp
 #include "Async/ParallelFor.h"
 
-// Basic — all iterations equal cost
-ParallelFor(Meshes.Num(), [&Meshes](int32 Index)
+TArray<UStaticMesh*> Meshes;
+
+// Basic — equal-cost iterations (Async/ParallelFor.h:526)
+ParallelFor(Meshes.Num(), [&Meshes](int32 Index) { ProcessMesh(Meshes[Index]); });
+
+// Named, with MinBatchSize — avoids task overhead on small ranges (:543)
+ParallelFor(TEXT("MeshProcess"), Meshes.Num(), 128, [&Meshes](int32 Index) { ProcessMesh(Meshes[Index]); });
+
+// Flags — variable-cost iterations at background priority
+ParallelFor(Meshes.Num(), [&Meshes](int32 Index) { ProcessMesh(Meshes[Index]); },
+    EParallelForFlags::Unbalanced | EParallelForFlags::BackgroundPriority);
+
+// Per-task context — one FMyScratch per worker task, Body(ContextType&, int32) (:792)
+struct FMyScratch
 {
-    ProcessMesh(Meshes[Index]);
-});
-
-// With MinBatchSize — avoids thread overhead for small counts
-ParallelFor(TEXT("MeshProcess"), Meshes.Num(), 128,
-    [&Meshes](int32 Index) { ProcessMesh(Meshes[Index]); }
-);
-
-// With flags — variable-cost iterations at background priority
-ParallelFor(Meshes.Num(), [&Meshes](int32 Index)
-{
-    ProcessMesh(Meshes[Index]);
-}, EParallelForFlags::Unbalanced | EParallelForFlags::BackgroundPriority);
-
-// With per-thread context — avoids per-iteration allocation
-TArray<FMyThreadContext> OutContexts;
-ParallelForWithTaskContext(TEXT("GenNormals"), OutContexts, Meshes.Num(), 64,
-    [&Meshes](FMyThreadContext& Ctx, int32 Index)
+    TArray<FVector> TempBuffer;
+};
+TArray<FMyScratch> Contexts;
+ParallelForWithTaskContext(TEXT("GenNormals"), Contexts, Meshes.Num(), 64,
+    [&Meshes](FMyScratch& Scratch, int32 Index)
     {
-        // Ctx is unique per worker thread — use as scratch buffer
-        Ctx.TempBuffer.Reset();
-        ComputeNormals(Meshes[Index], Ctx.TempBuffer);
-    }
-);
+        Scratch.TempBuffer.Reset();
+        ComputeNormals(Meshes[Index], Scratch.TempBuffer);
+    });
+// After the call, Contexts holds every worker's scratch — reduce here on the calling thread.
+
+// Custom context constructor — ContextConstructor(int32 ContextIndex, int32 NumContexts) (:694)
+ParallelForWithTaskContext(TEXT("GenNormalsSized"), Contexts, Meshes.Num(),
+    [](int32 ContextIndex, int32 NumContexts) { FMyScratch S; S.TempBuffer.Reserve(1024); return S; },
+    [&Meshes](FMyScratch& Scratch, int32 Index) { ComputeNormals(Meshes[Index], Scratch.TempBuffer); });
+
+// Reuse contexts you already own (:815)
+ParallelForWithExistingTaskContext(MakeArrayView(Contexts), Meshes.Num(), 64,
+    [&Meshes](FMyScratch& Scratch, int32 Index) { ComputeNormals(Meshes[Index], Scratch.TempBuffer); });
+
+// Do caller-side work first, then help with the loop (:571)
+ParallelForWithPreWork(Meshes.Num(), [&Meshes](int32 Index) { ProcessMesh(Meshes[Index]); },
+    []() { PrepareCaches(); });
 ```
+
+CVar `Async.ParallelFor.DisableOversubscription` (backed by `GParallelForDisableOversubscription`, `Async/ParallelFor.h:43`) prevents `ParallelFor` from waking additional workers when the scheduler is already saturated.
 
 ---
 
@@ -288,58 +341,198 @@ ParallelForWithTaskContext(TEXT("GenNormals"), OutContexts, Meshes.Num(), 64,
 
 ```cpp
 #include "Async/Async.h"
+#include "Misc/FileHelper.h"
 
-// ThreadPool — most common for CPU work
-TFuture<int32> F1 = Async(EAsyncExecution::ThreadPool,
-    []() { return HeavyCompute(); });
+// ThreadPool — CPU work
+TFuture<int32> F1 = Async(EAsyncExecution::ThreadPool, []() { return HeavyCompute(); });
 
-// TaskGraphMainThread — runs on game thread next tick
-TFuture<void> F2 = Async(EAsyncExecution::TaskGraphMainThread,
-    []() { /* safe for UObject access */ });
+// TaskGraphMainTick — game thread, inside a Tick; safe for UObject code and delegates
+TFuture<void> F2 = Async(EAsyncExecution::TaskGraphMainTick, []() { check(IsInGameThread()); });
 
-// Thread — dedicated thread for blocking I/O
-TFuture<TArray<uint8>> F3 = Async(EAsyncExecution::Thread,
-    []() { return FFileHelper::LoadFileToArray(...); });
+// Thread — dedicated thread for blocking I/O (FFileHelper::LoadFileToArray, Misc/FileHelper.h:79)
+TFuture<TArray<uint8>> F3 = Async(EAsyncExecution::Thread, []()
+{
+    TArray<uint8> Bytes;
+    FFileHelper::LoadFileToArray(Bytes, TEXT("C:/Temp/Input.bin"), 0);
+    return Bytes;
+});
 
-// Convenience wrappers
-TFuture<int32> F4 = AsyncPool(GThreadPool,
-    []() { return Compute(); });
-TFuture<void> F5 = AsyncThread(
-    []() { BlockingIOWork(); },
-    0,             // StackSize (0 = default)
-    TPri_Normal);
+// Completion callback — runs on the thread that finished the work
+TFuture<float> F4 = Async(EAsyncExecution::TaskGraph, []() { return 1.0f; }, []() { NotifyDone(); });
+
+// Convenience wrappers (Async/Async.h:407, :430) — AsyncPool takes FQueuedThreadPool&
+TFuture<int32> F5 = AsyncPool(*GThreadPool, []() { return Compute(); }, nullptr, EQueuedWorkPriority::Low);
+TFuture<void> F6 = AsyncThread([]() { BlockingIOWork(); }, 0 /*StackSize*/, TPri_Normal);
 ```
 
 ---
 
 ## TPromise/TFuture Producer-Consumer
 
-Decouples the code that produces a value from the code that consumes it.
-
 ```cpp
 #include "Async/Future.h"
 #include "Async/Async.h"
 
-// Create promise/future pair
-TPromise<FAnalyticsResult> Promise;
-TFuture<FAnalyticsResult> Future = Promise.GetFuture(); // call exactly once
-
-// Producer — moves promise into background work
-Async(EAsyncExecution::ThreadPool, [P = MoveTemp(Promise)]() mutable
+struct FMyStats
 {
-    FAnalyticsResult Result;
-    Result.PlayerCount = GatherPlayerMetrics();
-    Result.FrameStats = GatherFrameMetrics();
-    P.SetValue(MoveTemp(Result)); // or P.EmplaceValue(args...)
-});
+    int32 PlayerCount = 0;
+    TArray<float> FrameTimes;
+};
 
-// Consumer — chain continuation or block
-Future.Then([](TFuture<FAnalyticsResult> F)
+// Producer — move the promise into the work, hand the future to one consumer below
+TFuture<FMyStats> StartGatherStats()
 {
-    FAnalyticsResult R = F.Get(); // Get() does NOT invalidate
-    UE_LOG(LogGame, Log, TEXT("Players: %d"), R.PlayerCount);
-});
+    TPromise<FMyStats> Promise;
+    TFuture<FMyStats> Future = Promise.GetFuture();           // exactly once per promise
 
-// Or block directly on game thread (use sparingly)
-FAnalyticsResult R = Future.Get();
+    Async(EAsyncExecution::ThreadPool, [P = MoveTemp(Promise)]() mutable
+    {
+        FMyStats Stats;
+        Stats.PlayerCount = GatherPlayerMetrics();
+        GatherFrameMetrics(Stats.FrameTimes);
+        P.SetValue(MoveTemp(Stats));                          // or P.EmplaceValue(...)
+    });
+    return Future;
+}
+
+// Consume each future ONE way: Then()/Next() move its state into the continuation and
+// invalidate it ("This invalidate this future", Async/Future.h:669); a second call asserts.
+
+// Consumer A — continuation with the future (Then) or the value (Next); runs where the promise was fulfilled
+void ConsumeWithThen(TFuture<FMyStats> Future)
+{
+    Future.Then([](TFuture<FMyStats> Completed)
+    {
+        const FMyStats& Stats = Completed.Get();              // Get() keeps the future valid
+        UE_LOG(LogMyGame, Log, TEXT("Players: %d"), Stats.PlayerCount);
+    });
+}
+
+// Consumer B — hop to the game thread before touching UObjects
+void ConsumeOnGameThread(TFuture<FMyStats> Future, AMyActor* MyActor)
+{
+    Future.Next([Weak = TWeakObjectPtr<AMyActor>(MyActor)](FMyStats Stats)
+    {
+        AsyncTask(ENamedThreads::GameThread, [Weak, Stats = MoveTemp(Stats)]()
+        {
+            if (AMyActor* Actor = Weak.Get()) { Actor->ApplyStats(Stats); }
+        });
+    });
+}
+
+// Consumer C — poll from Tick instead of blocking
+void PollFromTick(TFuture<FMyStats>& Future)
+{
+    if (Future.IsReady()) { FMyStats Stats = Future.Consume(); }   // Consume() moves out and invalidates
+}
 ```
+
+---
+
+## FTSTicker and FTimerManager
+
+```cpp
+#include "Containers/Ticker.h"
+#include "TimerManager.h"
+#include "GameFramework/Actor.h"
+#include "MyActor.generated.h"
+
+struct FMyStats;                                               // defined in the TPromise/TFuture example above
+
+UCLASS()
+class MYGAME_API AMyActor : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+    void OnFire();
+    void OnNextTick();
+    void ApplyResult(float Value);
+    void ApplyStats(const FMyStats& Stats);
+
+private:
+    bool PollNetwork(float DeltaTime);
+
+    FTSTicker::FDelegateHandle PollHandle;
+    FTimerHandle FireHandle;
+    FTimerHandle OnceHandle;
+};
+
+void AMyActor::BeginPlay()
+{
+    Super::BeginPlay();
+
+    // Engine-wide ticker; return true to keep ticking (Containers/Ticker.h:45)
+    PollHandle = FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateUObject(this, &AMyActor::PollNetwork), 0.0f);
+
+    FTimerManager& Timers = GetWorldTimerManager();
+
+    // Method pointer: (Handle, Obj, Method, Rate, bLoop = false, FirstDelay = -1)  TimerManager.h:167
+    Timers.SetTimer(FireHandle, this, &AMyActor::OnFire, 1.0f, true);
+
+    // Delegate: (Handle, Delegate, Rate, bLoop, FirstDelay = -1)  TimerManager.h:178
+    Timers.SetTimer(OnceHandle, FTimerDelegate::CreateWeakLambda(this, [this]() { OnFire(); }), 3.0f, false);
+
+    // Parameters struct  TimerManager.h:124,211
+    FTimerManagerTimerParameters Params;
+    Params.bLoop = true;
+    Params.bMaxOncePerFrame = true;                            // collapse catch-up ticks after a hitch
+    Params.FirstDelay = 0.5f;
+    Timers.SetTimer(FireHandle, this, &AMyActor::OnFire, 0.1f, Params);
+
+    // Next tick  TimerManager.h:247
+    Timers.SetTimerForNextTick(this, &AMyActor::OnNextTick);
+}
+
+void AMyActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    FTSTicker::RemoveTicker(PollHandle);                       // static (Containers/Ticker.h:66)
+    GetWorldTimerManager().ClearAllTimersForObject(this);      // TimerManager.h:291
+    Super::EndPlay(EndPlayReason);
+}
+
+bool AMyActor::PollNetwork(float DeltaTime)
+{
+    return true;                                               // false removes the ticker
+}
+
+void AMyActor::OnFire() {}
+void AMyActor::OnNextTick() {}
+void AMyActor::ApplyResult(float Value) {}
+void AMyActor::ApplyStats(const FMyStats& Stats) {}
+```
+
+Queries (`TimerManager.h:304-444`): `PauseTimer(Handle)`, `UnPauseTimer(Handle)`, `IsTimerActive(Handle)`, `IsTimerPaused(Handle)`, `TimerExists(Handle)`, `GetTimerRate(Handle)`, `GetTimerElapsed(Handle)`, `GetTimerRemaining(Handle)`. `FTimerHandle::IsValid()` / `Invalidate()` (`Engine/TimerHandle.h:24,30`). Without an Actor: `GetWorld()->GetTimerManager()` (`Engine/World.h:4289`) or `UGameInstance::GetTimerManager()` (`Engine/GameInstance.h:424`) for timers that must survive level transitions.
+
+---
+
+## Lock-Free Producer/Consumer with TMpscQueue
+
+```cpp
+#include "Containers/MpscQueue.h"
+
+struct FMyMessage
+{
+    int32 Id = 0;
+    FVector Position = FVector::ZeroVector;
+};
+
+TMpscQueue<FMyMessage> Messages;               // many producers, exactly one consumer
+
+// Producers — any thread; Enqueue forwards constructor arguments
+Messages.Enqueue(FMyMessage{ 7, FVector(1.f, 2.f, 3.f) });
+
+// Consumer — one thread only (game thread Tick)
+FMyMessage Msg;
+while (Messages.Dequeue(Msg))
+{
+    HandleMessage(Msg);
+}
+if (const FMyMessage* Front = Messages.Peek()) { }             // consumer-only peek, nullptr when empty
+```
+
+`TSpscQueue<T>` (`Containers/SpscQueue.h`) has the same API for the single-producer case. Neither queue provides `Num()`; track counts with a `std::atomic<int32>` if needed.

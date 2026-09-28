@@ -1,357 +1,410 @@
-# Profiling Commands & Unreal Insights
+# Profiling: Insights, stat, CSV, LLM
 
-Reference for stat commands, Unreal Insights capture, custom profiling markers, CSV telemetry, and performance analysis workflow.
-
----
-
-## Built-in Stat Commands
-
-All `stat` commands are typed into the in-game console (`~`) or passed via `-ExecCmds` on the command line.
-
-### Frame & CPU
-
-| Command | Description |
-|---|---|
-| `stat fps` | Frame rate and frame time overlay |
-| `stat unit` | Game, Draw, GPU, Frame times in ms |
-| `stat unitgraph` | Rolling graph of unit timings |
-| `stat game` | Game thread breakdown: Tick, Actors, Components |
-| `stat engine` | Engine-level counters |
-| `stat tasks` | Async task system occupancy |
-| `stat threads` | Per-thread CPU times |
-| `stat slate` | Slate UI widget tick cost |
-| `stat scenerendering` | Scene rendering draw calls and primitives |
-| `stat initviews` | Visibility / frustum culling cost |
-
-### Memory
-
-| Command | Description |
-|---|---|
-| `stat memory` | High-level memory categories |
-| `stat memoryplatform` | OS-level virtual / physical memory |
-| `stat streaming` | Texture and mesh streaming stats |
-| `stat streamingdetails` | Per-resource streaming detail |
-| `memreport` | Full memory dump to `Saved/Profiling/MemReports/` |
-| `memreport -full` | Extended dump including asset registry |
-| `obj list class=Texture2D` | Count and size of all loaded Texture2D objects |
-| `obj list class=StaticMesh sortby=size` | Mesh objects sorted by memory |
-
-### GPU
-
-| Command | Description |
-|---|---|
-| `stat gpu` | Per-pass GPU time overlay (requires GPU timing support) |
-| `ProfileGPU` | Single-frame GPU capture, opens in RenderDoc-style viewer |
-| `r.ProfileGPU.Pattern *` | Set capture pattern (default `*` = everything) |
-| `r.GPUBusyWait 1` | Force busy-wait timing for more accurate GPU stats |
-
-### Networking
-
-| Command | Description |
-|---|---|
-| `stat net` | Network channel counts, saturation, packet loss |
-| `stat netdetailed` | Per-actor replication bandwidth |
-| `net.Stats 1` | Enable network stats overlay |
+Target engine: **UE 5.8**. Companion to `SKILL.md`. Macros come from `Runtime/Core/Public/ProfilingDebugging/`, `Runtime/Core/Public/Stats/Stats.h` and `Runtime/Core/Public/HAL/LowLevelMemTracker.h`; console commands are registered in `Runtime/Core/Private/` and `Runtime/Engine/Private/`.
 
 ---
 
-## Capturing Stats to File
+## Triage order
 
-### .uestats Capture (Legacy)
+1. `stat unit` — which of Game, Draw, RHIT or GPU owns the frame?
+2. Drill into that thread with the matching `stat <group>`.
+3. Capture with Insights (`-trace=cpu,frame` or `Trace.File`) and read the flame chart.
+4. Add `SCOPE_CYCLE_COUNTER` / `TRACE_CPUPROFILER_EVENT_SCOPE` around the suspect and re-measure.
+5. Keep a CSV baseline (`-csvCaptureFrames=600`) so the improvement is provable.
+
+At 30 Hz a frame budget is 33 ms; at 60 Hz it is 16.6 ms. `stat unit` > budget on:
+
+| Line | Means | Look at |
+|---|---|---|
+| Game | game-thread CPU | `stat game`, `stat threading`, tick counts, AI, blueprint |
+| Draw | render-thread CPU | `stat scenerendering`, `stat initviews`, draw call count, primitive count |
+| GPU | GPU cost | `ProfileGPU`, `DumpGPU`, Insights `gpu` channel, overdraw, shader complexity |
+| RHIT | RHI thread | driver submission, RHI command volume (`-trace=rhicommands`) |
+
+---
+
+## stat commands
+
+Typed into the console (`~`) or passed with `-ExecCmds="…"`.
+
+### Overlays
+
+| Command | Shows |
+|---|---|
+| `stat fps` | frame rate |
+| `stat unit` | Frame / Game / Draw / RHIT / GPU times in ms |
+| `stat unitgraph` | the same values as a rolling graph |
+| `stat unitmax`, `stat unitcriticalpath`, `stat unittime` | peak values, critical path, raw timings |
+| `stat hitches` | flags frames that exceed the hitch threshold |
+| `stat detailed`, `stat summary`, `stat raw` | preset overlay verbosity |
+| `stat drawcount` | draw calls |
+| `stat levels` | streaming level status |
+| `stat namedevents`, `stat verbosenamedevents` | emit stat names as profiler events for external tools |
+| `stat colorlist`, `stat version`, `stat timecode`, `stat thermals`, `stat tsr` | misc engine overlays |
+| `stat none` | disable every group overlay |
+
+### Stat groups
+
+`stat <groupname>` toggles the group's overlay; `stat <groupname>+` shows it hierarchically. Verified group names include `engine`, `game`, `initviews`, `scenerendering`, `memory`, `memoryplatform`, `streaming`, `streamingdetails`, `threading`, `net`, `slate`, `ai`, `anim`, and any `DECLARE_STATS_GROUP` you add (`stat MyGame`).
 
 ```
-# In-game console
-stat startfile          # starts recording to Saved/Profiling/
-stat stopfile           # stops and writes the .uestats file
-
-# Open in: UnrealEditor > Window > Session Frontend > Profiler tab
-# Or use deprecated StatsViewer commandlet
+stat group list                     # every registered group
+stat group enable MyGame            # enable without drawing the overlay
+stat hier -group=scenerendering -sortby=num -maxdepth=4
+stat display -font=small            # or -font=tiny
 ```
 
-### Command-Line Automated Capture
+### Dumping to the log
 
-```bash
-# Capture for 10 seconds then exit
-UnrealEditor-Cmd MyGame -game \
-    -ExecCmds="stat startfile, delay 10, stat stopfile, quit" \
-    -log
+```
+stat dumpframe -ms=.001 -root=initviews    # one frame, filtered
+stat dumpave -num=30 -ms=5.0               # aggregate; also dumpmax, dumpsum
+stat dumphitches                           # toggle hitch dumping
+stat dumpevents -ms=0.2 -all               # slow events across all threads
+stat dumpnonframe                          # non-frame stats, usually memory
+stat dumpcpu
+stat slow -ms=1.0 -depth=4                 # toggle slow-frame display
+stat namedmarker MyMarker                  # insert a marker into the stats stream
 ```
 
 ---
 
 ## Unreal Insights
 
-Unreal Insights replaces the legacy profiler for CPU, GPU, memory, and network trace analysis.
+`UnrealInsights.exe` lives at `Engine/Binaries/Win64/UnrealInsights.exe`. Start it first if you are streaming to a recorder; open a `.utrace` by passing it as the first argument.
 
-### Starting a Trace
-
-```bash
-# Attach Insights at launch (preferred for full coverage)
-UnrealEditor MyGame \
-    -trace=cpu,gpu,frame,memory,loadtime,log,bookmark \
-    -tracehost=127.0.0.1         # send to local Insights recorder
-    # or -tracefile=MyCapture.utrace   to write directly to disk
-
-# Insight trace channels
-#   cpu        — CPU thread events and named events
-#   gpu        — GPU pass timings (requires RHI support)
-#   frame      — per-frame markers
-#   memory     — LLM allocation tracking
-#   loadtime   — asset and package load timings
-#   log        — UE_LOG lines embedded in timeline
-#   bookmark   — UE_TRACE_BOOKMARK calls
-#   task       — Task Graph tasks
-#   rhicommands — RHI command list
-```
-
-### Runtime Console Commands
+### Starting a capture
 
 ```
-# Start trace mid-session
-Trace.Start cpu,frame,gpu
-
-# Stop trace
-Trace.Stop
-
-# Bookmark (appears as vertical line in Insights timeline)
-Trace.Bookmark "LevelLoaded"
+# From the command line
+-trace=cpu,frame,bookmark,counters                 # channel set; traces to memory by default
+-trace=cpu,frame -tracehost=127.0.0.1              # stream to a running recorder
+-trace=cpu,frame -tracefile=D:/Captures/Run1.utrace
+-tracefiletrunc                                    # overwrite instead of failing
+-tracefiletimestamps                               # append a timestamp to the filename
+-statnamedevents                                   # also emit stat names as named events
 ```
 
-### Opening Insights
+### From the console
 
-```bash
-# Launch the standalone Insights app
-Engine/Binaries/Win64/UnrealInsights.exe
+| Command | Effect |
+|---|---|
+| `Trace.File [Path] [ChannelSet]` | start tracing to a file |
+| `Trace.Send <Host> [ChannelSet]` | start tracing to a trace store |
+| `Trace.Stop` | stop tracing |
+| `Trace.Pause` / `Trace.Resume` | pause and re-enable the active channels |
+| `Trace.Enable <ChannelSet>` / `Trace.Disable [ChannelSet]` | toggle channels mid-session |
+| `Trace.Status` | print current trace state |
+| `Trace.SnapshotFile [Path]` | write the in-memory ring buffer to disk |
+| `Trace.SnapshotSend <Host> <Port>` | send the in-memory ring buffer to a server |
+| `Trace.Bookmark <Name>` | emit a `TRACE_BOOKMARK` event |
+| `Trace.RegionBegin` / `Trace.RegionEnd`, each taking a name | emit `TRACE_BEGIN_REGION` / `TRACE_END_REGION` |
 
-# Open a .utrace file directly
-UnrealInsights.exe MyCapture.utrace
-```
+`Trace.Start` still exists but logs "'Trace.Start' is being deprecated in favor of 'Trace.File'". Use `Trace.File`.
 
-Key Insights views:
+### Channels
 
-- **Timing Insights** — CPU/GPU flame chart, thread rows
-- **Memory Insights** — allocation timeline, LLM categories
-- **Asset Loading** — package load waterfall
-- **Networking** — connection bandwidth and packet timeline
+A channel declared as `XxxChannel` is named `xxx` on the command line.
+
+| Channel | Contents |
+|---|---|
+| `cpu` | CPU scope events on every thread |
+| `gpu` | GPU pass timings |
+| `frame` | per-frame begin/end markers |
+| `bookmark` | `TRACE_BOOKMARK` markers |
+| `counters` | `TRACE_*_VALUE` / `TRACE_COUNTER_*` series |
+| `log` | `UE_LOG` lines inline on the timeline |
+| `loadtime` / `assetloadtime` | package and asset load waterfall |
+| `task` | task graph and `UE::Tasks` work |
+| `memalloc` | allocation tracking for Memory Insights |
+| `callstack`, `module`, `metadata` | symbol and context data that `memalloc` needs |
+| `net` | replication traffic |
+| `rhicommands`, `rendercommands`, `rdg` | RHI / render command lists and the render graph |
+| `slate`, `animation`, `mass`, `messaging`, `iostore`, `http`, `cook`, `assetmetadata` | subsystem-specific |
+| `region`, `screenshot` | thread-agnostic timespans and embedded screenshots |
+
+Main views: **Timing Insights** (CPU/GPU flame chart), **Memory Insights**, **Asset Loading**, **Networking**, **Counters**.
 
 ---
 
-## Custom Profiling Markers
+## Code instrumentation
 
-### SCOPE_CYCLE_COUNTER
-
-Links to the stat system (visible in `stat MyGame` overlay and Insights).
+### Cycle stats
 
 ```cpp
-// In a .cpp file — one DECLARE per stat, referenced anywhere in the module
-DECLARE_STATS_GROUP(TEXT("MyGame"), STATGROUP_MyGame, STATCAT_Advanced);
-DECLARE_CYCLE_STAT(TEXT("InventoryTick"),  STAT_InventoryTick,  STATGROUP_MyGame);
-DECLARE_CYCLE_STAT(TEXT("PathFinder"),     STAT_PathFinder,     STATGROUP_MyGame);
-DECLARE_CYCLE_STAT(TEXT("AbilityResolve"), STAT_AbilityResolve, STATGROUP_MyGame);
+#include "Stats/Stats.h"
 
-// Usage
-void UInventoryComponent::TickComponent(float DeltaTime, ...)
+// In a .cpp, once per module.
+DECLARE_STATS_GROUP(TEXT("MyGame"), STATGROUP_MyGame, STATCAT_Advanced);
+DECLARE_CYCLE_STAT(TEXT("Inventory Tick"), STAT_MyInventoryTick, STATGROUP_MyGame);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Active Enemies"), STAT_MyActiveEnemies, STATGROUP_MyGame);
+DECLARE_MEMORY_STAT(TEXT("Inventory Memory"), STAT_MyInventoryMemory, STATGROUP_MyGame);
+
+void UMyInventoryComponent::TickComponent(float DeltaTime, ELevelTick TickType,
+                                          FActorComponentTickFunction* ThisTickFunction)
 {
-    SCOPE_CYCLE_COUNTER(STAT_InventoryTick);
-    // ...
+    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+    SCOPE_CYCLE_COUNTER(STAT_MyInventoryTick);
+    SET_DWORD_STAT(STAT_MyActiveEnemies, ActiveEnemyCount);
+}
+
+void UMyInventoryComponent::Compact()
+{
+    QUICK_SCOPE_CYCLE_COUNTER(STAT_MyInventoryCompact);   // no DECLARE needed
 }
 ```
 
-### SCOPED_NAMED_EVENT
+Use `DECLARE_STATS_GROUP_VERBOSE` for a group that should stay off unless explicitly enabled, and `DECLARE_*_STAT_EXTERN` + `DEFINE_STAT` when the stat is referenced from more than one `.cpp`.
 
-Shows as a colored block in Insights without stat overhead.
+### Insights CPU scopes
 
 ```cpp
-#include "HAL/PlatformMisc.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
-void UMySystem::ProcessBatch()
+void UMySubsystem::Process()
 {
-    SCOPED_NAMED_EVENT(MySystem_ProcessBatch, FColor::Orange);
-    for (auto& Item : Batch)
+    TRACE_CPUPROFILER_EVENT_SCOPE(UMySubsystem::Process);              // compile-time name
+    for (const FMyWorkItem& Item : Items)
     {
-        SCOPED_NAMED_EVENT_TEXT("ItemProcess", FColor::Yellow);
-        Process(Item);
+        TRACE_CPUPROFILER_EVENT_SCOPE_STR("ItemPass");                 // literal
+        TRACE_CPUPROFILER_EVENT_SCOPE_TEXT(*Item.GetDebugName());      // runtime TCHAR*
     }
 }
 ```
 
-### UE_TRACE_BOOKMARK
+`TRACE_CPUPROFILER_EVENT_SCOPE_CONDITIONAL(Name, Condition)` and the `..._ON_CHANNEL` variants let you gate a scope. `TRACE_CPUPROFILER_EVENT_MANUAL_START(Name)` with a matching `TRACE_CPUPROFILER_EVENT_MANUAL_END()` covers a span that is not lexically scoped.
 
-Places a labelled vertical marker in the Insights timeline.
+### Named events
 
 ```cpp
-#include "ProfilingDebugging/TraceAuxiliary.h"  // or use Trace.Bookmark in console
+#include "HAL/PlatformMisc.h"
 
-UE_TRACE_BOOKMARK(TEXT("WaveStarted_%d"), WaveNumber);
+SCOPED_NAMED_EVENT(MyGame_Process, FColor::Orange);        // identifier + colour
+SCOPED_NAMED_EVENT_TEXT("ItemPass", FColor::Yellow);       // literal
+SCOPED_NAMED_EVENT_FSTRING(DebugName, FColor::Green);      // FString
+SCOPED_NAMED_EVENT_F(TEXT("Item %d"), FColor::Cyan, Index);
+```
+
+Named events appear in Insights and in external profilers (PIX, Razor, Superluminal). They always emit a `TRACE_CPUPROFILER_EVENT_SCOPE*` too; when `ENABLE_NAMED_EVENTS` is 0 that is all they emit (`HAL/PlatformMisc.h:44,204-211`).
+
+### Bookmarks and regions
+
+```cpp
+#include "ProfilingDebugging/MiscTrace.h"
+
+TRACE_BOOKMARK(TEXT("WaveStarted_%d"), WaveNumber);   // no UE_ prefix on this one
+TRACE_BEGIN_REGION(TEXT("WaveSpawn"));
+TRACE_END_REGION(TEXT("WaveSpawn"));
+```
+
+The format argument must be a `const TCHAR` array literal — a `static_assert` enforces it, so `TRACE_BOOKMARK(*SomeFString)` does not compile. The whole macro is skipped unless the `bookmark` channel is enabled.
+
+### Counters
+
+```cpp
+#include "ProfilingDebugging/CountersTrace.h"
+
+// Inline: no declaration, name resolved once per call site.
+TRACE_INT_VALUE(TEXT("MyGame/SpawnedThisFrame"), SpawnedThisFrame);
+TRACE_FLOAT_VALUE(TEXT("MyGame/AverageDamage"), AverageDamage);
+TRACE_MEMORY_VALUE(TEXT("MyGame/PoolBytes"), PoolBytes);
+
+// Declared: cheaper, and supports increment/decrement.
+TRACE_DECLARE_INT_COUNTER(MyGameActiveEnemies, TEXT("MyGame/ActiveEnemies"));
+TRACE_COUNTER_SET(MyGameActiveEnemies, ActiveEnemyCount);
+TRACE_COUNTER_INCREMENT(MyGameActiveEnemies);
+TRACE_COUNTER_DECREMENT(MyGameActiveEnemies);
+TRACE_COUNTER_ADD(MyGameActiveEnemies, BatchSize);
+```
+
+`TRACE_DECLARE_FLOAT_COUNTER`, `TRACE_DECLARE_MEMORY_COUNTER`, the atomic variants (`TRACE_DECLARE_ATOMIC_INT_COUNTER`) and the extern forms (`TRACE_DECLARE_INT_COUNTER_EXTERN`) all exist. Counters need the `counters` channel.
+
+### Ad-hoc timing
+
+```cpp
+#include "ProfilingDebugging/ScopedTimers.h"
+
+double AccumulatedSeconds = 0.0;
+{
+    FScopedDurationTimer Timer(AccumulatedSeconds);   // adds to the accumulator on scope exit
+    DoWork();
+}
+
+{
+    FAutoScopedDurationTimer Timer;                   // keeps its own accumulator
+    DoWork();
+    const double Seconds = Timer.GetTime();
+}
+
+{
+    FScopedDurationTimeLogger Logger(TEXT("Wave load"));   // logs the duration on scope exit
+    LoadWave();
+}
 ```
 
 ---
 
-## CSV Profiling
+## CSV profiling
 
-CSV profiling writes lightweight, always-on telemetry to `Saved/Profiling/CSVStats/`. Enable with `-csvstatfile` or the auto-started profiler.
+CSV output goes to `Saved/Profiling/CSV/` (`FCsvProfiler::GetDefaultDirectory()` = `FPaths::ProfilingDir() + "CSV/"`) and is cheap enough to leave on in Test builds.
 
 ```cpp
 #include "ProfilingDebugging/CsvProfiler.h"
 
-// Declare category once per module
-CSV_DEFINE_CATEGORY(MyGame, true);   // true = enabled by default
+// One per module, in a .cpp. The second argument is "enabled by default".
+CSV_DEFINE_CATEGORY(MyGame, true);
+// Cross-module: CSV_DEFINE_CATEGORY_MODULE(MYGAME_API, MyGame, true) plus
+// CSV_DECLARE_CATEGORY_EXTERN(MyGame) in a header.
 
-// Timing stat in a function (duration captured each frame)
-void UMySystem::Tick(float DeltaTime)
+void UMySubsystem::Tick(float DeltaTime)
 {
-    CSV_SCOPED_TIMING_STAT(MyGame, SystemTick);
-    // ...
-}
+    CSV_SCOPED_TIMING_STAT(MyGame, SubsystemTick);          // inclusive time column
+    CSV_SCOPED_TIMING_STAT_EXCLUSIVE(SubsystemTickSelf);    // exclusive time column
 
-// Custom scalar value
-void UMySystem::PostSpawn()
-{
     CSV_CUSTOM_STAT(MyGame, ActiveEnemies, ActiveEnemyCount, ECsvCustomStatOp::Set);
-    CSV_CUSTOM_STAT(MyGame, DamageDealt,   FrameDamage,      ECsvCustomStatOp::Accumulate);
+    CSV_CUSTOM_STAT(MyGame, DamageDealt, FrameDamage, ECsvCustomStatOp::Accumulate);
 }
 
-// Named event (segment in CSV timeline)
-CSV_EVENT(MyGame, TEXT("LevelLoaded"));
+void UMySubsystem::OnLevelLoaded()
+{
+    CSV_EVENT(MyGame, TEXT("LevelLoaded"));
+}
 ```
 
-### Launching with CSV Capture
+`ECsvCustomStatOp` is `Set`, `Min`, `Max`, `Accumulate`. `CSV_CUSTOM_STAT_GLOBAL(StatName, Value, Op)` writes to the global category.
 
-```bash
-UnrealEditor-Cmd MyGame -game \
-    -csvstatfile=MySession.csv \
-    -csvCaptureFrames=1000 \     # capture 1000 frames then stop
-    -log
+### Driving a capture
+
+```
+# Command line
+-csvCaptureFrames=600        # capture N frames from startup, then stop
+-csvMetadata="build=1234,map=Arena"
+-csvGpuStats                 # include GPU stats in the CSV
+
+# Console
+CsvProfile Start
+CsvProfile Stop
+CsvProfile StartFile=Baseline
+CsvProfile ExitOnCompletion
+CsvCategory MyGame enable    # or disable
 ```
 
-Open `.csv` output with Python / Excel or the **PerfReportTool** (`Engine/Extras/PerfReportTool/`).
+`[CsvProfiler]` in `DefaultEngine.ini` accepts `EnabledCategories` / `DisabledCategories` arrays and `bEventTimestamps`. Read the output with `Engine/Extras/PerfReportTool` or any spreadsheet.
 
 ---
 
-## LLM (Low-Level Memory Tracker)
+## Memory
 
-LLM categorises allocations for memory profiling in Insights.
+```
+stat memory                              # engine-side categories
+stat memoryplatform                      # OS physical / virtual
+stat streaming / stat streamingdetails   # texture and mesh streaming
+memreport                                # dump to Saved/Profiling/MemReports
+memreport -full                          # extended dump
+obj list                                 # every loaded object
+obj list class=Texture2D                 # one class, with sizes
+```
+
+### Low Level Memory Tracker
 
 ```cpp
 #include "HAL/LowLevelMemTracker.h"
 
-// Push/pop a custom LLM scope
-LLM_SCOPE(ELLMTag::EngineMisc);                    // built-in tag
-LLM_SCOPE_BYTAG(MyGame_Inventory);                 // custom tag (declared separately)
-
-// Declare a custom LLM tag (in a cpp, once)
+// Declare a custom tag once, in a .cpp.
 LLM_DEFINE_TAG(MyGame_Inventory, TEXT("MyGame/Inventory"), TEXT("MyGame"));
+// LLM_DECLARE_TAG(MyGame_Inventory) in a header if other files need it.
 
-// Use in allocations
+void UMyInventoryComponent::Reserve(int32 Count)
 {
     LLM_SCOPE_BYTAG(MyGame_Inventory);
-    InventoryData = new FInventoryData();
+    Items.Reserve(Count);
+}
+
+void UMySubsystem::LoadAssets()
+{
+    LLM_SCOPE(ELLMTag::EngineMisc);          // built-in tag
+    LLM_SCOPE_BYNAME(TEXT("MyGame/Assets")); // ad-hoc named scope
 }
 ```
 
-Activate LLM at launch:
+Enable with `-LLM` on the command line; add `-trace=memalloc,callstack,module` to see allocations in Memory Insights.
 
-```bash
-UnrealEditor MyGame -LLM -trace=memory -tracehost=127.0.0.1
+### Allocator selection
+
+On Windows, editor and program builds prefer Mimalloc then TBB; other builds fall back to `MallocBinned3`, then `MallocBinned2`, then `MallocBinned`. Override on the command line (non-Shipping only) with `-libpasmalloc`, `-ansimalloc`, `-tbbmalloc`, `-mimalloc`, `-binnedmalloc3`, `-binnedmalloc2`, `-binnedmalloc` or `-stompmalloc`. `-stompmalloc` turns heap overruns into immediate access violations and is the fastest way to localize a corruption.
+
+### Automatic hitch snapshots
+
+```
+snapshothitches -start
+snapshothitches -stop
+```
+
+Requires `STATS` and a non-Shipping build. While armed it hooks the stats thread's new-frame delegate and writes a trace snapshot whenever a hitch is detected; it disables the `Screenshot` channel so a stale screenshot cannot land in the snapshot tail.
+
+### UObject count
+
+Build with `CSV_TRACK_UOBJECT_COUNT=1` (and CSV profiling enabled). Each frame the engine records `UObjectStats::GetUObjectCount()` as the CSV stat `Total` in the category `ObjectCount`. A monotonically rising line over a long session is an object leak; cross-check with `obj list`.
+
+---
+
+## GPU
+
+| Tool | Use |
+|---|---|
+| `ProfileGPU` | single-frame per-pass breakdown printed to the log and a viewer |
+| `DumpGPU` | dump one frame's intermediate render resources to disk |
+| `-trace=gpu` | GPU track in Timing Insights |
+| `stat GPU0_Graphics0` | per-queue GPU stat group (groups are named `GPU<n>_<Type><Index>`) |
+
+`ProfileGPU` is shaped by `r.ProfileGPU.Sort`, `r.ProfileGPU.Root`, `r.ProfileGPU.ThresholdPercent`, `r.ProfileGPU.ShowLeafEvents`, `r.ProfileGPU.ShowStats`, `r.ProfileGPU.TableFormatting` and `r.ProfileGPU.UnicodeOutput`. Draw events are compiled out of Test and Shipping unless the target opts back in.
+
+Declare your own GPU stats with `DECLARE_GPU_STAT(MyGamePass)` / `DECLARE_GPU_STAT_NAMED(MyGamePass, TEXT("MyGame Pass"))` from `ProfilingDebugging/RealtimeGPUProfiler.h` (module `RenderCore`).
+
+For draw-call level inspection, enable the RenderDoc plugin, launch with `-AttachRenderDoc`, and capture with the `renderdoc.CaptureFrame` console command (bound to Alt+F12 by default) or `renderdoc.CaptureFrameCount` for a multi-frame capture.
+
+---
+
+## Networking
+
+```
+stat net                                 # the Net stat group
+-NetTrace=1                              # enable network tracing (higher values = more detail)
+-trace=net                               # network track in Insights
 ```
 
 ---
 
-## Performance Analysis Workflow
+## Profiling on device
 
-### 1. Identify the Bottleneck
-
-```
-stat unit          # Is Frame time dominated by Game, Draw, or GPU?
-stat fps           # Confirm frame rate
-```
-
-- **Game > 33ms** → CPU game thread (tick, AI, physics logic)
-- **Draw > 33ms** → Render thread (draw calls, visibility)
-- **GPU > 33ms** → GPU fill rate, overdraw, shader complexity
-
-### 2. Drill Down on CPU
+Run the recorder on the host and point the device at it:
 
 ```
-stat game          # Which game-thread category?
-stat engine        # Is it engine overhead?
-stat tasks         # Async task contention?
+# Host
+UnrealInsights.exe
+
+# Device launch arguments
+-trace=cpu,frame -tracehost=<host-ip-address>
 ```
 
-Then capture with Insights (`-trace=cpu,frame`) and look at the flame chart.
-
-### 3. Drill Down on GPU
-
-```
-stat gpu           # Per-pass timings
-ProfileGPU         # Single-frame breakdown
-r.ProfileGPU.Pattern BasePass    # isolate specific pass
-```
-
-### 4. Memory Pressure
-
-```
-stat memory
-memreport -full
-obj list class=Texture2D sortby=size
-```
-
-Insights memory view shows allocation spikes over time.
-
-### 5. Reproduce and Baseline
-
-Always capture a baseline before any optimization. Use CSV profiling for production telemetry:
-
-```bash
-# Baseline run
-UnrealEditor-Cmd MyGame -game -csvstatfile=Baseline.csv -csvCaptureFrames=600
-
-# After optimization
-UnrealEditor-Cmd MyGame -game -csvstatfile=Optimized.csv -csvCaptureFrames=600
-
-# Diff with PerfReportTool or a Python script
-```
+Console platforms expose their own capture tools through platform extensions; `SCOPE_CYCLE_COUNTER` and `SCOPED_NAMED_EVENT` feed them automatically.
 
 ---
 
-## GPU Profiling with RenderDoc
-
-```bash
-# Launch with RenderDoc capture support
-UnrealEditor MyGame -AttachRenderDoc
-
-# In-game console
-renderdoc.CaptureFrame    # capture next frame
-```
-
-Or attach RenderDoc externally and use **F12** to capture. Open `.rdc` in the RenderDoc UI for draw-call-level inspection.
-
----
-
-## Profiling on Device (Mobile / Console)
-
-```bash
-# iOS / Android — tunnel Insights over USB
-UnrealInsights.exe -RecorderAddress=127.0.0.1:1980
-
-# On device launch with
--trace=cpu,frame -tracehost=<HOST_IP>
-
-# Console-specific profiling tools (e.g. PlayStation Razor / Xbox PIX)
-# integrate via platform-specific plugin; SCOPE_CYCLE_COUNTER feeds into them automatically
-```
-
----
-
-## Quick Reference: Command-Line Profiling Flags
+## Command-line flag reference
 
 | Flag | Effect |
 |---|---|
-| `-trace=cpu,gpu,frame,memory,log` | Enable trace channels for Insights |
-| `-tracehost=127.0.0.1` | Send trace to local Insights recorder |
-| `-tracefile=Output.utrace` | Write trace directly to file |
-| `-LLM` | Enable Low-Level Memory Tracker |
-| `-csvstatfile=Out.csv` | Start CSV profiling |
-| `-csvCaptureFrames=N` | Stop CSV after N frames |
-| `-statnamedevents` | Include stat names in profiler named events |
-| `-ExecCmds="stat startfile"` | Begin stats file capture on startup |
+| `-trace=<channels>` | enable trace channels (memory destination by default) |
+| `-tracehost=<host>` | stream the trace to a recorder |
+| `-tracefile=<path>` | write the trace to a file |
+| `-tracefiletrunc` | overwrite an existing trace file |
+| `-tracefiletimestamps` | append a timestamp to the trace filename |
+| `-statnamedevents` | emit stat names as named events |
+| `-LLM` | enable the Low Level Memory Tracker |
+| `-csvCaptureFrames=N` | capture N frames of CSV, then stop |
+| `-csvMetadata="k=v,k=v"` | attach metadata columns to the CSV |
+| `-csvGpuStats` | include GPU stats in the CSV |
+| `-NetTrace=<verbosity>` | enable network tracing |
+| `-AttachRenderDoc` | load the RenderDoc plugin at startup |
+| `-ExecCmds="a, b, c"` | run console commands after startup |

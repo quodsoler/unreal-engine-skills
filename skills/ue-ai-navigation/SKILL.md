@@ -1,261 +1,230 @@
 ---
 name: ue-ai-navigation
-description: "Use this skill when implementing AI, AIController, behavior tree, blackboard, AI perception, NavMesh, EQS, navigation, pathfinding, State Tree, or Smart Objects in Unreal Engine. See references/behavior-tree-patterns.md for BT patterns and references/eqs-reference.md for EQS configuration. For AI ability use, see ue-gameplay-abilities."
+description: "Use when writing Unreal Engine C++ AI — AI controllers, behavior tree nodes, blackboards, AI perception, navmesh pathfinding, EQS queries or Smart Objects. Also use when the user mentions 'AAIController', 'UBTTaskNode', 'ExecuteTask', 'FinishLatentTask', 'UBlackboardComponent', 'FBlackboardKeySelector', 'UAIPerceptionComponent', 'FAIStimulus', 'UAISenseConfig_Sight', 'MoveTo', 'UNavigationSystemV1', 'ProjectPointToNavigation', 'UNavArea', 'ANavLinkProxy', 'UEnvQueryManager', 'FEnvQueryRequest', 'EQS', 'navmesh', 'USmartObjectSubsystem' or 'ZoneGraph'. For State Tree authoring, see ue-state-trees; for Mass crowds, see ue-mass-entity; for the movement component that executes paths, see ue-character-movement."
 metadata:
-  version: 1.0.0
+  version: "2.0.0"
+  engine: "5.8"
 ---
 
 # UE AI and Navigation
 
-You are an expert in Unreal Engine's AI and navigation systems.
+Target engine: **UE 5.8**. APIs below are verified against the 5.8 headers; older forms are listed under "Deprecated — do not use".
+
+Classic UE AI runs on a server-only `AAIController` that owns a brain component (`UBehaviorTreeComponent`), a `UBlackboardComponent`, a `UAIPerceptionComponent` and a `UPathFollowingComponent`. Behavior trees, perception and EQS live in the `AIModule`; navmesh generation and queries live in `NavigationSystem`; BT tasks that wrap gameplay tasks need `GameplayTasks`. Smart Objects (`SmartObjectsModule`, plugin `SmartObjects`), ZoneGraph (`ZoneGraph`, Experimental in 5.8), MassAI (Experimental in 5.8) and NavCorridor (Experimental in 5.8) are opt-in plugins. Add what you use to `PublicDependencyModuleNames` in your `.Build.cs`, e.g. `"AIModule", "NavigationSystem", "GameplayTasks"`.
 
 ## Context
 
-Read `.agents/ue-project-context.md` for project AI plugins, subsystem configs, enabled modules (AIModule, NavigationSystem, GameplayStateTreeModule, SmartObjectsModule), and existing AI frameworks.
+Read `.agents/ue-project-context.md` if it exists (module names, conventions, enabled plugins, GAS/networking setup). Do not stop if it is missing.
 
-## Information Gathering
+Identify the area from the request and the codebase. Ask only when two plausible readings would produce different code.
 
-Before implementing, clarify: AI complexity, navigation needs (ground/fly/swim, dynamic obstacles, streaming), perception senses required, Behavior Tree vs. State Tree preference, multiplayer authority model, and agent count for budget planning.
+| Request is about… | Go to |
+|---|---|
+| Possessing a pawn, running a tree, move requests, focus | [AI Controller](#ai-controller) |
+| Reading/writing AI knowledge, key selectors, observers | [Blackboard](#blackboard) |
+| Custom tasks, decorators, services, node memory | [Behavior Tree Nodes](#behavior-tree-nodes) |
+| Sight/hearing/damage senses, stimuli sources | [AI Perception](#ai-perception) |
+| Path queries, projection, random points, invokers | [Navigation and Pathfinding](#navigation-and-pathfinding) |
+| Area costs, query filters, jump/off-mesh links | [Nav Areas, Filters and Off-Mesh Links](#nav-areas-filters-and-off-mesh-links) |
+| Cover/flank/patrol point selection, custom contexts | [EQS Environment Query System](#eqs-environment-query-system) |
+| State Tree instead of a behavior tree | [State Tree for AI](#state-tree-for-ai) |
+| Interactable world objects, slot claiming | [Smart Objects](#smart-objects) |
+| Lane-based crowds, large agent counts | [ZoneGraph, MassAI and NavCorridor](#zonegraph-massai-and-navcorridor) |
 
----
-
-## AI Architecture
-
-```
-APawn
-  └── AAIController (server-only in multiplayer)
-        ├── UBehaviorTreeComponent  (UBrainComponent subclass)
-        │     └── UBehaviorTree asset → UBlackboardData
-        ├── UBlackboardComponent    (AI knowledge store)
-        ├── UAIPerceptionComponent  (sight, hearing, damage)
-        └── UPathFollowingComponent (NavMesh path execution)
-```
-
-**Build.cs modules**: `AIModule`, `NavigationSystem`, `GameplayTasks`
-
----
-
-## AIController
+## AI Controller
 
 ```cpp
 // MyAIController.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "AIController.h"
+#include "Perception/AIPerceptionTypes.h"
+#include "MyAIController.generated.h"
+
+class UBehaviorTree;
+
 UCLASS()
-class AMyAIController : public AAIController
+class MYGAME_API AMyAIController : public AAIController
 {
     GENERATED_BODY()
+
 public:
     AMyAIController();
-    UPROPERTY(EditDefaultsOnly, Category = AI)
-    TObjectPtr<UBehaviorTree> BehaviorTreeAsset;
+
 protected:
+    UPROPERTY(EditDefaultsOnly, Category = "AI")
+    TObjectPtr<UBehaviorTree> BehaviorTreeAsset;
+
     virtual void OnPossess(APawn* InPawn) override;
+    virtual void OnMoveCompleted(FAIRequestID RequestID, const FPathFollowingResult& Result) override;
+
     UFUNCTION()
-    void OnTargetPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus);
+    void HandleTargetPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus);
 };
 
 // MyAIController.cpp
+#include "MyAIController.h"
+#include "BehaviorTree/BlackboardComponent.h"
+#include "Navigation/PathFollowingComponent.h"
+#include "Perception/AIPerceptionComponent.h"
+
 AMyAIController::AMyAIController()
 {
     bStartAILogicOnPossess = true;
     bStopAILogicOnUnposses = true;
-    // PerceptionComponent declared in AAIController; configure senses here or in BP defaults
 }
 
 void AMyAIController::OnPossess(APawn* InPawn)
 {
     Super::OnPossess(InPawn);
     if (BehaviorTreeAsset)
+    {
         RunBehaviorTree(BehaviorTreeAsset); // calls UseBlackboard internally
-    if (UAIPerceptionComponent* PC = GetAIPerceptionComponent())
-        PC->OnTargetPerceptionUpdated.AddDynamic(this, &AMyAIController::OnTargetPerceptionUpdated);
+    }
+    if (UAIPerceptionComponent* Perception = GetAIPerceptionComponent())
+    {
+        Perception->OnTargetPerceptionUpdated.AddDynamic(this, &AMyAIController::HandleTargetPerceptionUpdated);
+    }
+}
+
+void AMyAIController::OnMoveCompleted(FAIRequestID RequestID, const FPathFollowingResult& Result)
+{
+    Super::OnMoveCompleted(RequestID, Result);
+    if (UBlackboardComponent* BB = GetBlackboardComponent()) { BB->SetValueAsBool(TEXT("ReachedGoal"), Result.Code == EPathFollowingResult::Success); }
+}
+
+void AMyAIController::HandleTargetPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus)
+{
+    UBlackboardComponent* BlackboardComp = GetBlackboardComponent();
+    if (BlackboardComp && Stimulus.WasSuccessfullySensed())
+    {
+        BlackboardComp->SetValueAsObject(TEXT("TargetActor"), Actor);
+        BlackboardComp->SetValueAsVector(TEXT("LastKnownLocation"), Stimulus.StimulusLocation);
+    }
 }
 ```
 
-### Key AAIController API
-
 ```cpp
-// Navigation
-EPathFollowingRequestResult::Type MoveToActor(AActor* Goal, float AcceptanceRadius = -1,
-    bool bStopOnOverlap = true, bool bUsePathfinding = true, bool bCanStrafe = true,
+// AIController.h — signatures you will call
+EPathFollowingRequestResult::Type MoveToActor(AActor* Goal, float AcceptanceRadius = -1, bool bStopOnOverlap = true,
+    bool bUsePathfinding = true, bool bCanStrafe = true,
     TSubclassOf<UNavigationQueryFilter> FilterClass = {}, bool bAllowPartialPath = true);
 
-EPathFollowingRequestResult::Type MoveToLocation(const FVector& Dest, float AcceptanceRadius = -1,
-    bool bStopOnOverlap = true, bool bUsePathfinding = true,
-    bool bProjectDestinationToNavigation = false, bool bCanStrafe = true,
+EPathFollowingRequestResult::Type MoveToLocation(const FVector& Dest, float AcceptanceRadius = -1, bool bStopOnOverlap = true,
+    bool bUsePathfinding = true, bool bProjectDestinationToNavigation = false, bool bCanStrafe = true,
     TSubclassOf<UNavigationQueryFilter> FilterClass = {}, bool bAllowPartialPath = true);
 
-void StopMovement();
-bool HasPartialPath() const;
-EPathFollowingStatus::Type GetMoveStatus() const;
-
-// Focus
-void SetFocus(AActor* NewFocus, EAIFocusPriority::Type Priority = EAIFocusPriority::Gameplay);
-void SetFocalPoint(FVector NewFocus, EAIFocusPriority::Type Priority = EAIFocusPriority::Gameplay);
-void ClearFocus(EAIFocusPriority::Type Priority);
-
-// Brain / Blackboard
-bool RunBehaviorTree(UBehaviorTree* BTAsset);
+virtual FPathFollowingRequestResult MoveTo(const FAIMoveRequest& MoveRequest, FNavPathSharedPtr* OutPath = nullptr);
+virtual void SetFocus(AActor* NewFocus, EAIFocusPriority::Type InPriority = EAIFocusPriority::Gameplay);
+virtual void SetFocalPoint(FVector NewFocus, EAIFocusPriority::Type InPriority = EAIFocusPriority::Gameplay);
+virtual void ClearFocus(EAIFocusPriority::Type InPriority);
+virtual bool RunBehaviorTree(UBehaviorTree* BTAsset);
 bool UseBlackboard(UBlackboardData* BlackboardAsset, UBlackboardComponent*& BlackboardComponent);
-UBlackboardComponent* GetBlackboardComponent();
-
-// Team (IGenericTeamAgentInterface)
-void SetGenericTeamId(const FGenericTeamId& NewTeamID);
-
-// Delegate: FAIMoveCompletedSignature ReceiveMoveCompleted (RequestID, Result)
+EPathFollowingStatus::Type GetMoveStatus() const;   // Idle, Waiting, Paused, Moving
+bool HasPartialPath() const;
+virtual void SetGenericTeamId(const FGenericTeamId& NewTeamID) override;   // IGenericTeamAgentInterface
 ```
 
-**On Pawn**: `AIControllerClass = AMyAIController::StaticClass(); AutoPossessAI = EAutoPossessAI::PlacedInWorldOrSpawned;`
+| Need | Use |
+|---|---|
+| One-liner move with per-call options | `MoveToActor` / `MoveToLocation` — returns `EPathFollowingRequestResult::{Failed, AlreadyAtGoal, RequestSuccessful}` |
+| Full control (goal actor + radius + filter + partial path) and the resulting path | `MoveTo(FAIMoveRequest, FNavPathSharedPtr*)` — returns `FPathFollowingRequestResult` with `MoveId` and `Code` |
+| Move a controller that has no BT/blackboard, e.g. a click-to-move test | `UAIBlueprintHelperLibrary::SimpleMoveToLocation(AController*, const FVector&)` |
+| React to arrival | Override `OnMoveCompleted`, or bind the dynamic delegate `ReceiveMoveCompleted` (`FAIRequestID`, `EPathFollowingResult::Type`) |
 
----
+Build an `FAIMoveRequest` with its setters: `SetGoalActor`, `SetGoalLocation`, `SetAcceptanceRadius`, `SetUsePathfinding`, `SetAllowPartialPath`, `SetNavigationFilter`, `SetProjectGoalLocation`, `SetCanStrafe`, `SetReachTestIncludesAgentRadius`.
+
+On the pawn: `AIControllerClass = AMyAIController::StaticClass(); AutoPossessAI = EAutoPossessAI::PlacedInWorldOrSpawned;`
 
 ## Blackboard
 
 | Type | Get | Set |
-|------|-----|-----|
+|---|---|---|
 | Object | `GetValueAsObject` | `SetValueAsObject` |
 | Vector | `GetValueAsVector` | `SetValueAsVector` |
 | Bool | `GetValueAsBool` | `SetValueAsBool` |
 | Float | `GetValueAsFloat` | `SetValueAsFloat` |
 | Int | `GetValueAsInt` | `SetValueAsInt` |
-| Enum | `GetValueAsEnum` | `SetValueAsEnum` |
-| Name | `GetValueAsName` | `SetValueAsName` |
-| Rotator | `GetValueAsRotator` | `SetValueAsRotator` |
-| String | `GetValueAsString` | `SetValueAsString` |
-| Class | `GetValueAsClass` | `SetValueAsClass` |
+| Enum | `GetValueAsEnum` (returns `uint8`) | `SetValueAsEnum` (takes `uint8`) |
+| Name / String / Class / Rotator | `GetValueAsName` / `…String` / `…Class` / `…Rotator` | `SetValueAs…` matching |
+
+All accessors take `const FName& KeyName`. `ClearValue(FName)` and `IsVectorValueSet(FName)` have `FBlackboard::FKey` overloads that skip the name lookup.
 
 ```cpp
-UBlackboardComponent* BB = GetBlackboardComponent();
-BB->SetValueAsObject(TEXT("TargetActor"), SomeActor);
-BB->SetValueAsVector(TEXT("LastKnownLocation"), Location);
-BB->ClearValue(TEXT("TargetActor"));
-bool bSet = BB->IsVectorValueSet(TEXT("PatrolLocation"));
+#include "BehaviorTree/BlackboardComponent.h"
 
-// Observer (called when key changes)
-FBlackboard::FKey KeyID = BB->GetKeyID(TEXT("TargetActor"));
-FDelegateHandle H = BB->RegisterObserver(KeyID, this,
-    FOnBlackboardChangeNotification::CreateUObject(this, &AMyAIController::OnBBKeyChanged));
-BB->UnregisterObserver(KeyID, H);
+UBlackboardComponent* BlackboardComp = GetBlackboardComponent();
+BlackboardComp->SetValueAsObject(TEXT("TargetActor"), TargetActor);
+BlackboardComp->ClearValue(TEXT("TargetActor"));
 
-// High-perf cached accessor (avoids repeated name lookups):
-FBBKeyCachedAccessor<UBlackboardKeyType_Bool> BBInCombat;
-// Init: BBInCombat = FBBKeyCachedAccessor<...>(*BBComp, KeyID);
-// Use: bool b = BBInCombat.Get(); BBInCombat.SetValue(*BB, true);
+// Observers: the delegate returns EBlackboardNotificationResult, it is not void.
+const FBlackboard::FKey KeyID = BlackboardComp->GetKeyID(TEXT("TargetActor"));
+const FDelegateHandle Handle = BlackboardComp->RegisterObserver(KeyID, this,
+    FOnBlackboardChangeNotification::CreateUObject(this, &AMyAIController::HandleTargetKeyChanged));
+BlackboardComp->UnregisterObserver(KeyID, Handle);
+
+// Declared in AMyAIController — returning void will not bind:
+EBlackboardNotificationResult HandleTargetKeyChanged(const UBlackboardComponent& BlackboardComp, FBlackboard::FKey ChangedKeyID);
 ```
 
-Mark keys **Instance Synced** to share values across all AI using the same `UBlackboardData` (squad-wide alerts via `UAISystem` propagation).
+Return `EBlackboardNotificationResult::ContinueObserving` to stay registered, `RemoveObserver` to unsubscribe. `UnregisterObserversFrom(this)` drops every observer an object registered.
 
----
+**In BT nodes, never hard-code key names.** Expose a `FBlackboardKeySelector` `UPROPERTY` and read `SelectedKeyName`; the tree resolves it against the asset through `FBlackboardKeySelector::ResolveSelectedKey(const UBlackboardData&)`, and `GetSelectedKeyID()` gives the cached `FBlackboard::FKey`. Mark a key **Instance Synced** (`FBlackboardEntry::bInstanceSynced` in the `UBlackboardData` asset) to share its value across every AI using that asset — squad-wide alerts without extra plumbing; `UBlackboardData::HasSynchronizedKeys()` reports whether any key is synced. For hot paths, cache the key: `FBBKeyCachedAccessor<UBlackboardKeyType_Bool>` built from `(const UBlackboardComponent&, FBlackboard::FKey)` exposes `Get()` and `SetValue(UBlackboardComponent&, Value)` and skips the per-call name lookup.
 
 ## Behavior Tree Nodes
 
-### Custom Task
+| Base class | Override | Signature source |
+|---|---|---|
+| `UBTTaskNode` | `ExecuteTask`, `AbortTask`, `TickTask`, `OnTaskFinished`, `OnMessage` | `BehaviorTree/BTTaskNode.h` |
+| `UBTDecorator` | `CalculateRawConditionValue` (const), `OnNodeActivation`, `OnNodeDeactivation`, `OnNodeProcessed` | `BehaviorTree/BTDecorator.h` |
+| `UBTService` | `TickNode`, `OnSearchStart`, `OnBecomeRelevant`, `OnCeaseRelevant` | `BehaviorTree/BTService.h` (relevance hooks inherited from `BTAuxiliaryNode.h`) |
+| Any node | `GetInstanceMemorySize`, `InitializeMemory`, `CleanupMemory` | `BehaviorTree/BTNode.h` |
+
+Copy these verbatim (only the class name changes):
 
 ```cpp
-UCLASS()
-class UMyBTTask_Attack : public UBTTaskNode
-{
-    GENERATED_BODY()
-public:
-    UMyBTTask_Attack() { NodeName = TEXT("Attack"); INIT_TASK_NODE_NOTIFY_FLAGS(); }
-    UPROPERTY(EditAnywhere) FBlackboardKeySelector TargetKey;
-protected:
-    virtual EBTNodeResult::Type ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;
-    virtual void TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds) override;
-    virtual EBTNodeResult::Type AbortTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;
-};
-
-EBTNodeResult::Type UMyBTTask_Attack::ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
-{
-    AActor* Target = Cast<AActor>(
-        OwnerComp.GetBlackboardComponent()->GetValueAsObject(TargetKey.SelectedKeyName));
-    if (!IsValid(Target)) return EBTNodeResult::Failed;
-    // Start async work → return InProgress; call FinishLatentTask() when done
-    return EBTNodeResult::InProgress;
-}
-
-void UMyBTTask_Attack::TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
-{
-    FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded); // or Failed
-}
-
-EBTNodeResult::Type UMyBTTask_Attack::AbortTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
-{
-    return EBTNodeResult::Aborted; // cleanup; or InProgress + FinishLatentAbort()
-}
+virtual EBTNodeResult::Type ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;
+virtual EBTNodeResult::Type AbortTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;
+virtual void TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds) override;
+virtual void OnTaskFinished(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, EBTNodeResult::Type TaskResult) override;
+virtual void OnMessage(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, FName Message, int32 RequestID, bool bSuccess) override;
+virtual bool CalculateRawConditionValue(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const override;
+virtual void OnNodeActivation(FBehaviorTreeSearchData& SearchData) override;
+virtual void OnNodeDeactivation(FBehaviorTreeSearchData& SearchData, EBTNodeResult::Type NodeResult) override;
+virtual void TickNode(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds) override;
+virtual void OnSearchStart(FBehaviorTreeSearchData& SearchData) override;
+virtual uint16 GetInstanceMemorySize() const override;
+virtual void InitializeMemory(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, EBTMemoryInit::Type InitType) const override;
+virtual void CleanupMemory(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, EBTMemoryClear::Type CleanupType) const override;
 ```
 
-### Custom Decorator
+`EBTNodeResult::Type` has exactly four values: `Succeeded`, `Failed`, `Aborted`, `InProgress`. There is no `FBTNodeResult`.
 
-```cpp
-UCLASS()
-class UMyBTDecorator_CanSee : public UBTDecorator
-{
-    GENERATED_BODY()
-public:
-    UMyBTDecorator_CanSee()
-    {
-        INIT_DECORATOR_NODE_NOTIFY_FLAGS();
-        bAllowAbortLowerPri = true; bAllowAbortChildNodes = true;
-        FlowAbortMode = EBTFlowAbortMode::Both;
-    }
-    UPROPERTY(EditAnywhere) FBlackboardKeySelector TargetKey;
-protected:
-    virtual bool CalculateRawConditionValue(
-        UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const override
-    {
-        AActor* Target = Cast<AActor>(
-            OwnerComp.GetBlackboardComponent()->GetValueAsObject(TargetKey.SelectedKeyName));
-        return IsValid(Target) && OwnerComp.GetAIOwner()->LineOfSightTo(Target);
-    }
-};
-```
+### Custom task with node memory
 
-### Custom Service
+Per-AI runtime state goes in a plain struct (for example `FMyAttackTaskMemory { float ElapsedTime; TWeakObjectPtr<AActor> CachedTarget; }`), never in `UPROPERTY` members of the node. The task returns `sizeof` of that struct from `GetInstanceMemorySize()`. The full `UMyBTTask_Attack` header and `.cpp` (`FBlackboardKeySelector` key, `ExecuteTask` / `TickTask` / `AbortTask`) are in [behavior tree patterns](references/behavior-tree-patterns.md#custom-task-with-node-memory-full-source).
 
-```cpp
-UCLASS()
-class UMyBTService_UpdateTarget : public UBTService
-{
-    GENERATED_BODY()
-public:
-    UMyBTService_UpdateTarget() { Interval = 0.5f; RandomDeviation = 0.1f; INIT_SERVICE_NODE_NOTIFY_FLAGS(); }
-protected:
-    virtual void TickNode(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds) override
-    {
-        TArray<AActor*> Hostiles;
-        OwnerComp.GetAIOwner()->GetAIPerceptionComponent()->GetPerceivedHostileActors(Hostiles);
-        AActor* Best = nullptr; float BestDist = FLT_MAX;
-        FVector MyLoc = OwnerComp.GetAIOwner()->GetPawn()->GetActorLocation();
-        for (AActor* A : Hostiles)
-        {
-            float D = FVector::Dist(MyLoc, A->GetActorLocation());
-            if (D < BestDist) { BestDist = D; Best = A; }
-        }
-        OwnerComp.GetBlackboardComponent()->SetValueAsObject(TEXT("TargetActor"), Best);
-    }
-};
-```
+**Node memory rules.** `NodeMemory` is a raw byte block sized by `GetInstanceMemorySize()` and laid out per BT instance, so it is the only safe place for per-AI runtime state on a shared node object. Access it with `CastInstanceNodeMemory<T>()`, which asserts `sizeof(T) <= GetInstanceMemorySize()`. For non-trivial members override `InitializeMemory`/`CleanupMemory` and call the helpers `InitializeNodeMemory<T>(NodeMemory, InitType)` / `CleanupNodeMemory<T>(NodeMemory, CleanupType)`; they placement-new and destroy correctly. Tasks that opt into tick intervals get a `FBTTaskMemory` header (`NextTickRemainingTime`, `AccumulatedDeltaTime`) reachable through `GetSpecialNodeMemory<FBTTaskMemory>()`; the engine places it just before `NodeMemory` (`BTNode.h:390`), so it never overlaps your struct.
 
-### Built-in Nodes (reference)
+Call `INIT_TASK_NODE_NOTIFY_FLAGS()` / `INIT_DECORATOR_NODE_NOTIFY_FLAGS()` / `INIT_SERVICE_NODE_NOTIFY_FLAGS()` in the constructor: they set `bNotifyTick`, `bNotifyTaskFinished`, `bNotifyActivation` and friends from which virtuals you actually overrode. Without them (or setting the `bNotify*` flags by hand) task `TickTask`/`OnTaskFinished` and decorator/service activation and relevance overrides are never called (`BTTaskNode.cpp:12-13`); only `UBTService` defaults `bNotifyTick` and `bNotifyOnSearch` to true (`BTService.cpp:11-12`). Returning `InProgress` means the task is latent — finish it with `FinishLatentTask(OwnerComp, Result)` (or `FinishLatentAbort(OwnerComp)` from an abort). To wait on an external event instead of ticking, call `WaitForMessage(OwnerComp, FName)` and finish inside `OnMessage`; senders use `FAIMessage::Send(Pawn, FAIMessage(TEXT("MontageCompleted"), Sender, true))` or `UAIBlueprintHelperLibrary::SendAIMessage`.
 
-**Tasks**: `BTTask_MoveTo`, `BTTask_MoveDirectlyToward`, `BTTask_Wait`, `BTTask_WaitBlackboardTime`, `BTTask_RunEQSQuery`, `BTTask_PlayAnimation`, `BTTask_MakeNoise`, `BTTask_RotateToFaceBBEntry`, `BTTask_RunBehavior`, `BTTask_RunBehaviorDynamic`, `BTTask_FinishWithResult`
+To force a re-evaluation from outside the tree, use `UBehaviorTreeComponent::RequestExecution(const UBTCompositeNode* RequestedOn, int32 InstanceIdx, const UBTNode* RequestedBy, int32 RequestedByChildIndex, EBTNodeResult::Type ContinueWithResult, bool bStoreForDebugger = true)`; from a decorator prefer `ConditionalFlowAbort(OwnerComp, EBTDecoratorAbortRequest::ConditionResultChanged)` and let `FlowAbortMode` decide the scope.
 
-**Decorators**: `BTDecorator_Blackboard`, `BTDecorator_CompareBBEntries`, `BTDecorator_Cooldown`, `BTDecorator_TagCooldown`, `BTDecorator_Loop`, `BTDecorator_TimeLimit`, `BTDecorator_DoesPathExist`, `BTDecorator_IsAtLocation`, `BTDecorator_CheckGameplayTagsOnActor`, `BTDecorator_ForceSuccess`
+Built-in nodes worth reusing before writing your own: tasks `UBTTask_MoveTo`, `UBTTask_MoveDirectlyToward`, `UBTTask_Wait`, `UBTTask_WaitBlackboardTime`, `UBTTask_RunEQSQuery`, `UBTTask_PlayAnimation`, `UBTTask_PlaySound`, `UBTTask_MakeNoise`, `UBTTask_RotateToFaceBBEntry`, `UBTTask_RunBehavior`, `UBTTask_RunBehaviorDynamic`, `UBTTask_SetKeyValueBool` / `UBTTask_SetKeyValueFloat` / `UBTTask_SetKeyValueObject` (one per key type), `UBTTask_FinishWithResult`; decorators `UBTDecorator_Blackboard`, `UBTDecorator_CompareBBEntries`, `UBTDecorator_Cooldown`, `UBTDecorator_TagCooldown`, `UBTDecorator_Loop`, `UBTDecorator_LoopUntil`, `UBTDecorator_TimeLimit`, `UBTDecorator_DoesPathExist`, `UBTDecorator_IsAtLocation`, `UBTDecorator_ReachedMoveGoal`, `UBTDecorator_CheckGameplayTagsOnActor`, `UBTDecorator_ConeCheck`, `UBTDecorator_ForceSuccess`; services `UBTService_DefaultFocus`, `UBTService_RunEQS`. Composites ship as `UBTComposite_Selector`, `UBTComposite_Sequence` and `UBTComposite_SimpleParallel` only — there is no general-purpose parallel composite.
 
-**Composites**: `Selector` (first success), `Sequence` (first failure), `SimpleParallel` (main task + background subtree; main task drives completion). UE does not ship a general-purpose Parallel node — `SimpleParallel` is the built-in option. For true parallel execution of N branches, implement a custom `UBTCompositeNode` or chain multiple `SimpleParallel` nodes.
-
----
+Tree topologies, a full decorator and service, abort modes and message-driven tasks: [behavior tree patterns](references/behavior-tree-patterns.md).
 
 ## AI Perception
 
 ```cpp
-// In AIController constructor:
-#include "Perception/AISenseConfig_Sight.h"
+#include "Perception/AIPerceptionComponent.h"
 #include "Perception/AISenseConfig_Hearing.h"
-#include "Perception/AISenseConfig_Damage.h"
+#include "Perception/AISenseConfig_Sight.h"
 
-UAIPerceptionComponent* AIP = CreateDefaultSubobject<UAIPerceptionComponent>(TEXT("AIPerception"));
-SetPerceptionComponent(*AIP);
+// In AMyAIController::AMyAIController():
+UAIPerceptionComponent* Perception = CreateDefaultSubobject<UAIPerceptionComponent>(TEXT("AIPerception"));
+SetPerceptionComponent(*Perception);
 
 UAISenseConfig_Sight* Sight = CreateDefaultSubobject<UAISenseConfig_Sight>(TEXT("Sight"));
 Sight->SightRadius = 2000.f;
@@ -263,237 +232,234 @@ Sight->LoseSightRadius = 2500.f;
 Sight->PeripheralVisionAngleDegrees = 60.f;
 Sight->AutoSuccessRangeFromLastSeenLocation = 400.f;
 Sight->DetectionByAffiliation.bDetectEnemies = true;
-AIP->ConfigureSense(*Sight);
-AIP->SetDominantSense(Sight->GetSenseImplementation());
+Perception->ConfigureSense(*Sight);
+Perception->SetDominantSense(Sight->GetSenseImplementation());
 
 UAISenseConfig_Hearing* Hearing = CreateDefaultSubobject<UAISenseConfig_Hearing>(TEXT("Hearing"));
 Hearing->HearingRange = 3000.f;
 Hearing->DetectionByAffiliation.bDetectEnemies = true;
-Hearing->DetectionByAffiliation.bDetectNeutrals = true;
-AIP->ConfigureSense(*Hearing);
+Perception->ConfigureSense(*Hearing);
 ```
 
-```cpp
-// Perception handler:
-void AMyAIController::OnTargetPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus)
-{
-    UBlackboardComponent* BB = GetBlackboardComponent();
-    if (Stimulus.WasSuccessfullySensed())
-    {
-        BB->SetValueAsObject(TEXT("TargetActor"), Actor);
-        BB->SetValueAsVector(TEXT("LastKnownLocation"), Stimulus.StimulusLocation);
-    }
-    else
-    {
-        // Lost target — keep last known location for investigation
-        BB->SetValueAsVector(TEXT("LastKnownLocation"), Stimulus.StimulusLocation);
-    }
-}
+Changing sense config at runtime takes effect only after `RequestStimuliListenerUpdate()`.
 
-// Report noise manually (e.g., gunshot):
-UAISense_Hearing::ReportNoiseEvent(GetWorld(), Location, Loudness, Instigator, MaxRange, Tag);
+| Delegate | Signature | Fires |
+|---|---|---|
+| `OnTargetPerceptionUpdated` | `(AActor* Actor, FAIStimulus Stimulus)` | once per processed stimulus that changed state, i.e. per actor *per sense* (`AIPerceptionComponent.cpp:593`) |
+| `OnTargetPerceptionInfoUpdated` | `(const FActorPerceptionUpdateInfo& UpdateInfo)` | same, but carries `TargetId` so it still fires for destroyed/null actors |
+| `OnTargetPerceptionForgotten` | `(AActor* Actor)` | after `ForgetActor` / `ForgetAll`, or when all stimuli expire — age-out only with `UAISystem::bForgetStaleActors` enabled (`AISystem.h:84`) |
+| `OnPerceptionUpdated` | `(const TArray<AActor*>& UpdatedActors)` | once per stimuli-processing pass that updated anything, batched |
 
-// Report damage:
-UAISense_Damage::ReportDamageEvent(GetWorld(), DamagedActor, Instigator, Amount, EventLoc, HitLoc);
-```
+`FAIStimulus` carries `Strength`, `StimulusLocation`, `ReceiverLocation`, `Tag`, `Type` (an `FAISenseID`), plus `WasSuccessfullySensed()`, `IsActive()` and `GetAge()`. Branch per sense with `Stimulus.Type == UAISense::GetSenseID<UAISense_Sight>()`. Queries: `GetCurrentlyPerceivedActors(TSubclassOf<UAISense> SenseToUse, TArray<AActor*>& OutActors)`, `GetPerceivedHostileActors(TArray<AActor*>&)`, `GetPerceivedHostileActorsBySense(TSubclassOf<UAISense>, TArray<AActor*>&)`, `HasActiveStimulus(const AActor&, FAISenseID)`, `ForgetActor(AActor*)`, `ForgetAll()`.
+
+Events are pushed, not polled: `UAISense_Hearing::ReportNoiseEvent(WorldContextObject, NoiseLocation, Loudness, Instigator, MaxRange, Tag)` and `UAISense_Damage::ReportDamageEvent(WorldContextObject, DamagedActor, Instigator, DamageAmount, EventLocation, HitLocation, Tag)`. Sight has no report function — it is trace-driven and only sees registered sources. `UAISense_Prediction::RequestPawnPredictionEvent(APawn* Requestor, AActor* PredictedActor, float PredictionTime)` asks where a target will be.
+
+Make an actor perceivable either by adding `UAIPerceptionStimuliSourceComponent` and setting `bAutoRegisterAsSource = true` (or calling `RegisterWithPerceptionSystem()`) plus `RegisterForSense(UAISense_Sight::StaticClass())` per sense, or by calling `UAIPerceptionSystem::GetCurrent(World)->RegisterSource(*Actor)` (all instantiated senses) / `RegisterSourceForSenseClass(UAISense_Sight::StaticClass(), *Actor)` — both take `AActor&` (`Perception/AIPerceptionSystem.h:139-141`).
+
+Other sense configs: `UAISenseConfig_Touch`, `UAISenseConfig_Team` (propagates awareness between teammates via `IGenericTeamAgentInterface`), `UAISenseConfig_Prediction`.
+
+## Navigation and Pathfinding
 
 ```cpp
-// On perceived actors — add UAIPerceptionStimuliSourceComponent:
-#include "Perception/AIPerceptionStimuliSourceComponent.h"
-UAIPerceptionStimuliSourceComponent* Source =
-    CreateDefaultSubobject<UAIPerceptionStimuliSourceComponent>(TEXT("StimuliSource"));
-Source->bAutoRegister = true;
-Source->RegisterForSense(TSubclassOf<UAISense>(UAISense_Sight::StaticClass()));
-Source->RegisterForSense(TSubclassOf<UAISense>(UAISense_Hearing::StaticClass()));
-```
-
-```cpp
-// Query perception state:
-UAIPerceptionComponent* PC = GetAIPerceptionComponent();
-TArray<AActor*> Visible; PC->GetCurrentlyPerceivedActors(UAISense_Sight::StaticClass(), Visible);
-TArray<AActor*> Hostiles; PC->GetPerceivedHostileActors(Hostiles);
-bool bCanSee = PC->HasActiveStimulus(*Target, UAISense::GetSenseID<UAISense_Sight>());
-PC->ForgetActor(Target);
-PC->ForgetAll();
-// Per-actor delegate (shown above):
-// OnTargetPerceptionUpdated — fires once per actor whose perception state changed
-// Batch delegate — fires once per frame with all updated actors:
-// OnPerceptionUpdated — signature: void(const TArray<AActor*>& UpdatedActors)
-// Also: OnTargetPerceptionForgotten, OnTargetPerceptionInfoUpdated
-```
-
-Additional sense configs: `UAISenseConfig_Touch` (fires on physical contact with perceived actor), `UAISense_Team` (propagates enemy awareness across teammates via `IGenericTeamAgentInterface`), `UAISense_Prediction` (predicts future location — call `UAISense_Prediction::RequestPawnPredictionEvent`).
-
----
-
-## Navigation System
-
-```cpp
+#include "NavigationPath.h"
 #include "NavigationSystem.h"
+
 UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(GetWorld());
+if (!NavSys) { return; }
 
-// Random reachable point
-FNavLocation ResultLoc;
-bool bOk = NavSys->GetRandomReachablePointInRadius(Origin, Radius, ResultLoc);
+FNavLocation RandomPoint;
+const bool bFoundRandom = NavSys->GetRandomReachablePointInRadius(Origin, 1500.f, RandomPoint);
 
-// Project onto NavMesh
 FNavLocation Projected;
-NavSys->ProjectPointToNavigation(WorldLoc, Projected, FVector(500, 500, 500));
+const bool bOnNavMesh = NavSys->ProjectPointToNavigation(WorldLocation, Projected, FVector(500.f, 500.f, 500.f));
 
-// Sync path query
-FPathFindingQuery Query; Query.StartLocation = Start; Query.EndLocation = End;
-FPathFindingResult Result = NavSys->FindPathSync(Query);
-if (Result.IsSuccessful()) { TArray<FNavPathPoint>& Pts = Result.Path->GetPathPoints(); }
+// Blueprint-facing helpers, equally usable from C++ (all static, all take a world context):
+UNavigationPath* Path = UNavigationSystemV1::FindPathToLocationSynchronously(GetWorld(), Start, End, GetPawn());
+const bool bReachable = Path && Path->IsValid() && !Path->IsPartial();
 
-// Async path query
-FNavAgentProperties NavAgent = GetPawn()->GetNavAgentPropertiesRef();
-NavSys->FindPathAsync(NavAgent, Query,
-    FNavPathQueryDelegate::CreateUObject(this, &AMyAI::OnPathFound));
+FVector HitLocation;
+const bool bBlocked = UNavigationSystemV1::NavigationRaycast(GetWorld(), Start, End, HitLocation);
 
-// Dynamic obstacle on actor:
-#include "NavModifierComponent.h"
-UNavModifierComponent* Mod = CreateDefaultSubobject<UNavModifierComponent>(TEXT("NavMod"));
-Mod->AreaClass = UNavArea_Obstacle::StaticClass();
-
-// Custom nav filter (prefer certain areas):
-UCLASS() class UMyNavFilter : public UNavigationQueryFilter { ... };
-MoveToActor(Target, -1.f, true, true, true, UMyNavFilter::StaticClass());
-
-// Runtime NavMesh rebuild (after procedural generation):
-NavSys->Build();
-
-// Access RecastNavMesh for agent config (mirrors Project Settings > Navigation)
-ARecastNavMesh* RNM = Cast<ARecastNavMesh>(NavSys->GetDefaultNavDataInstance());
-// Key properties: AgentRadius, AgentHeight, AgentMaxStepHeight, AgentMaxSlope
-// ANavMeshBoundsVolume must exist in level — without it, no tiles generate.
-// For streaming/open-world: use UNavigationInvokerComponent on AI pawns instead.
+// Native path, with the full FNavPathPoint list:
+const FPathFindingQuery Query(this, *NavSys->GetDefaultNavDataInstance(), Start, End);
+const FPathFindingResult Result = NavSys->FindPathSync(Query);
+const int32 NumPoints = Result.IsSuccessful() ? Result.Path->GetPathPoints().Num() : 0;
 ```
 
-**Off-mesh links**: Use `ANavLinkProxy` in-level, or implement `INavLinkCustomInterface` for traversal callbacks.
+`UNavigationPath` exposes `PathPoints`, `GetPathLength()`, `IsValid()` and `IsPartial()`; `FPathFindingResult` exposes `Path`, `IsSuccessful()` and `IsPartial()`.
 
----
+Async: `FindPathAsync(const FNavAgentProperties&, FPathFindingQuery, const FNavPathQueryDelegate&, EPathFindingMode::Type)`; the delegate is `DECLARE_DELEGATE_ThreeParams(FNavPathQueryDelegate, uint32 QueryID, ENavigationQueryResult::Type, FNavPathSharedPtr)`, so a handler with any other signature will not compile.
 
-## EQS (Environment Query System)
+| Situation | Do this |
+|---|---|
+| No navmesh at all | Place an `ANavMeshBoundsVolume`; without one no tiles generate |
+| Procedural / runtime geometry | Set the navmesh Runtime Generation to Dynamic; registering or moving navigation-relevant components dirties and rebuilds only the touched tiles (`AddDirtyArea`, `NavigationSystem.h:973`). `NavSys->Build()` rebuilds all nav data — use it once after bulk generation, not per change |
+| Open world / streamed levels | Add `UNavigationInvokerComponent` to AI pawns and set `TileGenerationRadius` / `TileRemovalRadius` (or `SetGenerationRadii`) |
+| Flying or swimming agents | Set `FNavAgentProperties::bCanFly` / `bCanSwim` on the movement component's `NavAgentProps`; the agent only uses nav data whose flags match |
+| Crowd avoidance between many agents | Use `UCrowdFollowingComponent` and `SetCrowdSimulationState`, `SetCrowdAvoidanceQuality`, `SetCrowdSeparationWeight`, `SetCrowdCollisionQueryRange` |
+
+Agent generation settings live on `ARecastNavMesh` (`Cast<ARecastNavMesh>(NavSys->GetDefaultNavDataInstance())`): `AgentRadius`, `AgentHeight`, `AgentMaxSlope`, `TileSizeUU`, and per-resolution step height through `GetAgentMaxStepHeight(ENavigationDataResolution)` / `SetAgentMaxStepHeight(ENavigationDataResolution, float)`. Tiles are identified by `FNavTileRef`, not raw indices — `GetNavMeshTileBounds(FNavTileRef)` and `GetNavMeshTileXY(FNavTileRef, int32&, int32&, int32&)` are the current overloads.
+
+## Nav Areas, Filters and Off-Mesh Links
+
+Subclass `UNavArea` per traversal domain and set `DefaultCost`, `FixedAreaEnteringCost` and `DrawColor`. Built-in areas: `UNavArea_Default`, `UNavArea_Null` (unwalkable), `UNavArea_Obstacle`, `UNavArea_LowHeight`, and `UNavAreaMeta_SwitchByAgent` for per-agent substitution. Paint areas at runtime with `UNavModifierComponent` (`AreaClass`, optional `AreaClassToReplace`, `FailsafeExtent`, `bIncludeAgentHeight`, and the setters `SetAreaClass` / `SetAreaClassToReplace`) or in-level with `ANavModifierVolume`.
+
+**Per-mesh walkable areas.** `UNavCollisionBase` has two mutually exclusive modes: `bIsDynamicObstacle` paints an obstacle modifier after generation, while `bUseSurfaceArea` makes `UNavCollision::AreaClass` flow into rasterization, so the mesh's own triangles become that area. Use the surface mode when a mesh *is* the terrain type (mud, water, rooftop) rather than an obstacle on it.
+
+A query filter is a `UNavigationQueryFilter` subclass — it needs a real class body, not a forward declaration:
+
+```cpp
+// MyNavFilter.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "NavFilters/NavigationQueryFilter.h"
+#include "MyNavFilter.generated.h"
+
+UCLASS()
+class MYGAME_API UMyNavFilter : public UNavigationQueryFilter
+{
+    GENERATED_BODY()
+
+public:
+    UMyNavFilter();
+};
+
+// MyNavFilter.cpp
+#include "MyNavFilter.h"
+#include "NavAreas/NavArea_Obstacle.h"
+
+UMyNavFilter::UMyNavFilter()
+{
+    FNavigationFilterArea& AvoidObstacles = Areas.AddDefaulted_GetRef();
+    AvoidObstacles.AreaClass = UNavArea_Obstacle::StaticClass();
+    AvoidObstacles.bIsExcluded = true;
+}
+```
+
+Pass it as the `FilterClass` argument: `MoveToActor(Target, -1.f, true, true, true, UMyNavFilter::StaticClass());`. Each `FNavigationFilterArea` entry can instead override cost with `bOverrideTravelCost` + `TravelCostOverride` or `bOverrideEnteringCost` + `EnteringCostOverride`. `UNavigationQueryFilter::GetQueryFilter(NavData, Querier, FilterClass)` resolves the runtime `FSharedConstNavQueryFilter`; override `InitializeFilter(const ANavigationData&, const UObject*, FNavigationQueryFilter&)` for dynamic rules.
+
+**Off-mesh links.** Drop an `ANavLinkProxy` in the level: its `PointLinks` array holds simple links, `SegmentLinks` holds segment links, and its `UNavLinkCustomComponent` (via `GetSmartLinkComp()`) gives you the smart-link path — `SetLinkData(RelativeStart, RelativeEnd, ENavLinkDirection::Type)`, `SetEnabled(bool)`, `SetEnabledArea(TSubclassOf<UNavArea>)`, and `SetMoveReachedLink(FOnMoveReachedLink const&)` to run code (a jump, a ladder climb) when an agent reaches the link. `ANavLinkProxy::OnSmartLinkReached` is the Blueprint-facing equivalent. Recast can also generate jump links automatically from the `NavLinkJumpConfigs` array of `FNavLinkGenerationJumpConfig` on `ARecastNavMesh`.
+
+## EQS Environment Query System
 
 ```cpp
 #include "EnvironmentQuery/EnvQueryManager.h"
+#include "EnvironmentQuery/EnvQueryTypes.h"
 
-UPROPERTY(EditDefaultsOnly) TObjectPtr<UEnvQuery> FindCoverQuery;
-
+// AMyAIController declares: TObjectPtr<UEnvQuery> FindCoverQuery and
+// void HandleCoverQueryFinished(TSharedPtr<FEnvQueryResult> Result).
 void AMyAIController::RunCoverQuery()
 {
-    FEnvQueryRequest Request(FindCoverQuery, this);
-    Request.Execute(EEnvQueryRunMode::SingleResult,
-        FQueryFinishedSignature::CreateUObject(this, &AMyAIController::OnCoverDone));
+    if (!FindCoverQuery) { return; }
+
+    // Querier = pawn; a controller querier puts the Querier context at the controller (EnvQueryContext_Querier.cpp:19-21)
+    FEnvQueryRequest Request(FindCoverQuery, GetPawn());
+    Request.SetFloatParam(TEXT("SearchRadius"), 1200.f);
+    Request.Execute(EEnvQueryRunMode::SingleResult, this, &AMyAIController::HandleCoverQueryFinished);
 }
 
-void AMyAIController::OnCoverDone(TSharedPtr<FEnvQueryResult> Result)
+void AMyAIController::HandleCoverQueryFinished(TSharedPtr<FEnvQueryResult> Result)
 {
-    if (Result.IsValid() && Result->IsSuccessful())
-        GetBlackboardComponent()->SetValueAsVector(TEXT("CoverLocation"),
-            Result->GetItemAsLocation(0));
-}
-```
-
-**Run modes**: `SingleResult` (cheapest), `RandomBest5Pct`, `RandomBest25Pct`, `AllMatching`
-
-**BTTask_RunEQSQuery**: set `EQSRequest.QueryTemplate`, `BlackboardKey`, `RunMode`. Async lifecycle managed via `FBTEnvQueryTaskMemory.RequestID`.
-
-**Custom context** (resolve BB actor for use in tests):
-
-```cpp
-UCLASS()
-class UEnvQueryContext_Enemy : public UEnvQueryContext
-{
-    GENERATED_BODY()
-    virtual void ProvideContext(FEnvQueryInstance& QI, FEnvQueryContextData& CD) const override
+    UBlackboardComponent* BlackboardComp = GetBlackboardComponent();
+    if (BlackboardComp && Result.IsValid() && Result->IsSuccessful())
     {
-        AAIController* C = Cast<AAIController>(Cast<APawn>(QI.Owner.Get())->GetController());
-        AActor* Enemy = Cast<AActor>(C->GetBlackboardComponent()->GetValueAsObject(TEXT("TargetActor")));
-        if (IsValid(Enemy)) UEnvQueryItemType_Actor::SetContextHelper(CD, Enemy);
+        BlackboardComp->SetValueAsVector(TEXT("CoverLocation"), Result->GetItemAsLocation(0));
     }
-};
+}
 ```
 
-See `references/eqs-reference.md` for generator and test configurations.
+`FQueryFinishedSignature` is `DECLARE_DELEGATE_OneParam(FQueryFinishedSignature, TSharedPtr<FEnvQueryResult>)`. Run modes: `SingleResult`, `RandomBest5Pct`, `RandomBest25Pct`, `AllMatching`. Results expose `Items`, `GetItemAsLocation(int32)`, `GetItemAsActor(int32)`, `GetItemScore(int32)`, `IsSuccessful()`, `IsAborted()`. Other entry points: `UEnvQueryManager::GetCurrent(WorldContextObject)->RunQuery(Request, RunMode, FinishDelegate)` returns the query id for cancellation; `RunInstantQuery(Request, RunMode)` blocks and returns the result on the spot (use sparingly); `UEnvQueryManager::RunEQSQuery(WorldContextObject, QueryTemplate, Querier, RunMode, WrapperClass)` is the Blueprint wrapper.
 
----
+Subclass hooks, all const: `UEnvQueryGenerator::GenerateItems(FEnvQueryInstance&)`, `UEnvQueryTest::RunTest(FEnvQueryInstance&)`, `UEnvQueryContext::ProvideContext(FEnvQueryInstance&, FEnvQueryContextData&)`. Blueprint contexts derive from `UEnvQueryContext_BlueprintBase` and implement `ProvideSingleActor`, `ProvideSingleLocation`, `ProvideActorsSet` or `ProvideLocationsSet`.
 
-## State Trees (UE 5.1+)
+Place an `AEQSTestingPawn` (`EnvironmentQuery/EQSTestingPawn.h`) in the level to preview a query's scored items in-editor without PIE; set its `QueryTemplate` and `QueryConfig`.
 
-Use State Trees for simpler state machines, designer-friendly workflows, and Smart Object integration. Use Behavior Trees for complex reactive combat with priority-based interrupts.
+Generator and test property tables, a custom C++ context, scoring recipes and ready-made query configurations: [EQS reference](references/eqs-reference.md).
 
-```cpp
-// Build.cs: "GameplayStateTreeModule"
-#include "Components/StateTreeComponent.h"
+## State Tree for AI
 
-UCLASS()
-class AMyNPC : public ACharacter
-{
-    GENERATED_BODY()
-    UPROPERTY(VisibleAnywhere) TObjectPtr<UStateTreeComponent> StateTreeComp;
-};
-AMyNPC::AMyNPC() { StateTreeComp = CreateDefaultSubobject<UStateTreeComponent>(TEXT("StateTree")); }
-void AMyNPC::BeginPlay() { Super::BeginPlay(); StateTreeComp->StartLogic(); }
-```
+Behavior trees suit reactive combat with priority-based interrupts; State Trees suit flatter state machines and Smart Object flows. For AI, use `UStateTreeAIComponent` (from `Components/StateTreeAIComponent.h`) rather than the plain `UStateTreeComponent`: it returns `UStateTreeAIComponentSchema`, which guarantees an `AAIController` context value. Build.cs needs `StateTreeModule` **and** `GameplayStateTreeModule`.
 
-State Tree tasks use `FStateTreeTaskBase` + `FInstanceDataType`. Override `EnterState`, `Tick`, `ExitState`.
-
-State Tree **evaluators** (`FStateTreeEvaluatorBase`) run persistently across all active states — use them for shared context data (nearest enemy, threat level) that multiple states read, analogous to BT services.
-
----
+Task, condition, evaluator and schema authoring belongs to `ue-state-trees`.
 
 ## Smart Objects
 
-Add `USmartObjectComponent` to world actors (set `SmartObjectDefinition`). AI interacts via `USmartObjectSubsystem`:
+`SmartObjects` is an opt-in plugin (`SmartObjectsModule`). Put a `USmartObjectComponent` on world actors and give it a `USmartObjectDefinition` (`GetDefinition()` / `SetDefinition()`); AI finds and claims slots through `USmartObjectSubsystem`.
 
 ```cpp
-// Build.cs: "SmartObjectsModule"
 #include "SmartObjectSubsystem.h"
-USmartObjectSubsystem* SOS = USmartObjectSubsystem::GetCurrent(GetWorld());
+#include "SmartObjectRequestTypes.h" // FSmartObjectRequest, FSmartObjectRequestFilter, FSmartObjectRequestResult
+
+USmartObjectSubsystem* Subsystem = USmartObjectSubsystem::GetCurrent(GetWorld());
+if (!Subsystem) { return; }
+
 FSmartObjectRequestFilter Filter;
-FSmartObjectRequest Req(FBox(Origin, Origin).ExpandBy(500.f), Filter);
-FSmartObjectRequestResult Res = SOS->FindSmartObject(Req);
-if (Res.IsValid())
+const FSmartObjectRequest Request(FBox::BuildAABB(Origin, FVector(500.f)), Filter);
+const FSmartObjectRequestResult Result = Subsystem->FindSmartObject(Request, GetPawn());
+if (Result.IsValid())
 {
-    FSmartObjectClaimHandle Handle = SOS->MarkSlotAsClaimed(Res.SlotHandle, ESmartObjectClaimPriority::Normal);
-    // ... use slot, then:
-    SOS->MarkSlotAsFree(Handle);
+    const FSmartObjectClaimHandle Claim = Subsystem->MarkSlotAsClaimed(Result.SlotHandle, ESmartObjectClaimPriority::Normal);
+    FVector SlotLocation;
+    if (Subsystem->GetSlotLocation(Claim, SlotLocation))
+    {
+        MoveToLocation(SlotLocation);
+    }
+    Subsystem->MarkSlotAsFree(Claim); // in real code, only once the interaction ends
 }
 ```
 
----
+`ESmartObjectClaimPriority` values are `Low`, `BelowNormal`, `Normal`, `AboveNormal`, `High`. `FindSmartObjects` returns every match; `FindSmartObjectsInList` restricts the search to actors you already have. The `GameplayBehaviorSmartObjects` plugin (Experimental in 5.8) adds `GameplayBehavior`-driven slot behaviours, and `UBlackboardKeyType_SOClaimHandle` lets a BT hold a claim handle in a blackboard key.
+
+## ZoneGraph, MassAI and NavCorridor
+
+| Plugin | Maturity in 5.8 | Use it for | Entry points |
+|---|---|---|---|
+| ZoneGraph | Experimental | Lane graphs for traffic and pedestrian flow instead of free navmesh movement | `UZoneGraphSubsystem::FindNearestLane` / `FindOverlappingLanes`, `AZoneGraphData`, `UZoneShapeComponent`, `UE::ZoneGraph::Query` helpers |
+| MassAI | Experimental | Thousands of lightweight agents with no actor per agent | `UMassStateTreeProcessor`, `FMassStateTreeExecutionContext`, modules `MassAIBehavior`, `MassNavigation`, `MassZoneGraphNavigation`, `MassNavMeshNavigation` |
+| NavCorridor | Experimental | Steering inside a corridor around a navmesh path rather than along its polyline | `FNavCorridor`, `FNavCorridorParams`, `FNavCorridorPortal`, `FNavCorridorLocation` |
+
+Mass agent authoring, fragments and processors belong to `ue-mass-entity`.
+
+## Deprecated — do not use
+
+| Do not emit | Use in 5.8 | Source |
+|---|---|---|
+| `EPointOnCircleSpacingMethod` | `EEnvQueryPointSpacingMethod` | `UE_DEPRECATED(5.8)` in `EnvironmentQuery/Generators/EnvQueryGenerator_OnCircle.h:15` |
+| `USmartObjectComponent::SetSmartObjectEnabled` (BlueprintPure) | `K2_SetSmartObjectEnabled` | `UE_DEPRECATED(5.8)` in `SmartObjectComponent.h:101` |
+| `USmartObjectComponent::SetSmartObjectEnabledForReason` (BlueprintPure) | `K2_SetSmartObjectEnabledForReason` | `UE_DEPRECATED(5.8)` in `SmartObjectComponent.h:118` |
+| `FNavLinkGenerationJumpDownConfig` | `FNavLinkGenerationJumpConfig` | `UE_DEPRECATED(5.7)` in `NavMesh/LinkGenerationConfig.h:159` |
+| `UAIPerceptionComponent::RefreshStimulus` | `ConditionallyStoreSuccessfulStimulus(FAIStimulus&, const FAIStimulus&)` | `UE_DEPRECATED(5.6)` in `Perception/AIPerceptionComponent.h:448` |
+| `UPathFollowingComponent::SetMovementComponent(UNavMovementComponent*)` | `SetNavMovementInterface(INavMovementInterface*)` (the deprecation message's `SetNavMoveInterface` does not exist) | `UE_DEPRECATED(5.5)` in `Navigation/PathFollowingComponent.h:282`; replacement at `:286` |
+| `ARecastNavMesh` tile functions taking `int32 TileIndex` | overloads taking `FNavTileRef` | `UE_DEPRECATED(5.5)` in `NavMesh/RecastNavMesh.h:1134,1141,1151,1161` |
+| `ARecastNavMesh::AgentMaxStepHeight` | `GetAgentMaxStepHeight(ENavigationDataResolution)` / `NavMeshResolutionParams` | `UE_DEPRECATED(all)` in `NavMesh/RecastNavMesh.h:718` |
+| `UBehaviorTreeComponent::RequestExecution(const UBTDecorator*)` | `RequestBranchEvaluation` | "replaced by" comment, `BehaviorTree/BehaviorTreeComponent.h:153` |
+| `UNavigationSystemV1::K2_GetRandomPointInNavigableRadius` | `K2_GetRandomLocationInNavigableRadius` | `DeprecatedFunction` in `NavigationSystem.h:1484` |
 
 ## Common Mistakes
 
-**Polling instead of event-driven**: Do not check per-frame in `TickTask` if a `BTDecorator_Blackboard` observer abort or `WaitForMessage` achieves the same result.
+**Forgetting the notify-flags macro:** a `TickTask` or `OnSearchStart` override never runs unless the constructor calls `INIT_TASK_NODE_NOTIFY_FLAGS()` / `INIT_SERVICE_NODE_NOTIFY_FLAGS()` — the flags, not the override, decide what the tree calls.
 
-**Overcomplicated BTs**: Flatten needless nesting. Use services for periodic knowledge updates at `Interval >= 0.5s`. Gate expensive EQS with `BTDecorator_Cooldown`.
+**Per-instance state as a member:** BT node objects are shared by every AI running the tree, so `float ElapsedTime;` as a `UPROPERTY` is a cross-agent data race. Put it in a struct sized by `GetInstanceMemorySize()` and reach it with `CastInstanceNodeMemory<T>()`.
 
-**NavMesh gaps**: Always place `ANavMeshBoundsVolume`. For streaming/procedural levels, call `NavSys->Build()` after generation or use `UNavigationInvokerComponent` on AI pawns.
+**Returning `InProgress` and never finishing:** the task hangs forever. Every latent path must end in `FinishLatentTask` or `FinishLatentAbort`.
 
-**Server vs client**: `AAIController` only exists on the server. Replicate AI state via Pawn replicated properties, not through the controller. BT Blackboard is not replicated.
+**Blackboard mistakes:** `FOnBlackboardChangeNotification` returns `EBlackboardNotificationResult`, so a void observer will not bind; and BT nodes should expose a `FBlackboardKeySelector` rather than hard-coding key names, so designers can rebind and `ResolveSelectedKey` can validate against the asset.
 
-**Large worlds**: Use hierarchical NavMesh (RecastNavMesh actor settings). Set EQS max parallel queries per frame in Project Settings > AI > EQS.
+**No `ANavMeshBoundsVolume`:** with no bounds volume no tiles generate and every `MoveTo` fails silently. For procedural geometry use Dynamic runtime generation (plus one `NavSys->Build()` after bulk generation), or `UNavigationInvokerComponent`.
 
----
+**Assuming the AI exists on clients:** `AAIController` is server-only. Replicate results through the pawn's replicated properties; the blackboard and behavior tree are not replicated.
 
-## Edge Cases
-
-- **Flying/swimming**: Set `FNavAgentProperties::bCanFly`/`bCanSwim`; assign a `UNavArea` subclass with matching `SupportedAgents` flags. Custom `UNavArea` subclasses define traversal cost and area flags — create one per movement domain (e.g., `UNavArea_Water` with high cost for ground agents, zero for swimmers). Apply via NavModifierVolumes or NavMesh generation settings.
-- **Dedicated server**: Sight perception uses collision traces, not rendering — works fine. Guard non-server code with `HasAuthority()`.
-- **AI with GAS**: BT tasks request ability activation; abilities manage their own latent logic.
-
----
+**Polling instead of throttling:** prefer `UBTDecorator_Blackboard` with `FlowAbortMode` or `WaitForMessage` over per-frame checks; keep service `Interval` at or above 0.5 s with a `RandomDeviation`; gate EQS with `UBTDecorator_Cooldown`, prefer `SingleResult` over `AllMatching`, and put cheap filter tests before trace and pathfinding tests.
 
 ## Related Skills
 
-- `ue-actor-component-architecture` — component setup patterns for AI
-- `ue-gameplay-framework` — GameMode AI spawning, controller/pawn relationships
-- `ue-cpp-foundations` — delegates, subsystems, UObject patterns
-- `ue-gameplay-abilities` — GAS + AI integration
-
-## Reference Files
-
-- `references/behavior-tree-patterns.md` — patrol, combat, flee, investigate, squad BT patterns
-- `references/eqs-reference.md` — generator and test configurations for spatial queries
+- `ue-state-trees` — State Tree tasks, conditions, evaluators, schemas and Mass behaviours
+- `ue-mass-entity` — Mass fragments, processors and crowd simulation for large agent counts
+- `ue-character-movement` — the movement component that executes the paths this skill requests
+- `ue-gameplay-framework` — GameMode spawning, controller/pawn ownership, possession lifecycle
+- `ue-physics-collision` — trace channels and collision responses used by sight and EQS trace tests
+- `ue-gameplay-tags-messaging` — gameplay tags used by `UBTDecorator_CheckGameplayTagsOnActor` and EQS tag tests
+- `ue-actor-component-architecture` — component creation, ownership and replication patterns
+- `ue-mover` — the Mover plugin: movement modes, layered moves and rollback networking
+- `ue-testing-debugging` — automation tests, logging, assertions, profiling and debug drawing
